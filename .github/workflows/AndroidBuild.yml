@@ -13,9 +13,16 @@ on:
       ndk_version:
         description: "Android NDK version"
         default: "25.2.9519653"
+      compile_sdk:
+        description: "Android compileSdk version (API level)"
+        default: "35"
+      build_tools:
+        description: "Android build-tools version"
+        default: "35.0.0"
 
 permissions:
   contents: write
+  pages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -24,6 +31,12 @@ concurrency:
 defaults:
   run:
     shell: bash
+
+env:
+  OWNER: ${{ github.repository_owner }}
+  REPO: ${{ github.repository }}       # e.g. ishizuki-tech/SurveyNav
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
 
 jobs:
   build:
@@ -37,6 +50,9 @@ jobs:
       ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
       ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
       ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -61,10 +77,15 @@ jobs:
 
       - name: Install required SDK components
         run: |-
+          set -euo pipefail
+          COMPILE_SDK="${{ inputs.compile_sdk || '35' }}"
+          BUILD_TOOLS="${{ inputs.build_tools || '35.0.0' }}"
+
+          echo "Installing Android platform ${COMPILE_SDK} and build-tools ${BUILD_TOOLS}..."
           yes | sdkmanager --install \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "platform-tools" || true
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS}" \
+            "platform-tools"
 
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v3
@@ -72,6 +93,7 @@ jobs:
       - name: Configure gradle.properties
         shell: bash
         run: |-
+          set -euo pipefail
           [[ -n "${{ secrets.GH_TOKEN }}" ]] || { echo "::error ::GH_TOKEN is not configured"; exit 1; }
           mkdir -p "$HOME/.gradle"
           cat <<'PROPS' > "$HOME/.gradle/gradle.properties"
@@ -86,11 +108,13 @@ jobs:
       - name: Decode signing keystore
         if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
         run: |-
+          set -euo pipefail
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
-          echo "ANDROID_KEYSTORE_FILE=$PWD/keystore.jks" >> $GITHUB_ENV
+          echo "ANDROID_KEYSTORE_FILE=$PWD/keystore.jks" >> "$GITHUB_ENV"
 
       - name: Build release artifacts
         run: |-
+          set -euo pipefail
           ./gradlew \
             :${{ env.MODULE_PATH }}:clean \
             :${{ env.MODULE_PATH }}:assembleRelease \
@@ -101,26 +125,32 @@ jobs:
         id: collect
         shell: bash
         run: |-
+          set -euo pipefail
           ROOT="${MODULE_PATH}/build/outputs"
           APKs=$(find "$ROOT" -type f -name '*.apk' -print | sort || true)
           AABs=$(find "$ROOT" -type f -name '*.aab' -print | sort || true)
           MAPs=$(find "$ROOT" -type f -name 'mapping.txt' -print | sort || true)
+
           APK_COUNT=$(printf '%s\n' "$APKs" | sed '/^$/d' | wc -l | tr -d ' ')
           AAB_COUNT=$(printf '%s\n' "$AABs" | sed '/^$/d' | wc -l | tr -d ' ')
           MAP_COUNT=$(printf '%s\n' "$MAPs" | sed '/^$/d' | wc -l | tr -d ' ')
+
           printf '%s\n' "apk_count=$APK_COUNT" >> "$GITHUB_OUTPUT"
           printf '%s\n' "aab_count=$AAB_COUNT" >> "$GITHUB_OUTPUT"
           printf '%s\n' "map_count=$MAP_COUNT" >> "$GITHUB_OUTPUT"
+
           {
             echo "apk_list<<EOF"
             printf '%s\n' "$APKs"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
           {
             echo "aab_list<<EOF"
             printf '%s\n' "$AABs"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
           {
             echo "map_list<<EOF"
             printf '%s\n' "$MAPs"
@@ -180,9 +210,10 @@ jobs:
         id: notes
         shell: bash
         run: |-
+          set -euo pipefail
           APKs=$(printf '%s\n' "${{ steps.collect.outputs.apk_list }}" | sed '/^$/d')
           AABs=$(printf '%s\n' "${{ steps.collect.outputs.aab_list }}" | sed '/^$/d')
-          NOTES=$(git log -10 --pretty='* %s (%an)')
+          NOTES=$(git log -10 --pretty='* %s (%an)' || echo "* Commit history not available")
           APK_SAMPLE=$(printf '%s\n' "$APKs" | head -n1)
           AAB_SAMPLE=$(printf '%s\n' "$AABs" | head -n1)
           [[ -n "$APK_SAMPLE" ]] || APK_SAMPLE="your-release.apk"
@@ -212,8 +243,10 @@ jobs:
         id: tag
         shell: bash
         run: |-
+          set -euo pipefail
           TAG="v${{ steps.version.outputs.version }}-$(date '+%Y%m%d-%H%M')"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
 
       - name: Publish GitHub Release
         if: ${{ inputs.create_release && (steps.collect.outputs.apk_count != '0' || steps.collect.outputs.aab_count != '0') }}
@@ -230,3 +263,244 @@ jobs:
       - name: Skip release
         if: ${{ !inputs.create_release || (steps.collect.outputs.apk_count == '0' && steps.collect.outputs.aab_count == '0') }}
         run: echo "Release publishing skipped."
+
+  publish:
+    name: Publish Wiki + GH Pages
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve TAG/DATE/BASE
+        id: info
+        run: |-
+          set -euo pipefail
+          TAG="${TAG}"
+          DATE="$(date '+%Y-%m-%d %H:%M')"
+          REPO="${{ env.REPO }}"
+          OWNER="${{ env.OWNER }}"
+          BASE_URL="https://${OWNER}.github.io/${REPO#*/}"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve latest release APK
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |-
+          set -euo pipefail
+          REPO="${{ steps.info.outputs.repo }}"
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::GH_TOKEN not set; fallback to Releases page."
+            echo "latest_tag=" >> "$GITHUB_OUTPUT"
+            echo "latest_apk_name=" >> "$GITHUB_OUTPUT"
+            echo "latest_apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          fi
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases?per_page=10" \
+            -o releases.json
+
+          LATEST_TAG="$(jq -r '[.[] | select(.draft==false)][0].tag_name // empty' releases.json)"
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "::warning::No non-draft releases; fallback."
+            echo "latest_tag=" >> "$GITHUB_OUTPUT"
+            echo "latest_apk_name=" >> "$GITHUB_OUTPUT"
+            echo "latest_apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APK_NAME="$(
+            jq -r --arg TAG "$LATEST_TAG" '
+              (.[] | select(.draft==false and .tag_name==$TAG) | .assets[]?.name) // empty
+            ' releases.json \
+            | grep -E '\.apk$' \
+            | head -n1 || true
+          )"
+
+          if [ -n "$APK_NAME" ]; then
+            APK_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${APK_NAME}"
+          else
+            APK_URL="https://github.com/${REPO}/releases/tag/${LATEST_TAG}"
+          fi
+
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "latest_apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "latest_apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
+
+          echo "::group::Latest release asset"
+          echo "LATEST_TAG : $LATEST_TAG"
+          echo "APK_NAME   : ${APK_NAME:-'(none)'}"
+          echo "APK_URL    : $APK_URL"
+          echo "::endgroup::"
+
+      - name: Update Wiki (Home + TAG.md)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |-
+          set -euo pipefail
+
+          TAG="${{ steps.info.outputs.tag }}"
+          DATE="${{ steps.info.outputs.date }}"
+          REPO="${{ steps.info.outputs.repo }}"
+          BASE_URL="${{ steps.info.outputs.base }}"
+          LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
+
+          mkdir -p wiki
+
+          # Per-build page
+          {
+            echo "# 📦 SurveyNav — Build ${TAG}"
+            echo "Generated: ${DATE}"
+            echo ""
+            echo "## ⬇️ Download"
+            if [ -n "$LATEST_APK_URL" ]; then
+              echo "- [Latest APK](${LATEST_APK_URL})"
+            else
+              echo "- [Latest APK](https://github.com/${REPO}/releases)"
+            fi
+            echo "- [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
+            echo "- [All Releases](https://github.com/${REPO}/releases)"
+          } > "wiki/${TAG}.md"
+
+          # Home.md
+          {
+            echo "# 🏠 SurveyNav Wiki Home"
+            echo "Updated: ${DATE}"
+            echo ""
+            echo "## 📜 Build History (latest 20)"
+          } > wiki/Home.md
+
+          MAP_TMP="wiki/_link-map.txt"
+          : > "$MAP_TMP"
+
+          LIST=$(find wiki -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' | sort -r | head -n 20 || true)
+          if [ -z "$LIST" ]; then
+            echo "_No builds yet._" >> wiki/Home.md
+          else
+            echo "$LIST" | while read -r f; do
+              base="$(basename "$f" .md)"
+              slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
+              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> wiki/Home.md
+              printf -- "%s.md -> %s\n" "$base.md" "$slug" >> "$MAP_TMP"
+            done
+          fi
+
+          {
+            echo ""
+            echo "## 🌐 GitHub Pages"
+            echo "- [Downloads Page](${BASE_URL})"
+          } >> wiki/Home.md
+
+          echo "::group::Wiki tree"
+          ls -R wiki || true
+          echo "::endgroup::"
+          echo "::group::Wiki link map"
+          cat "$MAP_TMP" || true
+          echo "::endgroup::"
+
+          if [ -n "${GH_TOKEN:-}" ]; then
+            cd wiki
+            git init
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add .
+            git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
+            git branch -M master
+            git remote add origin "https://${{ github.actor }}:${GH_TOKEN}@github.com/${REPO}.wiki.git"
+            git push origin master --force || echo "::warning::Failed to push wiki (is Wiki enabled?)"
+          else
+            echo "::warning::GH_TOKEN not set; skip wiki push."
+          fi
+
+      - name: Generate GH Pages (Downloads)
+        run: |-
+          set -euo pipefail
+
+          TAG_THIS="${{ steps.info.outputs.tag }}"
+          DATE="${{ steps.info.outputs.date }}"
+          REPO="${{ steps.info.outputs.repo }}"
+          BASE_URL="${{ steps.info.outputs.base }}"
+          LATEST_TAG="${{ steps.latest.outputs.latest_tag }}"
+          LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
+
+          if [ -z "$LATEST_APK_URL" ]; then
+            LATEST_APK_URL="https://github.com/${REPO}/releases"
+          fi
+
+          mkdir -p gh-pages
+
+          cat > gh-pages/index.html <<HTML
+          <!doctype html><html lang="en"><head>
+          <meta charset="utf-8"/>
+          <meta name="viewport" content="width=device-width,initial-scale=1"/>
+          <title>📦 SurveyNav Downloads</title>
+          <style>
+            body{font-family:system-ui,Roboto,Inter,Arial;background:#0b0f17;color:#eee;margin:0}
+            .wrap{max-width:960px;margin:auto;padding:40px}
+            .glass{background:rgba(255,255,255,0.08);border-radius:20px;
+                   box-shadow:0 8px 40px rgba(0,0,0,0.4);
+                   padding:32px;backdrop-filter:blur(14px)}
+            a{color:#72d0ff;text-decoration:none}
+            footer{margin-top:24px;font-size:.85em;opacity:.7;text-align:center}
+            code{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:6px}
+            .muted{opacity:.8}
+          </style>
+          </head>
+          <body><div class="wrap"><div class="glass">
+          <h1>📦 SurveyNav — Latest Downloads</h1>
+          <p class="muted"><strong>Generated:</strong> ${DATE}</p>
+
+          <h2>⬇️ Latest Build</h2>
+          <p><a href="${LATEST_APK_URL}">Download Latest APK</a></p>
+          <p>
+            ${LATEST_TAG:+<a href="https://github.com/${REPO}/releases/tag/${LATEST_TAG}">🔖 ${LATEST_TAG}</a> • }
+            <a href="https://github.com/${REPO}/releases">📘 All Releases</a>
+          </p>
+
+          <hr style="border-color:rgba(255,255,255,.15);margin:24px 0">
+
+          <h2>🔎 Project</h2>
+          <p>
+            <a href="https://github.com/${REPO}">
+              View <code>${REPO#*/}</code> on GitHub
+            </a>
+          </p>
+
+          <p style="margin-top:16px;">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${BASE_URL}" alt="QR">
+          </p>
+          <footer>Generated by SurveyNav CI — ${DATE}</footer>
+          </div></div></body></html>
+          HTML
+
+          echo "::group::gh-pages tree"
+          ls -R gh-pages || true
+          echo "::endgroup::"
+
+      - name: Publish GH Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: gh-pages
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "Update GH Pages + Wiki (${{ steps.info.outputs.tag }})"
