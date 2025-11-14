@@ -34,7 +34,7 @@ defaults:
 
 env:
   OWNER: ${{ github.repository_owner }}
-  REPO: ${{ github.repository }}       # e.g. ishizuki-tech/SurveyNav
+  REPO: ${{ github.repository }}       # e.g. ishizuki-tech/SurveyNav2025
   ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
   ANDROID_HOME: /usr/local/lib/android/sdk
 
@@ -82,10 +82,18 @@ jobs:
           BUILD_TOOLS="${{ inputs.build_tools || '35.0.0' }}"
 
           echo "Installing Android platform ${COMPILE_SDK} and build-tools ${BUILD_TOOLS}..."
+
+          # English comment:
+          # - We temporarily disable 'pipefail' so that SIGPIPE from `yes`
+          #   does not cause the pipeline to fail.
+          # - The exit code of the pipeline becomes that of `sdkmanager`,
+          #   which is what we actually care about.
+          set +o pipefail
           yes | sdkmanager --install \
             "platforms;android-${COMPILE_SDK}" \
             "build-tools;${BUILD_TOOLS}" \
             "platform-tools"
+          set -o pipefail
 
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v3
@@ -98,7 +106,7 @@ jobs:
           mkdir -p "$HOME/.gradle"
           cat <<'PROPS' > "$HOME/.gradle/gradle.properties"
           gh.owner=ishizuki-tech
-          gh.repo=SurveyNav
+          gh.repo=SurveyNav2025
           gh.branch=main
           gh.pathPrefix=exports
           gh.token=${{ secrets.GH_TOKEN }}
