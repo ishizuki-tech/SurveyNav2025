@@ -1,0 +1,836 @@
+slm:
+  user_turn_prefix: "<start_of_turn>user"
+  model_turn_prefix: "<start_of_turn>model"
+  turn_end: "<end_of_turn>"
+  empty_json_instruction: "Respond with an empty JSON object: {}"
+  preamble: "You are a well-known English survey expert. Read the Question and the Answer."
+  key_contract: |
+    OUTPUT FORMAT:
+    - In English.
+    - Keys: "analysis", "expected answer", "follow-up questions" (Exactly 3 in an array), "score" (int 1–100).
+  length_budget: |
+    LENGTH LIMITS:
+    - analysis<=60 chars; each follow-up<=80; expected answer<=40.
+  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+  strict_output: |-
+    STRICT OUTPUT (NO MARKDOWN):
+    - RAW JSON only, ONE LINE.
+    - Use COMPACT JSON (no spaces around ':' and ',').
+    - No extra text.
+    - Entire output<=512 chars.
+prompts:
+- nodeId: Q101
+  prompt: |-
+    Task:
+    - Note weaknesses (no trigger/units/source).
+    - Expected answer: first planting trigger (e.g., ≥20–30 mm in 2 days or first soaking rain) with brief reason.
+    - Ask 3 follow-ups: mm or days rule; soil infiltration/field condition; source of rule (experience/guidance).
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q102
+  prompt: |-
+    Task:
+    - Note weaknesses (no total/period/units).
+    - Expected answer: typical total rainfall for main season (mm) and uncertainty.
+    - Ask 3 follow-ups: data source (gauge/radio); spread across months; last season total vs normal.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q103
+  prompt: |-
+    Task:
+    - Note weaknesses (no threshold/duration/window).
+    - Expected answer: number of dry spells ≥7 days last season.
+    - Ask 3 follow-ups: longest spell length; crop stage then; management response (mulch/replant/irrigation).
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q104
+  prompt: |-
+    Task:
+    - Note weaknesses (no week/temp/measure).
+    - Expected answer: hottest week and typical max temp (°C).
+    - Ask 3 follow-ups: measurement source; heat stress symptoms seen; shade/mulch actions taken.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q105
+  prompt: |-
+    Task:
+    - Note weaknesses (unclear month/frequency).
+    - Expected answer: frost risk month (or "none").
+    - Ask 3 follow-ups: last frost date remembered; altitude/microclimate; protective actions if any.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q106
+  prompt: |-
+    Task:
+    - Note weaknesses (no threshold/units).
+    - Expected answer: heavy-rain days (>30 mm) last season (count).
+    - Ask 3 follow-ups: worst event date; erosion/lodging impact; drainage measures used.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q107
+  prompt: |-
+    Task:
+    - Note weaknesses (no frequency/impact).
+    - Expected answer: windstorm events affecting lodging per season (count).
+    - Ask 3 follow-ups: lodging % at worst; staking/variety standability; harvest delay caused.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q108
+  prompt: |-
+    Task:
+    - Note weaknesses (no %/location).
+    - Expected answer: flooded/ponded field area (% of acres) in a typical bad event.
+    - Ask 3 follow-ups: low spots location; drainage outlet; crop loss % there last season.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q109
+  prompt: |-
+    Task:
+    - Note weaknesses (no tool/frequency).
+    - Expected answer: on-farm rain gauge use (Yes/No) & reading frequency.
+    - Ask 3 follow-ups: brand/type; who records; how info affects planting/fertilizer.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q110
+  prompt: |-
+    Task:
+    - Note weaknesses (vague timing/rule).
+    - Expected answer: earliest safe harvest week/month tied to moisture or rain pattern.
+    - Ask 3 follow-ups: moisture target used; storm risk window; drying capacity if earlier.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q111
+  prompt: |-
+    Task:
+    - Note weaknesses (no year/value/source).
+    - Expected answer: last soil test year and pH.
+    - Ask 3 follow-ups: lab/source; OM% if known; actions taken from results (lime/fert).
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q112
+  prompt: |-
+    Task:
+    - Note weaknesses (no %/method).
+    - Expected answer: estimated soil organic matter (%) or proxy.
+    - Ask 3 follow-ups: basis (test/color/texture); residue/compost practice; trend over 3 yrs.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q113
+  prompt: |-
+    Task:
+    - Note weaknesses (no rate/unit/timing).
+    - Expected answer: manure/compost rate (t/acre) last season.
+    - Ask 3 follow-ups: timing & incorporation; source/quality; observed yield effect.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q114
+  prompt: |-
+    Task:
+    - Note weaknesses (product/rate unclear).
+    - Expected answer: basal fertilizer product and rate (kg/acre).
+    - Ask 3 follow-ups: placement (band/broadcast); timing at planting; cost per acre.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q115
+  prompt: |-
+    Task:
+    - Note weaknesses (no splits/week).
+    - Expected answer: topdress N schedule (weeks after planting and % split).
+    - Ask 3 follow-ups: rain timing rule; product used; missed-split plan.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q116
+  prompt: |-
+    Task:
+    - Note weaknesses (no micro/units).
+    - Expected answer: micronutrients used (e.g., Zn/B) and rate.
+    - Ask 3 follow-ups: deficiency symptoms seen; application method; response observed.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q117
+  prompt: |-
+    Task:
+    - Note weaknesses (no target range/rationale).
+    - Expected answer: target soil pH range for maize.
+    - Ask 3 follow-ups: current pH; liming plan/frequency; buffer/soil type effect considered?
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q118
+  prompt: |-
+    Task:
+    - Note weaknesses (placement depth missing).
+    - Expected answer: preferred fertilizer placement (band/broadcast) & depth (cm).
+    - Ask 3 follow-ups: tools used; seed-to-fert distance; reason (efficiency/burn risk).
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q119
+  prompt: |-
+    Task:
+    - Note weaknesses (no NPK ratio/rate).
+    - Expected answer: starter fertilizer presence and NPK ratio/rate.
+    - Ask 3 follow-ups: starter placement; seedling response; cost justification.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q120
+  prompt: |-
+    Task:
+    - Note weaknesses (no species/area).
+    - Expected answer: cover crop species after maize and area (%) planted.
+    - Ask 3 follow-ups: termination timing; benefits sought; seed source/costs.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q121
+  prompt: |-
+    Task:
+    - Note weaknesses (no method/sample).
+    - Expected answer: seed germination test method & result (%).
+    - Ask 3 follow-ups: sample size; pre-soak/days; action if <85%.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q122
+  prompt: |-
+    Task:
+    - Note weaknesses (no years/selection).
+    - Expected answer: saved-seed reuse years and selection method.
+    - Ask 3 follow-ups: storage conditions; off-types removal; disease risk handling.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q123
+  prompt: |-
+    Task:
+    - Note weaknesses (no ranking/nums).
+    - Expected answer: top 3 traits ranked (1–3).
+    - Ask 3 follow-ups: why #1 matters most; numeric target for #1; trade-off you accept.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q124
+  prompt: |-
+    Task:
+    - Note weaknesses (no reason/context).
+    - Expected answer: preferred maturity group (early/medium/late) and brief reason.
+    - Ask 3 follow-ups: rainfall length; market timing; risk of lodging/disease late.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q125
+  prompt: |-
+    Task:
+    - Note weaknesses (no container/duration).
+    - Expected answer: seed storage method before planting.
+    - Ask 3 follow-ups: moisture control (desiccant/liner); storage duration; pest protection.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q126
+  prompt: |-
+    Task:
+    - Note weaknesses (units missing/mismatch).
+    - Expected answer: row spacing (cm) and in-row spacing (cm).
+    - Ask 3 follow-ups: planter/hole tool; reason for spacing; adjustments for intercrop.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q127
+  prompt: |-
+    Task:
+    - Note weaknesses (no depth/variation).
+    - Expected answer: planting depth target (cm) and tolerance.
+    - Ask 3 follow-ups: depth control method; soil moisture rule; emergence results.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q128
+  prompt: |-
+    Task:
+    - Note weaknesses (no rule/percent/timing).
+    - Expected answer: replant decision rule (e.g., >20% gaps or >1 m gaps by 10 DAP).
+    - Ask 3 follow-ups: who checks/when; seed reserve; partial gap-filling method.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q129
+  prompt: |-
+    Task:
+    - Note weaknesses (no rationale).
+    - Expected answer: tillage system (conventional/min/zero) and brief reason.
+    - Ask 3 follow-ups: residue handling; fuel/labor costs; yield impact observed.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q130
+  prompt: |-
+    Task:
+    - Note weaknesses (no schedule/method).
+    - Expected answer: weed control plan first 6 weeks (manual/chemical schedule).
+    - Ask 3 follow-ups: WAP timings; target weeds; backup if rain blocks access.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q131
+  prompt: |-
+    Task:
+    - Note weaknesses (no ranking/ID).
+    - Expected answer: top 3 weeds; name the toughest.
+    - Ask 3 follow-ups: why toughest (timing/mode); effective control tried; seedbank strategy.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q132
+  prompt: |-
+    Task:
+    - Note weaknesses (no product/count).
+    - Expected answer: insecticide use last season (product & # sprays).
+    - Ask 3 follow-ups: threshold to spray; interval; PPE/safety practices used.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q133
+  prompt: |-
+    Task:
+    - Note weaknesses (no pest/indicator).
+    - Expected answer: resistance concerns (Yes/No) and which pest.
+    - Ask 3 follow-ups: evidence (survival, repeats); rotation of MOA; non-chemical steps.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q134
+  prompt: |-
+    Task:
+    - Note weaknesses (no frequency/method).
+    - Expected answer: scouting frequency (days) and method.
+    - Ask 3 follow-ups: sample size/area; record keeping; action threshold used.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q135
+  prompt: |-
+    Task:
+    - Note weaknesses (no stage/symptoms).
+    - Expected answer: first disease observed stage and key symptom description.
+    - Ask 3 follow-ups: conducive weather; spread speed; control attempted.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q136
+  prompt: |-
+    Task:
+    - Note weaknesses (no %/location).
+    - Expected answer: rodent/bird damage % in field and in storage.
+    - Ask 3 follow-ups: hotspot location; protection methods; seasonal pattern.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q137
+  prompt: |-
+    Task:
+    - Note weaknesses (generic only).
+    - Expected answer: IPM actions used (2–3 items) with brief triggers.
+    - Ask 3 follow-ups: cultural step; mechanical/biological step; economic threshold used.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q138
+  prompt: |-
+    Task:
+    - Note weaknesses (no structure/area).
+    - Expected answer: water harvesting structures used (bunds/tying/zai) and area covered.
+    - Ask 3 follow-ups: labor need; maintenance; yield benefit seen.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q139
+  prompt: |-
+    Task:
+    - Note weaknesses (no thickness/coverage).
+    - Expected answer: mulching practice and typical thickness/coverage (% area).
+    - Ask 3 follow-ups: material source; timing applied; weed/soil-moisture effect.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q140
+  prompt: |-
+    Task:
+    - Note weaknesses (rule vague/NA handling).
+    - Expected answer: irrigation scheduling rule (or "none").
+    - Ask 3 follow-ups: method (soil feel/gauge); interval/volume; cutoff rule before harvest.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q141
+  prompt: |-
+    Task:
+    - Note weaknesses (no criteria/method).
+    - Expected answer: harvest method and start criteria (e.g., black layer or ~15% moisture).
+    - Ask 3 follow-ups: tool/machinery used; lodging losses; staggered vs single pass.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q142
+  prompt: |-
+    Task:
+    - Note weaknesses (no throughput/loss).
+    - Expected answer: shelling method and throughput (bags/hour).
+    - Ask 3 follow-ups: grain damage %; cost per bag; power source/availability.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q143
+  prompt: |-
+    Task:
+    - Note weaknesses (no surface/frequency).
+    - Expected answer: drying surface and turning frequency.
+    - Ask 3 follow-ups: drying duration typical; re-wet handling; night cover practice.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q144
+  prompt: |-
+    Task:
+    - Note weaknesses (no container/liner).
+    - Expected answer: storage container (crib/silo/bags) and liner use (Yes/No).
+    - Ask 3 follow-ups: aeration/stacking; pest protection (actives); storage length months.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q145
+  prompt: |-
+    Task:
+    - Note weaknesses (no test/method).
+    - Expected answer: aflatoxin testing use (Yes/No) and method.
+    - Ask 3 follow-ups: when tested; action if high; who provides test/service cost.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q146
+  prompt: |-
+    Task:
+    - Note weaknesses (no buyer/distance).
+    - Expected answer: usual buyer type and distance to buyer.
+    - Ask 3 follow-ups: transport mode; price negotiation; grading at buyer point.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q147
+  prompt: |-
+    Task:
+    - Note weaknesses (no basis/date).
+    - Expected answer: expected price at next harvest (currency/90 kg) and basis month.
+    - Ask 3 follow-ups: info source; storage plan to time sale; minimum acceptable price.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q148
+  prompt: |-
+    Task:
+    - Note weaknesses (no components/season).
+    - Expected answer: cost of production per acre last season (currency) with major components.
+    - Ask 3 follow-ups: top 3 cost items; family vs hired labor share; plan to reduce cost.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q149
+  prompt: |-
+    Task:
+    - Note weaknesses (no unit/timing).
+    - Expected answer: peak weeding labor demand (person-days/acre).
+    - Ask 3 follow-ups: when in season; hired labor availability; wage rate last season.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+- nodeId: Q150
+  prompt: |-
+    Task:
+    - Note weaknesses (no access/cost/lead time).
+    - Expected answer: access to tractor/planter (Yes/No), typical lead time (days) and cost/acre.
+    - Ask 3 follow-ups: booking method; breakdown risk/backup; field size limits for service.
+    - Score 1–100.
+
+    Question: {{QUESTION}}
+    Answer: {{ANSWER}}
+graph:
+  startId: Start
+  nodes:
+  - id: Start
+    type: START
+    title: Start
+    question: Start
+    nextId: Q101
+  - id: Q101
+    type: AI
+    title: Planting Trigger (Rain)
+    question: >-
+      What rainfall or field-condition trigger tells you it’s safe to plant the first maize? (e.g., mm over 1–2 days, first soaking rain, other.)
+    nextId: Q102
+  - id: Q102
+    type: AI
+    title: Seasonal Rainfall Total
+    question: >-
+      In a typical main season, about how many millimeters of rain do you receive?
+    nextId: Q103
+  - id: Q103
+    type: AI
+    title: Dry Spells (≥7 days)
+    question: >-
+      Last season, how many dry spells of 7 days or longer did you experience?
+    nextId: Q104
+  - id: Q104
+    type: AI
+    title: Hottest Week & Max Temp
+    question: >-
+      Which week is usually the hottest, and what is the typical maximum temperature (°C)?
+    nextId: Q105
+  - id: Q105
+    type: AI
+    title: Frost Risk Month
+    question: >-
+      Is there a month with frost risk in your area? If yes, which month? If none, say 'none'.
+    nextId: Q106
+  - id: Q106
+    type: AI
+    title: Heavy-Rain Days
+    question: >-
+      How many heavy-rain days (>30 mm) did you have last season?
+    nextId: Q107
+  - id: Q107
+    type: AI
+    title: Windstorms & Lodging
+    question: >-
+      How often do windstorms cause lodging in your maize (events per season)?
+    nextId: Q108
+  - id: Q108
+    type: AI
+    title: Flooded Area Share
+    question: >-
+      During a typical bad event, what share of your field floods or ponds? (Give % of area.)
+    nextId: Q109
+  - id: Q109
+    type: AI
+    title: Rain Gauge Use
+    question: >-
+      Do you use an on-farm rain gauge? If yes, how often do you read it?
+    nextId: Q110
+  - id: Q110
+    type: AI
+    title: Earliest Safe Harvest
+    question: >-
+      What is the earliest safe harvest time (week/month) for your first maize, considering moisture and rain risk?
+    nextId: Q111
+  - id: Q111
+    type: AI
+    title: Last Soil Test & pH
+    question: >-
+      When was your last soil test, and what was the soil pH?
+    nextId: Q112
+  - id: Q112
+    type: AI
+    title: Organic Matter %
+    question: >-
+      What is your soil organic matter (%)? If unknown, give your best estimate and basis.
+    nextId: Q113
+  - id: Q113
+    type: AI
+    title: Manure/Compost Rate
+    question: >-
+      How much manure or compost did you apply last season? (tons per acre)
+    nextId: Q114
+  - id: Q114
+    type: AI
+    title: Basal Fertilizer
+    question: >-
+      Which basal fertilizer do you use and at what rate? (kg per acre)
+    nextId: Q115
+  - id: Q115
+    type: AI
+    title: Topdress N Schedule
+    question: >-
+      How do you split and time your nitrogen topdressing? (weeks after planting and %)
+    nextId: Q116
+  - id: Q116
+    type: AI
+    title: Micronutrients
+    question: >-
+      Do you use micronutrients like zinc or boron? If yes, which and at what rate?
+    nextId: Q117
+  - id: Q117
+    type: AI
+    title: Target Soil pH
+    question: >-
+      What is your target soil pH range for maize?
+    nextId: Q118
+  - id: Q118
+    type: AI
+    title: Fertilizer Placement
+    question: >-
+      How do you place fertilizer (band/broadcast) and at what depth (cm)?
+    nextId: Q119
+  - id: Q119
+    type: AI
+    title: Starter Fertilizer
+    question: >-
+      Do you use a starter fertilizer? If yes, what NPK ratio and rate?
+    nextId: Q120
+  - id: Q120
+    type: AI
+    title: Cover Crops
+    question: >-
+      Do you plant a cover crop after maize? Which species and what area (%)?
+    nextId: Q121
+  - id: Q121
+    type: AI
+    title: Germination Test
+    question: >-
+      Do you test seed germination? How do you test and what % did you get?
+    nextId: Q122
+  - id: Q122
+    type: AI
+    title: Saved Seed Reuse
+    question: >-
+      How many years have you reused saved maize seed, and how do you select it?
+    nextId: Q123
+  - id: Q123
+    type: AI
+    title: Trait Ranking
+    question: Rank your top three maize traits (1–3).
+    nextId: Q124
+  - id: Q124
+    type: AI
+    title: Maturity Preference
+    question: >-
+      Do you prefer early-, medium-, or late-maturing varieties, and why?
+    nextId: Q125
+  - id: Q125
+    type: AI
+    title: Seed Storage
+    question: >-
+      How do you store seed before planting? (container, liner, duration)
+    nextId: Q126
+  - id: Q126
+    type: AI
+    title: Row & In-row Spacing
+    question: >-
+      What row spacing (cm) and in-row spacing (cm) do you use?
+    nextId: Q127
+  - id: Q127
+    type: AI
+    title: Planting Depth
+    question: What planting depth (cm) do you target?
+    nextId: Q128
+  - id: Q128
+    type: AI
+    title: Replant Rule
+    question: >-
+      What is your decision rule for replanting gaps or poor stands?
+    nextId: Q129
+  - id: Q129
+    type: AI
+    title: Tillage System
+    question: >-
+      Which tillage system do you use (conventional/minimum/zero), and why?
+    nextId: Q130
+  - id: Q130
+    type: AI
+    title: Weed Control Plan
+    question: >-
+      How do you plan weed control in the first six weeks (manual/chemical and schedule)?
+    nextId: Q131
+  - id: Q131
+    type: AI
+    title: Top Weeds
+    question: >-
+      Name your top three weeds and which is most difficult.
+    nextId: Q132
+  - id: Q132
+    type: AI
+    title: Insecticide Use
+    question: >-
+      Which insecticide(s) did you use last season and how many sprays?
+    nextId: Q133
+  - id: Q133
+    type: AI
+    title: Resistance Concern
+    question: >-
+      Have you seen signs of resistance in any pest? If yes, which one?
+    nextId: Q134
+  - id: Q134
+    type: AI
+    title: Scouting Frequency
+    question: >-
+      How often do you scout your maize and how do you sample?
+    nextId: Q135
+  - id: Q135
+    type: AI
+    title: First Disease & Symptoms
+    question: >-
+      Which disease appears first and what key symptoms do you observe?
+    nextId: Q136
+  - id: Q136
+    type: AI
+    title: Rodent/Bird Damage
+    question: >-
+      Roughly what percent of yield is lost to rodents/birds in field and storage?
+    nextId: Q137
+  - id: Q137
+    type: AI
+    title: IPM Actions
+    question: >-
+      Which integrated pest management steps do you use and when?
+    nextId: Q138
+  - id: Q138
+    type: AI
+    title: Water Harvesting
+    question: >-
+      Do you use water harvesting (bunds, zai pits, tied ridges)? On what area?
+    nextId: Q139
+  - id: Q139
+    type: AI
+    title: Mulching Practice
+    question: >-
+      Do you mulch maize? What thickness or coverage (%) do you aim for?
+    nextId: Q140
+  - id: Q140
+    type: AI
+    title: Irrigation Rule
+    question: >-
+      If you irrigate, how do you decide when and how much? If not, say 'none'.
+    nextId: Q141
+  - id: Q141
+    type: AI
+    title: Harvest Method & Criteria
+    question: >-
+      How do you harvest (hand/mechanized) and what criteria start harvest?
+    nextId: Q142
+  - id: Q142
+    type: AI
+    title: Shelling Throughput
+    question: >-
+      How do you shell maize and what is your throughput (bags/hour)?
+    nextId: Q143
+  - id: Q143
+    type: AI
+    title: Drying Practice
+    question: >-
+      Where do you dry grain and how often do you turn it?
+    nextId: Q144
+  - id: Q144
+    type: AI
+    title: Storage Container
+    question: >-
+      What storage container do you use and do you use liners?
+    nextId: Q145
+  - id: Q145
+    type: AI
+    title: Aflatoxin Testing
+    question: >-
+      Do you test for aflatoxin? If yes, how and when?
+    nextId: Q146
+  - id: Q146
+    type: AI
+    title: Usual Buyer
+    question: >-
+      Who do you usually sell to and how far are they from your farm?
+    nextId: Q147
+  - id: Q147
+    type: AI
+    title: Expected Price
+    question: >-
+      What price do you expect at the next harvest (currency per 90 kg) and when?
+    nextId: Q148
+  - id: Q148
+    type: AI
+    title: Cost of Production
+    question: >-
+      About how much did it cost to produce one acre last season? List main cost items.
+    nextId: Q149
+  - id: Q149
+    type: AI
+    title: Peak Labor Need
+    question: >-
+      At peak weeding, how many person-days per acre do you need?
+    nextId: Q150
+  - id: Q150
+    type: AI
+    title: Mechanization Access
+    question: >-
+      Can you hire a tractor or planter? What is the usual lead time (days) and cost per acre?
+    nextId: Review
+  - id: Review
+    type: REVIEW
+    title: Review
+    question: ''
+    nextId: Done
+  - id: Done
+    type: DONE
+    title: Done
+    question: ''

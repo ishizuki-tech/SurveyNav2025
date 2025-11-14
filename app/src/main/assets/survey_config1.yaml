@@ -1,0 +1,154 @@
+graph:
+  startId: Start
+  nodes:
+    - id: Start
+      type: START
+      title: Start
+      question: Start
+      nextId: Q1
+    - id: Q1
+      type: AI
+      title: FAW Yield Loss (3 Seasons)
+      question: >-
+        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
+      nextId: Q2
+    - id: Q2
+      type: AI
+      title: Trade-off for 10-Day Earlier Harvest
+      question: >-
+        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
+      nextId: Q3
+    - id: Q3
+      type: AI
+      title: Damage Threshold to Switch Variety
+      question: >-
+        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
+      nextId: Q4
+    - id: Q4
+      type: AI
+      title: Expectations for Replacement Variety
+      question: >-
+        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+      nextId: Q5
+    - id: Q5
+      type: AI
+      title: Minimum Acceptable Harvest in Bad Year
+      question: >-
+        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
+      nextId: Q6
+    - id: Q6
+      type: AI
+      title: Most Damaging Drought Timing
+      question: >-
+        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+      nextId: Review
+    - id: Review
+      type: REVIEW
+      title: Review
+      question: ''
+      nextId: Done
+    - id: Done
+      type: DONE
+      title: Done
+      question: ''
+
+slm:
+  accelerator: "GPU"
+  max_tokens: 4096
+  top_k: 10
+  top_p: 0.2
+  temperature: 0.5
+  user_turn_prefix: "<start_of_turn>user"
+  model_turn_prefix: "<start_of_turn>model"
+  turn_end: "<end_of_turn>"
+  empty_json_instruction: "Respond with an empty JSON object: {}"
+  preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
+  key_contract: |
+    OUTPUT FORMAT:
+    - In English.
+    - Keys:
+      • "analysis": short string
+      • "expected answer": short string
+      • "follow-up question": a single short confirm/validate question (NOT an array)
+      • "score": integer 1–100
+    FOLLOW-UP INTENT:
+    - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
+    - It must target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
+    - Keep it single-scope (no multi-part), concrete, and answerable immediately.
+    - Do not introduce new topics or additional objectives.
+  length_budget: |
+    LENGTH LIMITS:
+    - analysis<=60 chars; follow-up<=120; expected answer<=120.
+  scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+  strict_output: |-
+    STRICT OUTPUT (NO MARKDOWN):
+    - RAW JSON only, ONE LINE.
+    - Use COMPACT JSON (no spaces around ':' and ',').
+    - No extra text.
+
+prompts:
+  - nodeId: Q1
+    prompt: |-
+      Task:
+      - Note weaknesses (e.g., unclear units, missing seasons, outliers).
+      - Provide ONE strong expected answer: avg FAW yield loss over last 3 seasons (% or bags/acre); note high variability if present.
+      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming unit + baseline or per-season values if missing.
+      - Score 1–100.
+      
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q2
+    prompt: |-
+      Task:
+      - Note weaknesses (e.g., vague trade-off, no units, no rationale).
+      - Provide a strong expected answer: willingness-to-accept yield loss to harvest 10 days earlier (% or bags/acre) with a one-clause reason (rain risk/price).
+      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer clarifying the unit/amount or rationale boundary (max acceptable loss).
+      - Score 1–100 (integer).
+      
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q3
+    prompt: |-
+      Task:
+      - Note weaknesses (e.g., no threshold, unclear measure, pest vs disease mixed).
+      - Provide a strong expected answer: a clear switching threshold (e.g., ≥X% plants/ears with moderate+ damage, or a severity level at tasseling).
+      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the metric/scale or growth stage window.
+      - Score 1–100 (integer).
+      
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q4
+    prompt: |-
+      Task:
+      - Note weaknesses (e.g., generic traits, missing numbers).
+      - Provide a strong expected answer listing 2 compact replacement targets with numeric/categorical thresholds.
+      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the top-priority trait or a numeric target.
+      - Score 1–100 (integer).
+      
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q5
+    prompt: |-
+      Task:
+      - Note weaknesses (e.g., no baseline, no unit, no decision rule).
+      - Provide a strong expected answer: minimum acceptable harvest in a bad year (% or bags/acre) plus a terse rule.
+      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming baseline average or a concrete bad-year example.
+      - Score 1–100 (integer).
+      
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q6
+    prompt: |-
+      Task:
+      - Note weaknesses (e.g., vague timing, no stage, no symptoms).
+      - Provide a strong expected answer: most damaging drought moment as a crop stage with a one-clause reason.
+      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the stage definition or a concrete season example.
+      - Score 1–100 (integer).
+      
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}

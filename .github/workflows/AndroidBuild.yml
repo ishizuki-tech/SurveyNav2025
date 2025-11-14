@@ -1,0 +1,232 @@
+name: Android CI & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Android module (e.g. app)"
+        default: "app"
+      create_release:
+        description: "Publish GitHub Release with artifacts"
+        type: boolean
+        default: true
+      ndk_version:
+        description: "Android NDK version"
+        default: "25.2.9519653"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MODULE_PATH: ${{ inputs.module || 'app' }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Validate Gradle wrapper
+        uses: gradle/wrapper-validation-action@v2
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: ${{ inputs.ndk_version }}
+
+      - name: Install required SDK components
+        run: |-
+          yes | sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "platform-tools" || true
+
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Configure gradle.properties
+        shell: bash
+        run: |-
+          [[ -n "${{ secrets.GH_TOKEN }}" ]] || { echo "::error ::GH_TOKEN is not configured"; exit 1; }
+          mkdir -p "$HOME/.gradle"
+          cat <<'PROPS' > "$HOME/.gradle/gradle.properties"
+          gh.owner=ishizuki-tech
+          gh.repo=SurveyNav
+          gh.branch=main
+          gh.pathPrefix=exports
+          gh.token=${{ secrets.GH_TOKEN }}
+          HF_TOKEN=${{ secrets.HF_TOKEN }}
+          PROPS
+
+      - name: Decode signing keystore
+        if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |-
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
+          echo "ANDROID_KEYSTORE_FILE=$PWD/keystore.jks" >> $GITHUB_ENV
+
+      - name: Build release artifacts
+        run: |-
+          ./gradlew \
+            :${{ env.MODULE_PATH }}:clean \
+            :${{ env.MODULE_PATH }}:assembleRelease \
+            :${{ env.MODULE_PATH }}:bundleRelease \
+            --no-daemon --stacktrace
+
+      - name: Collect outputs
+        id: collect
+        shell: bash
+        run: |-
+          ROOT="${MODULE_PATH}/build/outputs"
+          APKs=$(find "$ROOT" -type f -name '*.apk' -print | sort || true)
+          AABs=$(find "$ROOT" -type f -name '*.aab' -print | sort || true)
+          MAPs=$(find "$ROOT" -type f -name 'mapping.txt' -print | sort || true)
+          APK_COUNT=$(printf '%s\n' "$APKs" | sed '/^$/d' | wc -l | tr -d ' ')
+          AAB_COUNT=$(printf '%s\n' "$AABs" | sed '/^$/d' | wc -l | tr -d ' ')
+          MAP_COUNT=$(printf '%s\n' "$MAPs" | sed '/^$/d' | wc -l | tr -d ' ')
+          printf '%s\n' "apk_count=$APK_COUNT" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "aab_count=$AAB_COUNT" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "map_count=$MAP_COUNT" >> "$GITHUB_OUTPUT"
+          {
+            echo "apk_list<<EOF"
+            printf '%s\n' "$APKs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "aab_list<<EOF"
+            printf '%s\n' "$AABs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "map_list<<EOF"
+            printf '%s\n' "$MAPs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifacts
+        if: ${{ steps.collect.outputs.apk_count != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: ${{ steps.collect.outputs.apk_list }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload AAB artifacts
+        if: ${{ steps.collect.outputs.aab_count != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: ${{ steps.collect.outputs.aab_list }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload mapping files
+        if: ${{ steps.collect.outputs.map_count != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: proguard-mapping
+          path: ${{ steps.collect.outputs.map_list }}
+          retention-days: 14
+
+      - name: Derive version name
+        id: version
+        shell: bash
+        run: |-
+          set -Eeuo pipefail
+          FILE_GRADLE="${MODULE_PATH}/build.gradle.kts"
+          FILE_MANIFEST="${MODULE_PATH}/src/main/AndroidManifest.xml"
+          VERSION=""
+
+          if [[ -f "$FILE_GRADLE" ]]; then
+            VERSION=$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*[:=][[:space:]]*"([^"]+)".*/\1/p' "$FILE_GRADLE" | head -n1 || true)
+          fi
+
+          if [[ -z "${VERSION:-}" && -f "$FILE_MANIFEST" ]]; then
+            VERSION=$(sed -nE 's/.*versionName="([^"]+)".*/\1/p' "$FILE_MANIFEST" | head -n1 || true)
+          fi
+
+          if [[ -z "${VERSION:-}" ]]; then
+            VERSION="0.0.0"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release body
+        id: notes
+        shell: bash
+        run: |-
+          APKs=$(printf '%s\n' "${{ steps.collect.outputs.apk_list }}" | sed '/^$/d')
+          AABs=$(printf '%s\n' "${{ steps.collect.outputs.aab_list }}" | sed '/^$/d')
+          NOTES=$(git log -10 --pretty='* %s (%an)')
+          APK_SAMPLE=$(printf '%s\n' "$APKs" | head -n1)
+          AAB_SAMPLE=$(printf '%s\n' "$AABs" | head -n1)
+          [[ -n "$APK_SAMPLE" ]] || APK_SAMPLE="your-release.apk"
+          [[ -n "$AAB_SAMPLE" ]] || AAB_SAMPLE="your-release.aab"
+          DELIM="BODY_$(date +%s)"
+          {
+            echo "body<<$DELIM"
+            echo "## What's Changed"
+            echo "$NOTES"
+            echo
+            echo "## Install Guide"
+            echo "1. adb install -r -g $APK_SAMPLE"
+            echo "2. bundletool build-apks --bundle $AAB_SAMPLE --output app.apks --mode=universal"
+            echo "3. bundletool install-apks --apks app.apks"
+            echo
+            echo "## Assets"
+            printf '%s\n' "$APKs" | sed '/^$/d' | while IFS= read -r f; do
+              echo "- $(basename "$f")"
+            done
+            printf '%s\n' "$AABs" | sed '/^$/d' | while IFS= read -r f; do
+              echo "- $(basename "$f")"
+            done
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute release tag
+        id: tag
+        shell: bash
+        run: |-
+          TAG="v${{ steps.version.outputs.version }}-$(date '+%Y%m%d-%H%M')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.create_release && (steps.collect.outputs.apk_count != '0' || steps.collect.outputs.aab_count != '0') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+          files: |
+            ${{ steps.collect.outputs.apk_list }}
+            ${{ steps.collect.outputs.aab_list }}
+          draft: false
+          prerelease: false
+
+      - name: Skip release
+        if: ${{ !inputs.create_release || (steps.collect.outputs.apk_count == '0' && steps.collect.outputs.aab_count == '0') }}
+        run: echo "Release publishing skipped."
