@@ -2,7 +2,7 @@
  * =====================================================================
  *  IshizukiTech LLC — SLM Integration Framework
  *  ---------------------------------------------------------------------
- *  File: SurveyConfig.kt
+ *  File: SurveyConfigLoader.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
  *  © 2025 IshizukiTech LLC. All rights reserved.
@@ -11,13 +11,13 @@
  *  Summary:
  *  ---------------------------------------------------------------------
  *  Strongly-typed survey configuration model and loader.
- *  Supports JSON and YAML formats, SLM metadata, and structural validation
- *  for graph-based survey flows.
+ *  Supports JSON and YAML formats, SLM metadata, model defaults,
+ *  and structural validation for graph-based survey flows.
  *
  *  Features:
- *   • Typed prompts, graph, and SLM runtime metadata
+ *   • Typed prompts, graph, SLM runtime metadata, and model defaults
  *   • JSON/YAML auto-detection with BOM and newline normalization
- *   • Config-level graph validation with human-readable diagnostics
+ *   • Config-level graph/SLM/model-defaults validation
  *   • Backward-compatible type aliases for legacy call sites
  * =====================================================================
  */
@@ -37,14 +37,15 @@ import kotlinx.serialization.json.Json
 /**
  * Top-level configuration model for a survey.
  *
- * Aggregates the prompt table, graph structure, and SLM metadata
- * that describe how a survey should be executed at runtime.
+ * Aggregates the prompt table, graph structure, SLM metadata, and model
+ * defaults that describe how a survey should be executed at runtime.
  */
 @Serializable
 data class SurveyConfig(
     val prompts: List<Prompt> = emptyList(),
     val graph: Graph,
-    val slm: SlmMeta = SlmMeta()
+    val slm: SlmMeta = SlmMeta(),
+    @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
 
     // ---------------------------------------------------------------------
@@ -78,6 +79,10 @@ data class SurveyConfig(
         val startId: String,
         val nodes: List<NodeDTO>
     )
+
+    // ---------------------------------------------------------------------
+    // SLM metadata
+    // ---------------------------------------------------------------------
 
     /**
      * SLM runtime parameters and system-prompt metadata.
@@ -134,6 +139,53 @@ data class SurveyConfig(
         /** Extra constraints to enforce strict output formats. */
         @SerialName("strict_output") val strict_output: String? = null
     )
+
+    // ---------------------------------------------------------------------
+    // Model defaults (download/UI level)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Model download and UI default settings.
+     *
+     * These values are optional overrides for the client-side defaults
+     * used by the SLM integration (for example, download URL and timeouts).
+     */
+    @Serializable
+    data class ModelDefaults(
+        /**
+         * Default model URL for the download UI.
+         *
+         * Example:
+         * "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/..."
+         */
+        @SerialName("default_model_url") val defaultModelUrl: String? = null,
+
+        /**
+         * Default file name to use when saving the model locally.
+         *
+         * Example: "swahili-gemma-1b-fp16.task"
+         */
+        @SerialName("default_file_name") val defaultFileName: String? = null,
+
+        /**
+         * Optional timeout override for model loading/inference, in milliseconds.
+         */
+        @SerialName("timeout_ms") val timeoutMs: Long? = null,
+
+        /**
+         * Optional UI throttling interval for streaming updates, in milliseconds.
+         */
+        @SerialName("ui_throttle_ms") val uiThrottleMs: Long? = null,
+
+        /**
+         * Optional minimum number of streamed bytes before pushing a UI update.
+         */
+        @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
+    )
+
+    // ---------------------------------------------------------------------
+    // Validation
+    // ---------------------------------------------------------------------
 
     /**
      * Validate the internal structure of this configuration and return a list
@@ -237,6 +289,33 @@ data class SurveyConfig(
         slm.temperature?.let {
             if (it < 0.0) {
                 issues += "slm.temperature must be >= 0.0 (got $it)"
+            }
+        }
+
+        // --- Model defaults sanity (optional, only if given) ---
+        modelDefaults.defaultModelUrl?.let { url ->
+            if (url.isBlank()) {
+                issues += "model_defaults.default_model_url is blank"
+            }
+        }
+        modelDefaults.defaultFileName?.let { name ->
+            if (name.isBlank()) {
+                issues += "model_defaults.default_file_name is blank"
+            }
+        }
+        modelDefaults.timeoutMs?.let { ms ->
+            if (ms <= 0L) {
+                issues += "model_defaults.timeout_ms must be > 0 (got $ms)"
+            }
+        }
+        modelDefaults.uiThrottleMs?.let { ms ->
+            if (ms < 0L) {
+                issues += "model_defaults.ui_throttle_ms must be >= 0 (got $ms)"
+            }
+        }
+        modelDefaults.uiMinDeltaBytes?.let { bytes ->
+            if (bytes < 0L) {
+                issues += "model_defaults.ui_min_delta_bytes must be >= 0 (got $bytes)"
             }
         }
 

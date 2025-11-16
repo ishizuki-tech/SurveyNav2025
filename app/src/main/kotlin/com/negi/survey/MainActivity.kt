@@ -95,22 +95,29 @@ import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.BuildConfig
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
- * App entry point — edge-to-edge & black system bars with light icons.
+ * Root activity of the SurveyNav app.
+ *
+ * English comment:
+ * - Enables edge-to-edge system bars with dark (black) backgrounds.
+ * - Delegates all UI to [AppNav] which hosts the survey flow, model
+ *   download gate, and SLM initialization gate.
  */
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // English comment:
-        // Prefer new API (light icons on black bars). Fall back gracefully for older devices.
+        // Prefer modern edge-to-edge API. Fall back gracefully on older devices.
         try {
             enableEdgeToEdge(
                 statusBarStyle = SystemBarStyle.dark("#000000".toColorInt()),
@@ -118,12 +125,12 @@ class MainActivity : ComponentActivity() {
             )
         } catch (_: Throwable) {
             WindowCompat.setDecorFitsSystemWindows(window, false)
-            val c = WindowInsetsControllerCompat(window, window.decorView)
-            c.isAppearanceLightStatusBars = false
-            c.isAppearanceLightNavigationBars = false
+            val controller = WindowInsetsControllerCompat(window, window.decorView)
+            controller.isAppearanceLightStatusBars = false
+            controller.isAppearanceLightNavigationBars = false
             window.statusBarColor = 0xFF000000.toInt()
             window.navigationBarColor = 0xFF000000.toInt()
-            if (Build.VERSION.SDK_INT >= 29) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 runCatching { window.isNavigationBarContrastEnforced = false }
             }
         }
@@ -138,6 +145,10 @@ class MainActivity : ComponentActivity() {
 
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
+/**
+ * English comment:
+ * Simple vertical gradient used as a dark backplate behind loading cards.
+ */
 @Composable
 private fun animatedBackplate(): Brush =
     Brush.verticalGradient(
@@ -148,6 +159,9 @@ private fun animatedBackplate(): Brush =
 /**
  * English comment:
  * Ultra-thin neon-like edge glow for cards.
+ *
+ * The effect is built with a radial gradient centered on the composable,
+ * fading from a slightly tinted primary color into full transparency.
  */
 @Composable
 private fun Modifier.neonEdgeThin(
@@ -156,13 +170,13 @@ private fun Modifier.neonEdgeThin(
     corner: Dp = 20.dp
 ): Modifier = this.then(
     Modifier.drawBehind {
-        val r = size.minDimension * 0.45f
+        val radius = size.minDimension * 0.45f
         val cr = corner.toPx()
         drawRoundRect(
             brush = Brush.radialGradient(
                 colors = listOf(color.copy(alpha = intensity), Color.Transparent),
                 center = center,
-                radius = r
+                radius = radius
             ),
             cornerRadius = CornerRadius(cr, cr)
         )
@@ -172,12 +186,19 @@ private fun Modifier.neonEdgeThin(
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 
 /**
+ * Generic initialization gate composable.
+ *
  * English comment:
- * Generic initialization gate:
- * - Runs [init] once for the given [key]
- * - Shows a loading card while running
- * - Shows an error card with retry button on failure
- * - Renders [content] after success
+ * - Executes [init] exactly once for the given [key].
+ * - While running, shows a blocking loading card with subtle animation.
+ * - On failure, shows an error card with a "Retry" action.
+ * - Once [init] succeeds, renders [content] and never shows the gate again
+ *   for the same [key].
+ *
+ * Typical usage:
+ *  - Wrapping SLM model initialization.
+ *  - Wrapping heavy one-time setup logic that must complete before the
+ *    main UI becomes interactive.
  */
 @Composable
 fun InitGate(
@@ -193,6 +214,8 @@ fun InitGate(
     var error by remember(key) { mutableStateOf<Throwable?>(null) }
     val scope = rememberCoroutineScope()
 
+    // English comment:
+    // Small helper that (re)starts the initialization coroutine.
     fun kick() {
         isLoading = true
         error = null
@@ -207,6 +230,8 @@ fun InitGate(
         }
     }
 
+    // English comment:
+    // Run initialization once when the given [key] enters composition.
     LaunchedEffect(key) {
         kick()
     }
@@ -215,6 +240,7 @@ fun InitGate(
 
     when {
         isLoading -> {
+            // Loading state: full-screen dark background + centered card.
             Box(
                 modifier
                     .fillMaxSize()
@@ -241,7 +267,9 @@ fun InitGate(
                         )
                         Spacer(Modifier.height(14.dp))
 
-                        val pulse = rememberInfiniteTransition(label = "pulse")
+                        // English comment:
+                        // Soft alpha pulsing for the headline to avoid a static feel.
+                        val pulse = rememberInfiniteTransition(label = "init_gate_pulse")
                         val alpha by pulse.animateFloat(
                             initialValue = 0.35f,
                             targetValue = 1f,
@@ -249,7 +277,7 @@ fun InitGate(
                                 animation = tween(durationMillis = 1100, easing = LinearEasing),
                                 repeatMode = RepeatMode.Reverse
                             ),
-                            label = "loading_alpha"
+                            label = "init_gate_alpha"
                         )
 
                         Text(
@@ -269,6 +297,7 @@ fun InitGate(
         }
 
         error != null -> {
+            // Error state: same layout, but with error styling and Retry.
             Box(
                 modifier
                     .fillMaxSize()
@@ -306,20 +335,51 @@ fun InitGate(
             }
         }
 
-        else -> content()
+        else -> {
+            // Success state: hand over control to the main content.
+            content()
+        }
     }
 }
 
 /* ───────────────────────────── App Nav Root ───────────────────────────── */
 
+/**
+ * Top-level navigation host for the SurveyNav app.
+ *
+ * English comment:
+ * - Loads the YAML survey configuration from assets.
+ * - Builds [AppViewModel] to manage model download and SLM defaults.
+ * - Shows [DownloadGate] while the SLM model file is being downloaded.
+ * - Once downloaded, initializes SLM via [InitGate] and then hosts the
+ *   survey navigation flow with [SurveyNavHost].
+ */
 @Composable
 fun AppNav() {
     val appContext = LocalContext.current.applicationContext
-    val appVm: AppViewModel = viewModel(factory = AppViewModel.factory())
+
+    // English comment:
+    // 1) Load survey YAML once (graph + SLM metadata + model defaults).
+    val config: SurveyConfig = remember(appContext) {
+        SurveyConfigLoader.fromAssets(appContext, "survey_config1.yaml")
+    }
+
+    // English comment:
+    // 2) Build AppViewModel with overrides injected from YAML model_defaults.
+    val appVm: AppViewModel = viewModel(
+        factory = AppViewModel.factoryFromOverrides(
+            modelUrlOverride = config.modelDefaults.defaultModelUrl,
+            fileNameOverride = config.modelDefaults.defaultFileName,
+            timeoutMsOverride = config.modelDefaults.timeoutMs,
+            uiThrottleMsOverride = config.modelDefaults.uiThrottleMs,
+            uiMinDeltaBytesOverride = config.modelDefaults.uiMinDeltaBytes
+        )
+    )
+
     val state by appVm.state.collectAsState()
 
     // English comment:
-    // Start model download once when entering Idle.
+    // Start model download once when entering Idle state.
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
             appVm.ensureModelDownloaded(appContext)
@@ -331,24 +391,27 @@ fun AppNav() {
         onRetry = { appVm.ensureModelDownloaded(appContext) }
     ) { modelFile ->
 
-        // 1) Load survey config
-        val config: SurveyConfig = remember(appContext) {
-            SurveyConfigLoader.fromAssets(appContext, "survey_config1.yaml")
-        }
-
-        // 2) Build model config from YAML SLM meta
+        // English comment:
+        // 3) Build SLM model configuration map from YAML metadata.
         val modelConfig = remember(config) { buildModelConfig(config.slm) }
 
-        // 3) Create SLM model descriptor
+        // English comment:
+        // 4) Create a concrete SLM model descriptor.
         val slmModel = remember(modelFile.absolutePath, modelConfig) {
+            val modelName = config.modelDefaults.defaultFileName
+                ?.substringBeforeLast('.')
+                ?.ifBlank { null }
+                ?: "ondevice-slm"
+
             Model(
-                name = "gemma-3n-E4B-it",
+                name = modelName,
                 taskPath = modelFile.absolutePath,
                 config = modelConfig
             )
         }
 
-        // 4) Initialize SLM under gate
+        // English comment:
+        // 5) Initialize SLM instance under InitGate.
         InitGate(
             key = slmModel,
             progressText = "Initializing Small Language Model…",
@@ -369,7 +432,7 @@ fun AppNav() {
             }
         ) {
             // English comment:
-            // Cleanup on composition disposal (activity destroy, etc.).
+            // Ensure SLM resources are released when the composition is disposed.
             DisposableEffect(slmModel) {
                 onDispose {
                     runCatching {
@@ -380,12 +443,14 @@ fun AppNav() {
 
             val backStack = rememberNavBackStack(FlowHome)
 
-            // Repo to talk to SLM
+            // English comment:
+            // Repository used by AI ViewModel to talk to SLM.
             val repo: Repository = remember(appContext, slmModel, config) {
                 SlmDirectRepository(slmModel, config)
             }
 
-            // ViewModels
+            // English comment:
+            // Survey ViewModel: holds graph position, answers, and follow-ups.
             val vmSurvey: SurveyViewModel = viewModel(
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
@@ -394,6 +459,8 @@ fun AppNav() {
                 }
             )
 
+            // English comment:
+            // AI ViewModel: wraps SLM calls and exposes responses to the UI.
             val vmAI: AiViewModel = viewModel(
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
@@ -407,13 +474,23 @@ fun AppNav() {
     }
 }
 
+/* ───────────────────────────── Survey Nav Host ───────────────────────────── */
+
 /**
- * Survey flow host.
+ * Host composable for the survey navigation flow.
  *
  * English comment:
- * - UploadProgressOverlay is placed at the root so it can overlay all scenes.
- * - imePadding() is applied inside each screen, not on the root, to avoid
- *   jumping the whole layout.
+ * - Places [UploadProgressOverlay] at the root so upload HUD is always visible.
+ * - Wires each navigation flow key (FlowHome / FlowText / FlowAI / FlowReview /
+ *   FlowDone) to its corresponding screen.
+ * - Manages back navigation via [BackHandler], delegating to [SurveyViewModel]
+ *   and [AiViewModel] where appropriate.
+ *
+ * Restart behavior:
+ * - When [DoneScreen] calls `onRestart`, this function:
+ *   1) Resets AI and survey state.
+ *   2) Shrinks [backStack] to a single FlowHome entry.
+ *   3) Causes [NavDisplay] to render IntroScreen again.
  */
 @Composable
 fun SurveyNavHost(
@@ -421,7 +498,8 @@ fun SurveyNavHost(
     vmAI: AiViewModel,
     backStack: NavBackStack<NavKey>
 ) {
-    // Global background upload overlay
+    // English comment:
+    // Global background upload HUD — always attached at the window root.
     UploadProgressOverlay()
 
     val canGoBack by vmSurvey.canGoBack.collectAsState()
@@ -434,14 +512,19 @@ fun SurveyNavHost(
             rememberViewModelStoreNavEntryDecorator()
         ),
         entryProvider = entryProvider {
+            // Home (intro) screen.
             entry<FlowHome> {
                 IntroScreen(
                     onStart = {
+                        // English comment:
+                        // Reset internal state and advance to the first node.
                         vmSurvey.resetToStart()
                         vmSurvey.advanceToNext()
                     }
                 )
             }
+
+            // Plain text question screen.
             entry<FlowText> {
                 val node by vmSurvey.currentNode.collectAsState()
                 AiScreen(
@@ -452,6 +535,8 @@ fun SurveyNavHost(
                     onBack = { vmSurvey.backToPrevious() }
                 )
             }
+
+            // AI-driven question/answer screen (same UI, different node type).
             entry<FlowAI> {
                 val node by vmSurvey.currentNode.collectAsState()
                 AiScreen(
@@ -462,6 +547,8 @@ fun SurveyNavHost(
                     onBack = { vmSurvey.backToPrevious() }
                 )
             }
+
+            // Review screen before finalization.
             entry<FlowReview> {
                 ReviewScreen(
                     vm = vmSurvey,
@@ -469,6 +556,8 @@ fun SurveyNavHost(
                     onBack = { vmSurvey.backToPrevious() }
                 )
             }
+
+            // Final summary + export / upload screen.
             entry<FlowDone> {
                 val gh = if (BuildConfig.GH_TOKEN.isNotEmpty()) {
                     GitHubUploader.GitHubConfig(
@@ -484,7 +573,21 @@ fun SurveyNavHost(
 
                 DoneScreen(
                     vm = vmSurvey,
-                    onRestart = { vmSurvey.resetToStart() },
+                    onRestart = {
+                        // English comment:
+                        // 1) Reset AI and survey internal state for a fresh run.
+                        vmAI.resetStates()
+                        vmSurvey.resetToStart()
+
+                        // English comment:
+                        // 2) Reset navigation backstack so only FlowHome remains.
+                        //    This assumes FlowHome is the start destination and
+                        //    is present as the first entry.
+                        while (backStack.size > 1) {
+                            backStack.removeLastOrNull()
+                        }
+                        // After this, NavDisplay will render FlowHome again.
+                    },
                     gitHubConfig = gh
                 )
             }
@@ -492,8 +595,9 @@ fun SurveyNavHost(
     )
 
     // English comment:
-    // Only intercept system back when we actually have somewhere to go back to.
-    // On the root screen, let the system handle back (e.g., close the app).
+    // Only intercept system back when there is something to pop inside
+    // the survey flow. On the root (FlowHome only), let the system handle
+    // back (e.g., finish the activity).
     BackHandler(enabled = canGoBack) {
         vmAI.resetStates()
         vmSurvey.backToPrevious()
@@ -503,18 +607,19 @@ fun SurveyNavHost(
 /* ───────────────────────────── SLM Config Helpers ────────────────────────── */
 
 /**
+ * Build a normalized model configuration map for the SLM engine.
+ *
  * English comment:
- * Build a normalized model config map for the SLM engine from YAML metadata.
- * - Normalizes numeric types (Int/Double)
- * - Clamps TOP_P to [0.0, 1.0]
- * - Clamps TEMPERATURE to [0.0, +∞)
+ * - Reads SLM metadata from [SurveyConfig.SlmMeta].
+ * - Fills in default values if fields are missing.
+ * - Normalizes numeric types and clamps sensitive ranges.
  */
 private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
     val out = mutableMapOf<ConfigKey, Any>(
-        ConfigKey.ACCELERATOR to ((slm.accelerator ?: "GPU").uppercase()),
-        ConfigKey.MAX_TOKENS  to (slm.maxTokens ?: 512),
-        ConfigKey.TOP_K       to (slm.topK ?: 1),
-        ConfigKey.TOP_P       to (slm.topP ?: 0.0),
+        ConfigKey.ACCELERATOR to (slm.accelerator ?: "GPU").uppercase(),
+        ConfigKey.MAX_TOKENS to (slm.maxTokens ?: 512),
+        ConfigKey.TOP_K to (slm.topK ?: 1),
+        ConfigKey.TOP_P to (slm.topP ?: 0.0),
         ConfigKey.TEMPERATURE to (slm.temperature ?: 0.0)
     )
     normalizeNumberTypes(out)
@@ -523,10 +628,12 @@ private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, A
 }
 
 /**
+ * Normalize JVM number types for SLM configuration values.
+ *
  * English comment:
- * Ensure all numeric values have consistent JVM number types:
- * - MAX_TOKENS, TOP_K as Int
- * - TOP_P, TEMPERATURE as Double
+ * - MAX_TOKENS, TOP_K → Int
+ * - TOP_P, TEMPERATURE → Double
+ * - Falls back to safe defaults when parsing fails.
  */
 private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
     m[ConfigKey.MAX_TOKENS] =
@@ -540,8 +647,11 @@ private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
 }
 
 /**
- * English comment:
  * Clamp sampling parameters to safe ranges before passing them to the engine.
+ *
+ * English comment:
+ * - TOP_P is clamped to [0.0, 1.0].
+ * - TEMPERATURE is clamped to [0.0, +∞).
  */
 private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
     val topP = (m[ConfigKey.TOP_P] as Number)

@@ -10,8 +10,8 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  Floating overlay that visualizes background GitHub uploads driven by
- *  WorkManager. The overlay:
+ *  Floating HUD-style overlay that visualizes background GitHub uploads
+ *  driven by WorkManager. The overlay:
  *    • Listens to a queue-oriented ViewModel ([UploadQueueViewModel]).
  *    • Shows a compact card whenever there is at least one ENQUEUED,
  *      RUNNING, or BLOCKED work item.
@@ -21,7 +21,7 @@
  *  Notes:
  *    • The overlay is layout-neutral and can be added at the root of any
  *      screen. It uses a Box that fills the window and anchors the card
- *      near the bottom center.
+ *      near the top center, below the status bar (HUD-style).
  *    • Color and typography are driven entirely by [MaterialTheme].
  * =====================================================================
  */
@@ -48,6 +48,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -91,11 +92,12 @@ import com.negi.survey.vm.UploadQueueViewModel
 import kotlin.math.roundToInt
 
 /**
- * Floating overlay that shows background upload progress for the current app.
+ * Floating HUD-style overlay that shows background upload progress
+ * for the current app.
  *
  * This composable listens to [UploadQueueViewModel.itemsFlow] and renders:
- *  - A scrim (optional) behind the overlay to focus attention.
- *  - A bottom-anchored card listing all relevant upload items.
+ *  - Optionally a scrim behind the overlay to focus attention.
+ *  - A top-anchored card listing all relevant upload items.
  *
  * Visibility is automatically controlled: the overlay only appears when at
  * least one item is in [WorkInfo.State.RUNNING], [WorkInfo.State.ENQUEUED],
@@ -131,7 +133,11 @@ fun UploadProgressOverlay(
 
     Box(Modifier.fillMaxSize()) {
         // Optional scrim to visually separate the overlay from the app content.
-        AnimatedVisibility(visible = showScrim && visible, enter = fadeIn(), exit = fadeOut()) {
+        AnimatedVisibility(
+            visible = showScrim && visible,
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
             Box(
                 Modifier
                     .fillMaxSize()
@@ -139,10 +145,12 @@ fun UploadProgressOverlay(
             )
         }
 
+        // Top-anchored HUD card.
         AnimatedVisibility(
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(12.dp),
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 12.dp),
             visible = visible,
             enter = fadeIn(),
             exit = fadeOut()
@@ -192,7 +200,7 @@ fun UploadProgressOverlay(
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             // Use stable keys; prefer work id, fall back to fileName.
-                            items(items, key = { it.id ?: it.fileName }) { item ->
+                            items(items, key = { it.id }) { item ->
                                 UploadRowFancy(item)
                             }
                         }

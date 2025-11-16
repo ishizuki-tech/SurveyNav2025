@@ -152,3 +152,28 @@ prompts:
       
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+model_defaults:
+  # Model download UI defaults
+
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+
+  # default_model_url: "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/swahili-gemma-1b-fp16-instruct.task"
+  # default_file_name: "swahili-gemma-1b-fp16.task"
+
+  # default_model_url: "https://huggingface.co/google/gemma-3n-E2B-it-litert-lm/resolve/main/gemma-3n-E2B-it-int4.litertlm"
+  # default_file_name: "Gemma3n2B.litertlm"
+  # default_model_url: "https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.litertlm"
+  # default_file_name: "Gemma31B.litertlm"
+  # default_model_url: "https://huggingface.co/litert-community/Gemma2-2B-IT/resolve/main/Gemma2-2B-IT_multi-prefill-seq_q8_ekv1280.task"
+  # default_file_name: "Gemma2-2B.task"
+  # default_model_url: "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task"
+  # default_file_name: "Qwen2-5-0-5B.task"
+  # default_model_url: "https://huggingface.co/litert-community/Phi-4-mini-instruct/resolve/main/phi4_q8_ekv1280.task"
+  # default_file_name: "phi4_q8_ekv1280.task"
+
+  # Optional tuning knobs (keep same defaults as code)
+  timeout_ms: 1800000          # 30 minutes
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576  # 1 MiB

@@ -72,6 +72,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 /**
  * Final survey screen that summarizes all collected answers and follow-ups.
@@ -160,7 +162,9 @@ fun DoneScreen(
     val autoSavedOnce = remember { mutableStateOf(false) }
     LaunchedEffect(autoSaveToDevice, jsonText) {
         if (autoSaveToDevice && !autoSavedOnce.value) {
-            val fileName = "survey_${System.currentTimeMillis()}.json"
+            // English comment:
+            // Use a human-friendly, timestamped file name for device storage as well.
+            val fileName = buildSurveyFileName()
             runCatching {
                 val result = withContext(Dispatchers.IO) {
                     saveJsonAutomatically(
@@ -273,19 +277,23 @@ fun DoneScreen(
                             scope.launch {
                                 uploading.value = true
                                 try {
-                                    val fileName = "survey_${System.currentTimeMillis()}.json"
-                                    val path = "${gitHubConfig.pathPrefix.trimEnd('/')}/$fileName"
+                                    // English comment:
+                                    // Use a human-readable, timestamped file name.
+                                    val fileName = buildSurveyFileName()
+
+                                    // English comment:
+                                    // Use the GitHubConfig-based overload so that
+                                    // the date-based path logic inside GitHubUploader
+                                    // (e.g., yyyy-MM-dd/fileName) is consistently applied.
                                     val result = withContext(Dispatchers.IO) {
                                         GitHubUploader.uploadJson(
-                                            owner = gitHubConfig.owner,
-                                            repo = gitHubConfig.repo,
-                                            branch = gitHubConfig.branch,
-                                            path = path,
-                                            token = gitHubConfig.token,
+                                            cfg = gitHubConfig,
+                                            relativePath = fileName,
                                             content = jsonText,
                                             message = "Upload $fileName"
                                         )
                                     }
+
                                     snackbar.showOnce(
                                         "Uploaded: ${result.fileUrl ?: result.commitSha}"
                                     )
@@ -306,7 +314,10 @@ fun DoneScreen(
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
-                            val fileName = "survey_${System.currentTimeMillis()}.json"
+                            // English comment:
+                            // Use the same naming scheme so on-device file names
+                            // and GitHub paths stay aligned.
+                            val fileName = buildSurveyFileName()
                             GitHubUploadWorker.enqueue(
                                 context = context,
                                 cfg = gitHubConfig,
@@ -325,7 +336,14 @@ fun DoneScreen(
                 }
 
                 Spacer(Modifier.weight(1f))
+            }
 
+            Spacer(Modifier.height(1.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Button(onClick = onRestart) {
                     Text("Restart")
                 }
@@ -339,6 +357,25 @@ fun DoneScreen(
             }
         }
     }
+}
+
+/* ============================================================
+ * File name helper
+ * ============================================================ */
+
+/**
+ * Build a human-friendly survey file name such as:
+ * "survey_2025-11-15_14-32-08.json".
+ *
+ * English comment:
+ * - Uses local device time for readability.
+ * - Keeps a stable "survey_" prefix so that files
+ *   group naturally in file explorers and GitHub.
+ */
+private fun buildSurveyFileName(prefix: String = "survey"): String {
+    val now = LocalDateTime.now()
+    val stamp = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
+    return "${prefix}_${stamp}.json"
 }
 
 /* ============================================================
@@ -369,7 +406,7 @@ private data class SaveResult(
  *  - API 28- : Writes into app-specific external Downloads/SurveyNav directory.
  *
  * @param context Android [android.content.Context].
- * @param fileName Target file name, e.g. `"survey_123.json"`.
+ * @param fileName Target file name, e.g. `"survey_2025-11-15_14-32-08.json"`.
  * @param content JSON payload to write.
  * @return [SaveResult] describing where the file ended up.
  */

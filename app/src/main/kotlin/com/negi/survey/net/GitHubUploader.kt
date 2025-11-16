@@ -1,30 +1,3 @@
-/*
- * =====================================================================
- *  IshizukiTech LLC — SLM Integration Framework
- *  ---------------------------------------------------------------------
- *  File: GitHubUploader.kt
- *  Author: Shu Ishizuki (石附 支)
- *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
- * =====================================================================
- *
- *  Summary:
- *  ---------------------------------------------------------------------
- *  High-level coroutine-based helper for the GitHub
- *  "Create or Update File Contents" REST API.
- *
- *  Core features:
- *   • Coroutine-friendly suspend APIs (IO dispatcher)
- *   • Robust retry/backoff for 429 and 5xx
- *   • Automatic detection of existing file SHA (avoids 409 conflicts)
- *   • Deterministic progress reporting (0..100%)
- *   • Clean separation between config, result, and execution logic
- *
- *  API Reference:
- *  https://docs.github.com/rest/repos/contents#create-or-update-file-contents
- * =====================================================================
- */
-
 package com.negi.survey.net
 
 import android.util.Base64
@@ -40,6 +13,9 @@ import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.min
 
 /**
@@ -63,14 +39,24 @@ object GitHubUploader {
      * @property repo        Repository name.
      * @property token       GitHub Personal Access Token (PAT) with `contents:write` scope.
      * @property branch      Target branch (default: `main`).
-     * @property pathPrefix  Root folder inside the repo (default: `exports`).
+     * @property pathPrefix  Logical root folder inside the repo.
+     *
+     * English comment:
+     * - When using the [uploadJson] overload that takes [GitHubConfig], the
+     *   final path becomes:
+     *
+     *       pathPrefix / yyyy-MM-dd / relativePath
+     *
+     *   If [pathPrefix] is empty, the date folder becomes the root:
+     *
+     *       yyyy-MM-dd/relativePath
      */
     data class GitHubConfig(
         val owner: String,
         val repo: String,
         val token: String,
         val branch: String = "main",
-        val pathPrefix: String = "exports"
+        val pathPrefix: String = ""   // ← ここを空デフォルトに
     )
 
     /**
@@ -91,14 +77,18 @@ object GitHubUploader {
     /**
      * Uploads a JSON or text file to GitHub using the provided configuration.
      *
-     * This overload automatically prepends the configured `pathPrefix`.
-     * Progress updates are reported in 0..100 integer range.
+     * English comment:
+     * - The final GitHub path has a date segment inserted automatically:
      *
-     * @param cfg GitHub connection and target configuration.
-     * @param relativePath Relative path under [cfg.pathPrefix].
-     * @param content Raw text or JSON content to upload.
-     * @param message Commit message for the operation.
-     * @param onProgressPercent Progress callback (0..100).
+     *       cfg.pathPrefix / yyyy-MM-dd / relativePath
+     *
+     *   Examples:
+     *       cfg.pathPrefix = ""
+     *       relativePath   = "survey_123.json"
+     *       → "2025-11-15/survey_123.json"
+     *
+     *       cfg.pathPrefix = "exports"
+     *       → "exports/2025-11-15/survey_123.json"
      */
     suspend fun uploadJson(
         cfg: GitHubConfig,
@@ -120,14 +110,9 @@ object GitHubUploader {
     /**
      * Core upload function — creates or updates a file using GitHub Contents API.
      *
-     * Steps:
-     *  1. Retrieve existing file SHA (if present) to avoid 409 conflict.
-     *  2. PUT Base64-encoded content to the repo, streaming progress updates.
-     *  3. Retry transient errors (429/5xx) with exponential backoff.
-     *  4. Parse and return the file URL + commit SHA.
-     *
-     * @throws IOException If network or parsing errors occur.
-     * @throws HttpFailureException If GitHub responds with unrecoverable errors.
+     * English comment:
+     * - [path] is treated as a fully-resolved path. Date folder insertion
+     *   only happens in [buildPath] when using the [GitHubConfig] overload.
      */
     suspend fun uploadJson(
         owner: String,
@@ -218,9 +203,6 @@ object GitHubUploader {
     private class HttpFailureException(val code: Int, val body: String) :
         IOException("GitHub request failed ($code): ${body.take(256)}")
 
-    /**
-     * Executes an HTTP request with retry logic for 429/5xx and exponential backoff.
-     */
     private suspend fun executeWithRetry(
         method: String,
         url: URL,
@@ -290,8 +272,29 @@ object GitHubUploader {
             URLEncoder.encode(it, "UTF-8").replace("+", "%20")
         }
 
-    private fun buildPath(prefix: String, relative: String): String =
-        listOf(prefix.trim('/'), relative.trim('/')).filter { it.isNotBlank() }.joinToString("/")
+    /**
+     * English comment:
+     * Build a dated GitHub path:
+     *
+     *   prefix / yyyy-MM-dd / relative
+     *
+     * - Empty segments are skipped, so:
+     *     buildPath("", "file.json")
+     *   becomes:
+     *     yyyy-MM-dd/file.json
+     */
+    private fun buildPath(prefix: String, relative: String): String {
+        val dateSegment = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            .format(Date())
+
+        val segments = listOf(
+            prefix.trim('/'),
+            dateSegment,
+            relative.trim('/')
+        ).filter { it.isNotBlank() }
+
+        return segments.joinToString("/")
+    }
 
     private fun parseRetryAfterSeconds(headers: Map<String, List<String>>): Long? =
         headers["Retry-After"]?.firstOrNull()?.toLongOrNull()
@@ -299,10 +302,6 @@ object GitHubUploader {
     private fun readAll(stream: InputStream): String =
         stream.bufferedReader(Charsets.UTF_8).use(BufferedReader::readText)
 
-    /**
-     * Fetch existing file's SHA for safe updates.
-     * Returns null if file doesn't exist or the request fails.
-     */
     private fun getExistingSha(
         owner: String,
         repo: String,
@@ -325,9 +324,11 @@ object GitHubUploader {
             if (conn.responseCode == 200) {
                 val body = conn.inputStream.use(::readAll)
                 JSONObject(body).optString("sha").takeIf { it.isNotBlank() }
-            } else null
+            } else {
+                null
+            }
         } catch (_: Exception) {
-            null // Safe fallback: treat as "not found"
+            null
         } finally {
             conn.disconnect()
         }
