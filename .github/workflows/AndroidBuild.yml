@@ -105,8 +105,8 @@ jobs:
           [[ -n "${{ secrets.GH_TOKEN }}" ]] || { echo "::error ::GH_TOKEN is not configured"; exit 1; }
           mkdir -p "$HOME/.gradle"
           cat <<'PROPS' > "$HOME/.gradle/gradle.properties"
-          gh.owner=ishizuki-tech
-          gh.repo=SurveyNav2025
+          gh.owner=${{ env.OWNER }}
+          gh.repo=${{ env.REPO }}
           gh.branch=main
           gh.pathPrefix=exports
           gh.token=${{ secrets.GH_TOKEN }}
@@ -369,6 +369,7 @@ jobs:
           TAG="${{ steps.info.outputs.tag }}"
           DATE="${{ steps.info.outputs.date }}"
           REPO="${{ steps.info.outputs.repo }}"
+          OWNER="${{ env.OWNER }}"
           BASE_URL="${{ steps.info.outputs.base }}"
           LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
 
@@ -433,7 +434,7 @@ jobs:
             git add .
             git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
             git branch -M master
-            git remote add origin "https://${{ github.actor }}:${GH_TOKEN}@github.com/${REPO}.wiki.git"
+            git remote add origin "https://${OWNER}:${GH_TOKEN}@github.com/${REPO}.wiki.git"
             git push origin master --force || echo "::warning::Failed to push wiki (is Wiki enabled?)"
           else
             echo "::warning::GH_TOKEN not set; skip wiki push."
