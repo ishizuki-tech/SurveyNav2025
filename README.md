@@ -62,35 +62,13 @@ This repo is intended as:
 ## Demo screenshots and video
 
 <p align="center">
-<img src="images/Screenshot_20251117_134942.png" alt="Home screen – SurveyNav 2025" width="120">
-<img src="images/Screenshot_20251117_135301.png" alt="Question screen – SurveyNav 2025" width="120">
+  <img src="images/Screenshot_20251117_134942.png" alt="Home screen – SurveyNav 2025" width="120">
+  <img src="images/Screenshot_20251117_135301.png" alt="Question screen – SurveyNav 2025" width="120">
 </p>
 
-## Demo videos
-
-<p align="center">
-  <video
-    src="videos/Screen_recording_20251117_131203.mp4"
-    controls
-    width="180"
-    style="max-width: 100%; height: auto;">
-    Your browser does not support the video tag.
-  </video>
-  <video
-    src="videos/Screen_recording_20251117_131343.mp4"
-    controls
-    width="180"
-    style="max-width: 100%; height: auto;">
-    Your browser does not support the video tag.
-  </video>
-  <video
-    src="videos/Screen_recording_20251117_132537.mp4"
-    controls
-    width="180"
-    style="max-width: 100%; height: auto;">
-    Your browser does not support the video tag.
-  </video>
-</p>
+- [▶ SurveyNav 2025 demo 1 – Installation](https://youtube.com/shorts/HkPB50I-s8k)
+- [▶ SurveyNav 2025 demo 2 – SLM Initialization](https://youtube.com/shorts/qtmngp435rg)
+- [▶ SurveyNav 2025 demo 3 – Question Evaluation](https://youtube.com/shorts/2NUFjaMYYN8)
 
 ---
 ## Features
