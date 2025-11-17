@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -102,7 +103,7 @@ class AiViewModel(
      *
      * @param id Stable identifier for diffing.
      * @param sender Author of the message.
-     * @param text Plain text bubble content (for normal messages).
+     * @param text Plain text bubble content for normal messages.
      * @param json Raw JSON content (for final result bubbles).
      * @param isTyping True when this bubble represents a typing indicator.
      */
@@ -126,7 +127,9 @@ class AiViewModel(
             .map { it[nodeId] ?: emptyList() }
             .stateIn(
                 scope = viewModelScope,
-                started = kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(stopTimeoutMillis = 5000),
+                started = kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(
+                    stopTimeoutMillis = 5000
+                ),
                 initialValue = emptyList()
             )
 
@@ -180,11 +183,22 @@ class AiViewModel(
     }
 
     /**
-     * Clear chat history for [nodeId].
+     * Clear chat history for a single [nodeId].
      */
     fun chatClear(nodeId: String) {
         _chats.update { it - nodeId }
         if (DEBUG_LOGS) Log.w(TAG, "chatClear: cleared chat for $nodeId")
+    }
+
+    /**
+     * Clear chat history for all nodes.
+     *
+     * - Use this when starting a completely fresh survey session so that
+     *   no previous AI conversation leaks into the new run.
+     */
+    fun resetChats() {
+        _chats.value = emptyMap()
+        if (DEBUG_LOGS) Log.w(TAG, "resetChats: cleared all chats")
     }
 
     private inline fun updateNode(
@@ -414,6 +428,17 @@ class AiViewModel(
         _followups.value = emptyList()
         if (!keepError) _error.value = null
         Log.i(TAG, "resetStates: done (score=${_score.value}, err=${_error.value})")
+    }
+
+    /**
+     * Reset all AI-related state including chats.
+     *
+     * - Use this when starting a completely new survey run.
+     * - This clears streaming state, score, errors, and all per-node chats.
+     */
+    fun resetAll(keepError: Boolean = false) {
+        resetStates(keepError = keepError)
+        resetChats()
     }
 
     override fun onCleared() {

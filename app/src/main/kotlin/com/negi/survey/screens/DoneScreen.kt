@@ -162,7 +162,6 @@ fun DoneScreen(
     val autoSavedOnce = remember { mutableStateOf(false) }
     LaunchedEffect(autoSaveToDevice, jsonText) {
         if (autoSaveToDevice && !autoSavedOnce.value) {
-            // English comment:
             // Use a human-friendly, timestamped file name for device storage as well.
             val fileName = buildSurveyFileName()
             runCatching {
@@ -277,11 +276,9 @@ fun DoneScreen(
                             scope.launch {
                                 uploading.value = true
                                 try {
-                                    // English comment:
                                     // Use a human-readable, timestamped file name.
                                     val fileName = buildSurveyFileName()
 
-                                    // English comment:
                                     // Use the GitHubConfig-based overload so that
                                     // the date-based path logic inside GitHubUploader
                                     // (e.g., yyyy-MM-dd/fileName) is consistently applied.
@@ -314,7 +311,6 @@ fun DoneScreen(
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
-                            // English comment:
                             // Use the same naming scheme so on-device file names
                             // and GitHub paths stay aligned.
                             val fileName = buildSurveyFileName()
@@ -367,7 +363,6 @@ fun DoneScreen(
  * Build a human-friendly survey file name such as:
  * "survey_2025-11-15_14-32-08.json".
  *
- * English comment:
  * - Uses local device time for readability.
  * - Keeps a stable "survey_" prefix so that files
  *   group naturally in file explorers and GitHub.

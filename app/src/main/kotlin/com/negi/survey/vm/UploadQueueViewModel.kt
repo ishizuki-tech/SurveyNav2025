@@ -26,40 +26,53 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import java.util.Locale
 
+/* ───────────────────────────── UI Model ───────────────────────────── */
+
 /**
- * UI-facing description of a single upload.
+ * UI-facing description of a single upload task.
  *
- * English comment:
- * - [percent] == null means "unknown / not reported".
- * - [fileUrl] is filled only after success (worker writes OUT_FILE_URL).
+ * @property id Stable identifier derived from [WorkInfo.id].
+ * @property fileName Best-effort file name associated with the upload.
+ * @property percent Upload progress percentage (0..100) or null if unknown.
+ * @property state Current [WorkInfo.State] for the worker.
+ * @property fileUrl URL returned by the worker on success, if available.
+ * @property message Short human-readable status derived from [state].
  */
 data class UploadItemUi(
     val id: String,
     val fileName: String,
-    val percent: Int?,          // null = unknown
+    val percent: Int?,          // null = unknown / not reported
     val state: WorkInfo.State,
     val fileUrl: String?,       // populated on success
-    val message: String? = null // short human text derived from state
+    val message: String? = null // short status line for the HUD
 )
 
+/* ───────────────────────────── ViewModel ───────────────────────────── */
+
 /**
- * Observes WorkManager for tasks tagged with [GitHubUploadWorker.TAG] and
- * maps their WorkInfo into a light UI model stream.
+ * ViewModel that observes WorkManager for GitHub upload tasks and exposes
+ * a compact stream of UI models for a HUD or queue display.
  *
- * English comment:
- * - We consume WorkManager's LiveData via .asFlow() for reliability (it is
- *   the officially supported observation path for WorkManager state).
- * - Mapping keeps allocations small and avoids unnecessary recompositions
- *   via a hand-rolled distinctUntilChanged comparator.
+ * Features:
+ * - Observes all work with [GitHubUploadWorker.TAG].
+ * - Maps [WorkInfo] into [UploadItemUi] with stable sorting.
+ * - Uses a lightweight equality check to avoid unnecessary recompositions.
  */
 class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
 
     private val wm: WorkManager = WorkManager.getInstance(app)
 
     /**
-     * Emits the current list of uploads, sorted by priority:
-     *   RUNNING → ENQUEUED/BLOCKED → SUCCEEDED → (FAILED/CANCELLED) → else
-     * then by file name (case-insensitive) for a stable visual order.
+     * Stream of upload items for the UI.
+     *
+     * Ordering:
+     *  1. RUNNING
+     *  2. ENQUEUED / BLOCKED
+     *  3. SUCCEEDED
+     *  4. FAILED / CANCELLED
+     *
+     * Within the same bucket, items are sorted by file name (case-insensitive)
+     * for a stable, predictable visual order.
      */
     val itemsFlow: Flow<List<UploadItemUi>> =
         wm.getWorkInfosByTagLiveData(GitHubUploadWorker.TAG)
@@ -72,11 +85,14 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
                             .thenBy(String.CASE_INSENSITIVE_ORDER) { it.fileName }
                     )
             }
-            // Only emit when something that affects rendering actually changed.
+            // Emit only when something that affects rendering actually changed.
             .distinctUntilChanged { old, new -> listsRenderEqual(old, new) }
 
-    /* -------------------------- Mapping helpers -------------------------- */
+    /* ─────────────────────── Mapping helpers ─────────────────────── */
 
+    /**
+     * Convert [WorkInfo] into an [UploadItemUi] with derived status text.
+     */
     private fun WorkInfo.toUploadItemUi(): UploadItemUi {
         val pct: Int? = extractPercent(this)
         val name: String = extractFileName(this)
@@ -104,11 +120,13 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * English comment:
-     * Try progress sources in this order:
-     *  1) progress[PROGRESS_PCT] (live updates)
-     *  2) outputData[PROGRESS_PCT] (some workers finalize here)
-     *  -> clamp to 0..100, return null if missing/invalid.
+     * Extract upload progress percentage from [WorkInfo], if available.
+     *
+     * Progress sources (in order of priority):
+     *  1. `progress[PROGRESS_PCT]` during upload.
+     *  2. `outputData[PROGRESS_PCT]` on completion.
+     *
+     * Returns null when progress is missing or invalid.
      */
     private fun extractPercent(wi: WorkInfo): Int? {
         val fromProgress = wi.progress.getInt(GitHubUploadWorker.PROGRESS_PCT, -1)
@@ -122,13 +140,14 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * English comment:
-     * Resolve the best-available filename for display:
-     *  1) progress[PROGRESS_FILE] during upload
-     *  2) outputData[OUT_FILE_NAME] after success/failure
-     *  3) a tag like "GitHubUpload:file:<name>"
-     *  4) inputData (in case you pass the name there)
-     *  5) deterministic fallback "upload-<4chars>.json"
+     * Resolve the best-available filename for display.
+     *
+     * Resolution order:
+     *  1. `progress[PROGRESS_FILE]` during upload.
+     *  2. `outputData[OUT_FILE_NAME]` after success/failure.
+     *  3. A tag formatted as `"GitHubUpload:file:<name>"`.
+     *  4. `input_file` from progress or output key-value maps.
+     *  5. Fallback `"upload-<4chars>.json"` using work ID prefix.
      */
     private fun extractFileName(wi: WorkInfo): String {
         progressName(wi)?.let { return it }
@@ -158,23 +177,29 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
             ?.takeIf { it.isNotBlank() }
 
     /**
-     * English comment:
-     * Rank uploads for the UI list.
-     * Lower number = higher in the list.
+     * Compute UI priority for an upload item.
+     *
+     * Lower rank → shown earlier in the list.
      */
     private fun UploadItemUi.priorityRank(): Int = when (state) {
         WorkInfo.State.RUNNING -> 0
-        WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED -> 1
+        WorkInfo.State.ENQUEUED,
+        WorkInfo.State.BLOCKED -> 1
         WorkInfo.State.SUCCEEDED -> 2
-        WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> 3
+        WorkInfo.State.FAILED,
+        WorkInfo.State.CANCELLED -> 3
     }
 
     /**
-     * English comment:
-     * Lightweight deep-equality for render-critical fields.
-     * We purposefully ignore [message] text — it derives from [state].
+     * Lightweight deep equality for the fields that affect rendering.
+     *
+     * This intentionally ignores [UploadItemUi.message], because it is
+     * always derived from [UploadItemUi.state].
      */
-    private fun listsRenderEqual(a: List<UploadItemUi>, b: List<UploadItemUi>): Boolean {
+    private fun listsRenderEqual(
+        a: List<UploadItemUi>,
+        b: List<UploadItemUi>
+    ): Boolean {
         if (a.size != b.size) return false
         for (i in a.indices) {
             val x = a[i]
@@ -190,12 +215,15 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         /**
-         * English comment:
-         * Compose-friendly factory so you can do:
+         * Compose-friendly factory.
          *
-         * val vm = viewModel<UploadQueueViewModel>(
+         * Usage:
+         * ```kotlin
+         * val app = LocalContext.current.applicationContext as Application
+         * val vm: UploadQueueViewModel = viewModel(
          *     factory = UploadQueueViewModel.factory(app)
          * )
+         * ```
          */
         fun factory(app: Application) = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

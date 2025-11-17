@@ -41,7 +41,6 @@ object GitHubUploader {
      * @property branch      Target branch (default: `main`).
      * @property pathPrefix  Logical root folder inside the repo.
      *
-     * English comment:
      * - When using the [uploadJson] overload that takes [GitHubConfig], the
      *   final path becomes:
      *
@@ -77,7 +76,6 @@ object GitHubUploader {
     /**
      * Uploads a JSON or text file to GitHub using the provided configuration.
      *
-     * English comment:
      * - The final GitHub path has a date segment inserted automatically:
      *
      *       cfg.pathPrefix / yyyy-MM-dd / relativePath
@@ -110,7 +108,6 @@ object GitHubUploader {
     /**
      * Core upload function — creates or updates a file using GitHub Contents API.
      *
-     * English comment:
      * - [path] is treated as a fully-resolved path. Date folder insertion
      *   only happens in [buildPath] when using the [GitHubConfig] overload.
      */
@@ -273,7 +270,6 @@ object GitHubUploader {
         }
 
     /**
-     * English comment:
      * Build a dated GitHub path:
      *
      *   prefix / yyyy-MM-dd / relative

@@ -29,22 +29,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.BuildConfig
+import com.negi.survey.utils.HeavyInitializer
 import java.io.File
-import java.io.IOException
-import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import okhttp3.Interceptor
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
 
 /**
  * Represents the current download state for the model.
@@ -82,9 +72,8 @@ sealed class DlState {
  * ViewModel responsible for managing the download and persistence of the SLM model file.
  *
  * Responsibilities:
- * - Gate model download so it only happens once.
+ * - Delegate heavy initialization to [HeavyInitializer].
  * - Expose [DlState] as a [StateFlow] for UI.
- * - Handle Hugging Face authentication via [HfAuthInterceptor].
  * - Apply timeout and basic UI throttling based on configuration.
  */
 class AppViewModel(
@@ -92,27 +81,8 @@ class AppViewModel(
     private val fileName: String = DEFAULT_FILE_NAME,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     private val uiThrottleMs: Long = DEFAULT_UI_THROTTLE_MS,
-    private val uiMinDeltaBytes: Long = DEFAULT_UI_MIN_DELTA_BYTES,
-    private val client: OkHttpClient = defaultClient(BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() })
+    private val uiMinDeltaBytes: Long = DEFAULT_UI_MIN_DELTA_BYTES
 ) : ViewModel() {
-
-    /**
-     * Interceptor that adds headers (User-Agent, Authorization, etc.) to requests.
-     */
-    class HfAuthInterceptor(private val token: String) : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val req = chain.request()
-            val host = req.url.host
-            val builder = req.newBuilder()
-                .header("User-Agent", "SurveyNav/1.0 (Android)")
-                .header("Accept", "application/octet-stream")
-
-            if (host.endsWith("huggingface.co") && token.isNotBlank()) {
-                builder.header("Authorization", "Bearer $token")
-            }
-            return chain.proceed(builder.build())
-        }
-    }
 
     private val _state = MutableStateFlow<DlState>(DlState.Idle)
 
@@ -122,128 +92,114 @@ class AppViewModel(
     val state: StateFlow<DlState> = _state
 
     /**
-     * Simple mutex to serialize download starts.
-     *
-     * English comment:
-     * - Prevents multiple concurrent downloads when called from several places.
-     */
-    private val startMutex = Mutex()
-
-    /**
      * Ensures that the model is downloaded once.
      *
      * Behavior:
-     * - If already downloading or already done, this is a no-op.
-     * - If the target file already exists and is non-empty, marks [DlState.Done] immediately.
-     * - Applies [timeoutMs] as a hard limit for the whole download if > 0.
+     * - If [forceFresh] is false and a previously downloaded file exists on disk,
+     *   this method short-circuits and updates state to [DlState.Done] without
+     *   calling [HeavyInitializer].
+     * - Otherwise, uses [HeavyInitializer] for single-flight + resume +
+     *   integrity check.
+     * - If [forceFresh] is true, cached files are ignored and re-downloaded.
+     * - Safe to call from several places; HeavyInitializer collapses concurrent calls.
      */
-    fun ensureModelDownloaded(appContext: Context) {
+    fun ensureModelDownloaded(
+        appContext: Context,
+        forceFresh: Boolean = false
+    ) {
         val app = appContext.applicationContext
 
+        // If we already have a Done state with an existing file and we are not
+        // forcing a refresh, keep it and skip any new work.
+        val currentState = _state.value
+        if (!forceFresh && currentState is DlState.Done && currentState.file.exists()) {
+            return
+        }
+
+        // Try to detect an existing model file on disk before starting a download.
+        if (!forceFresh) {
+            val safeName = suggestFileName(modelUrl, fileName)
+            // This must match the directory HeavyInitializer uses to place the file.
+            // Here we assume filesDir with a flat filename, which is the common case.
+            val existing = File(app.filesDir, safeName)
+            if (existing.exists() && existing.isFile && existing.length() > 0L) {
+                _state.value = DlState.Done(existing)
+                return
+            }
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
-            startMutex.withLock {
-                val current = _state.value
-                if (current is DlState.Downloading || current is DlState.Done) return@withLock
+            val current = _state.value
+            if (!forceFresh && (current is DlState.Downloading || current is DlState.Done)) {
+                return@launch
+            }
 
-                // Derive a safe file name from the URL when not provided explicitly.
-                val safeName = suggestFileName(modelUrl, fileName)
-                val dstFile = File(app.filesDir, safeName)
+            val safeName = suggestFileName(modelUrl, fileName)
+            val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
 
-                // Fast path: already present and non-empty.
-                if (dstFile.exists() && dstFile.length() > 0L) {
-                    _state.value = DlState.Done(dstFile)
-                    return@withLock
-                }
+            _state.value = DlState.Downloading(downloaded = 0L, total = null)
 
-                _state.value = DlState.Downloading(downloaded = 0L, total = null)
+            var lastEmitNs = 0L
+            var lastBytes = 0L
 
-                var lastEmitNs = 0L
-                var lastBytes = 0L
+            // Bridge HeavyInitializer's raw progress into throttled DlState updates.
+            val progressBridge: (Long, Long?) -> Unit = { got, total ->
+                val now = System.nanoTime()
+                val elapsedMs = (now - lastEmitNs) / 1_000_000L
+                val deltaBytes = got - lastBytes
 
-                try {
-                    val block: suspend () -> Unit = {
-                        downloadToFile(
-                            url = modelUrl,
-                            dst = dstFile
-                        ) { got, total ->
-                            val now = System.nanoTime()
-                            val elapsedMs = (now - lastEmitNs) / 1_000_000L
-                            val deltaBytes = got - lastBytes
+                val shouldEmit =
+                    elapsedMs >= uiThrottleMs ||
+                            deltaBytes >= uiMinDeltaBytes ||
+                            (total != null && got >= total)
 
-                            val shouldEmit =
-                                elapsedMs >= uiThrottleMs ||
-                                        deltaBytes >= uiMinDeltaBytes ||
-                                        (total != null && got >= total)
-
-                            if (shouldEmit) {
-                                lastEmitNs = now
-                                lastBytes = got
-                                _state.value = DlState.Downloading(got, total)
-                            }
-                        }
-                    }
-
-                    if (timeoutMs > 0L) {
-                        withTimeout(timeoutMs) { block() }
-                    } else {
-                        block()
-                    }
-
-                    _state.value = DlState.Done(dstFile)
-                } catch (t: Throwable) {
-                    val msg = when (t) {
-                        is TimeoutCancellationException -> "download timeout"
-                        else -> t.message ?: "download failed"
-                    }
-                    _state.value = DlState.Error(msg)
+                if (shouldEmit) {
+                    lastEmitNs = now
+                    lastBytes = got
+                    _state.value = DlState.Downloading(got, total)
                 }
             }
+
+            val result = HeavyInitializer.ensureInitialized(
+                context = app,
+                modelUrl = modelUrl,
+                hfToken = token,
+                fileName = safeName,
+                timeoutMs = timeoutMs,
+                forceFresh = forceFresh,
+                onProgress = progressBridge
+            )
+
+            _state.value = result.fold(
+                onSuccess = { file -> DlState.Done(file) },
+                onFailure = { error ->
+                    val msg = error.message ?: "download failed"
+                    DlState.Error(msg)
+                }
+            )
         }
     }
 
     /**
-     * Downloads a file to disk with optional progress tracking.
+     * Attempts to cancel any running HeavyInitializer task.
      *
-     * @param url Source URL to download.
-     * @param dst Destination file.
-     * @param onProgress Callback invoked with downloaded bytes and total length if known.
+     * Call from UI when the user taps a "Cancel" button.
      */
-    private suspend fun downloadToFile(
-        url: String,
-        dst: File,
-        onProgress: (downloaded: Long, total: Long?) -> Unit
-    ) = withContext(Dispatchers.IO) {
-        dst.parentFile?.mkdirs()
-        val req = Request.Builder().url(url).build()
-
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                val code = resp.code
-                val msg = resp.body?.string()?.take(200)
-                throw IOException("HTTP $code ${msg ?: ""}".trim())
-            }
-
-            val body = resp.body ?: throw IOException("empty body")
-            val total = body.contentLength().takeIf { it >= 0L }
-
-            body.byteStream().use { input ->
-                val tmp = File(dst.parentFile, dst.name + ".part")
-                tmp.outputStream().use { output ->
-                    val buf = ByteArray(256 * 1024)
-                    var downloaded = 0L
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n == -1) break
-                        output.write(buf, 0, n)
-                        downloaded += n
-                        onProgress(downloaded, total)
-                    }
-                    output.flush()
-                }
-                if (dst.exists()) dst.delete()
-                tmp.renameTo(dst)
-            }
+    fun cancelDownload() {
+        viewModelScope.launch {
+            HeavyInitializer.cancel()
+            _state.value = DlState.Error("Canceled by user")
         }
+    }
+
+    /**
+     * Debug-only reset that also clears HeavyInitializer internal state.
+     *
+     * Useful in dev builds when testing repeated downloads.
+     */
+    fun resetForDebug() {
+        HeavyInitializer.resetForDebug()
+        _state.value = DlState.Idle
     }
 
     companion object {
@@ -277,22 +233,21 @@ class AppViewModel(
         /**
          * ViewModel factory to be used with Compose [androidx.lifecycle.viewmodel.compose.viewModel].
          *
-         * English comment:
-         * - Uses fully compiled-in defaults.
+         * Uses fully compiled-in defaults.
          */
-        fun factory(): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                return AppViewModel() as T
+        fun factory(): ViewModelProvider.Factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    return AppViewModel() as T
+                }
             }
-        }
 
         /**
          * High-level factory that accepts nullable overrides (from YAML model_defaults).
          *
-         * English comment:
-         * - Pass values directly from SurveyConfig.modelDefaults.
-         * - Any null or invalid value falls back to a compiled default.
+         * Pass values directly from SurveyConfig.modelDefaults.
+         * Any null or invalid value falls back to a compiled default.
          */
         fun factoryFromOverrides(
             modelUrlOverride: String? = null,
@@ -316,26 +271,11 @@ class AppViewModel(
                         fileName = name,
                         timeoutMs = timeout,
                         uiThrottleMs = throttle,
-                        uiMinDeltaBytes = minDelta,
-                        client = defaultClient(BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() })
+                        uiMinDeltaBytes = minDelta
                     ) as T
                 }
             }
         }
-
-        /**
-         * Provides a default OkHttpClient with proper headers and timeouts.
-         */
-        fun defaultClient(hfToken: String?): OkHttpClient =
-            OkHttpClient.Builder()
-                .addInterceptor(HfAuthInterceptor(hfToken.orEmpty()))
-                .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(60, TimeUnit.SECONDS)
-                .writeTimeout(60, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true)
-                .followRedirects(true)
-                .followSslRedirects(true)
-                .build()
 
         /**
          * Derive a safe filename from the given URL or fall back to [fallback].

@@ -27,66 +27,11 @@ import kotlinx.serialization.Serializable
 
 private const val TAG = "SurveyVM"
 
-/**
- * Port interface that abstracts minimal navigation stack operations.
- *
- * English comment:
- * This interface decouples the ViewModel from a specific navigation library
- * (such as Navigation3) and makes it easier to unit test navigation logic.
- *
- * @param K NavKey type that identifies destinations.
- */
-interface BackStackPort<K : NavKey> {
-
-    /**
-     * English comment:
-     * Push a new destination key onto the navigation stack.
-     *
-     * @param key Destination to add.
-     * @return True if the destination was added.
-     */
-    fun add(key: K): Boolean
-
-    /**
-     * English comment:
-     * Remove the last destination from the navigation stack, if any.
-     *
-     * @return The removed destination, or null if the stack was empty.
-     */
-    fun removeLastOrNull(): K?
-
-    /**
-     * English comment:
-     * Clear the navigation stack completely.
-     */
-    fun clear()
-}
-
-/**
- * Adapter that bridges Navigation3's [NavBackStack] with [BackStackPort].
- *
- * English comment:
- * Use this class on the UI side to connect a Navigation3 back stack
- * to [SurveyViewModel] while keeping the ViewModel independent of
- * Navigation3 types.
- */
-class Nav3BackStackAdapter(
-    private val delegate: NavBackStack<NavKey>
-) : BackStackPort<NavKey> {
-
-    override fun add(key: NavKey): Boolean = delegate.add(key)
-
-    override fun removeLastOrNull(): NavKey? = delegate.removeLastOrNull()
-
-    override fun clear() {
-        delegate.clear()
-    }
-}
+/* ───────────────────────────── Graph Model ───────────────────────────── */
 
 /**
  * Survey node types used by the runtime flow.
  *
- * English comment:
  * These values represent the logical type of nodes in the survey graph.
  */
 enum class NodeType {
@@ -102,7 +47,6 @@ enum class NodeType {
 /**
  * Runtime node model built from survey configuration.
  *
- * English comment:
  * This is the in-memory representation of a survey node that the
  * ViewModel manipulates during the flow.
  *
@@ -122,10 +66,11 @@ data class Node(
     val nextId: String? = null
 )
 
+/* ───────────────────────────── Nav Keys ───────────────────────────── */
+
 /**
  * NavKey definitions for each flow node destination.
  *
- * English comment:
  * Each of these objects represents a logical screen that the navigation
  * layer can target for a given node type.
  */
@@ -150,22 +95,21 @@ object FlowReview : NavKey
 @Serializable
 object FlowDone : NavKey
 
+/* ───────────────────────────── UI Events ───────────────────────────── */
+
 /**
  * Events emitted by the ViewModel for one-off UI feedback.
  *
- * English comment:
- * Use these events to show snackbars, dialogs, or other transient messages.
+ * Typical usages include snackbars, dialogs, and other transient messages.
  */
 sealed interface UiEvent {
 
     /**
-     * English comment:
      * Simple snackbar-like message.
      */
     data class Snack(val message: String) : UiEvent
 
     /**
-     * English comment:
      * Dialog event that carries a title and message.
      */
     data class Dialog(
@@ -174,20 +118,18 @@ sealed interface UiEvent {
     ) : UiEvent
 }
 
+/* ───────────────────────────── Main ViewModel ───────────────────────────── */
+
 /**
  * Main ViewModel responsible for managing survey navigation and state.
  *
- * English comment:
- * This ViewModel:
- *  - holds the current node and navigation history
- *  - tracks questions and answers per node
- *  - manages follow-up questions and responses
- *  - exposes navigation helpers (advance, back, reset)
+ * Responsibilities:
+ * - Tracks the current node and navigation history.
+ * - Keeps questions and answers per node.
+ * - Manages AI follow-up questions and answers.
+ * - Exposes navigation helpers (advance, back, reset).
  *
- * The ViewModel depends only on [BackStackPort] for navigation, which keeps
- * it decoupled from any concrete navigation library.
- *
- * @property nav Navigation back-stack port.
+ * @property nav Navigation back-stack.
  * @property config Survey configuration loaded from JSON/YAML.
  */
 open class SurveyViewModel(
@@ -196,25 +138,23 @@ open class SurveyViewModel(
 ) : ViewModel() {
 
     /**
-     * English comment:
      * Survey graph as a map from node ID to [Node].
      */
     private val graph: Map<String, Node>
 
     /**
-     * English comment:
      * ID of the starting node defined in [SurveyConfig.graph.startId].
      */
     private val startId: String = config.graph.startId
 
     /**
-     * English comment:
      * Internal stack that tracks the sequence of visited node IDs.
+     *
+     * The last element corresponds to the currently active node.
      */
     private val nodeStack = ArrayDeque<String>()
 
     /**
-     * English comment:
      * StateFlow representing the currently active [Node].
      */
     private val _currentNode = MutableStateFlow(
@@ -223,23 +163,20 @@ open class SurveyViewModel(
     val currentNode: StateFlow<Node> = _currentNode.asStateFlow()
 
     /**
-     * English comment:
      * Whether backwards navigation is currently possible.
      *
-     * This is true when the navigation stack contains more than one node.
+     * True when the internal navigation history contains more than one node.
      */
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
 
     /**
-     * English comment:
      * UI-level event stream (snackbars, dialogs, etc.).
      */
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 8)
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
 
     /**
-     * English comment:
      * Node ID to question text map, kept for the duration of the flow.
      *
      * This allows the UI to re-use original questions even after navigation.
@@ -249,7 +186,6 @@ open class SurveyViewModel(
     val questions: StateFlow<Map<String, String>> = _questions.asStateFlow()
 
     /**
-     * English comment:
      * Update or insert a question text for the given key (node ID).
      */
     fun setQuestion(text: String, key: String) {
@@ -261,13 +197,11 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Retrieve a question text by key (node ID) or return an empty string.
      */
     fun getQuestion(key: String): String = questions.value[key].orEmpty()
 
     /**
-     * English comment:
      * Clear all stored questions.
      */
     fun resetQuestions() {
@@ -275,7 +209,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Node ID to answer text map.
      */
     private val _answers =
@@ -283,7 +216,6 @@ open class SurveyViewModel(
     val answers: StateFlow<Map<String, String>> = _answers.asStateFlow()
 
     /**
-     * English comment:
      * Update or insert an answer text for the given key (node ID).
      */
     fun setAnswer(text: String, key: String) {
@@ -295,13 +227,11 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Retrieve an answer by key (node ID) or return an empty string.
      */
     fun getAnswer(key: String): String = answers.value[key].orEmpty()
 
     /**
-     * English comment:
      * Remove an answer associated with the given key (node ID).
      */
     fun clearAnswer(key: String) {
@@ -313,14 +243,19 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
+     * Clear all stored answers.
+     */
+    fun resetAnswers() {
+        _answers.value = LinkedHashMap()
+    }
+
+    /**
      * Single-choice selection for the current node.
      */
     private val _single = MutableStateFlow<String?>(null)
     val single: StateFlow<String?> = _single.asStateFlow()
 
     /**
-     * English comment:
      * Set the current single-choice selection, or null to clear.
      */
     fun setSingleChoice(opt: String?) {
@@ -328,14 +263,12 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Multi-choice selection set for the current node.
      */
     private val _multi = MutableStateFlow<Set<String>>(emptySet())
     val multi: StateFlow<Set<String>> = _multi.asStateFlow()
 
     /**
-     * English comment:
      * Toggle the presence of a multi-choice option in the selection set.
      *
      * If the option is not present, it is added; otherwise it is removed.
@@ -351,7 +284,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Clear both single- and multi-choice selections for the current node.
      */
     fun clearSelections() {
@@ -360,7 +292,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Follow-up entry used to track AI-generated questions and answers.
      *
      * @property question Text of the follow-up question.
@@ -376,7 +307,6 @@ open class SurveyViewModel(
     )
 
     /**
-     * English comment:
      * Map from node ID to a list of follow-up entries.
      */
     private val _followups =
@@ -385,13 +315,12 @@ open class SurveyViewModel(
         _followups.asStateFlow()
 
     /**
-     * English comment:
      * Add a follow-up question for a given node ID.
      *
-     * @param nodeId Node ID that owns the follow-up.
+     * @param nodeId Owner node ID.
      * @param question Follow-up question text.
-     * @param dedupAdjacent If true, ignore the new question when it is the
-     * same as the last question in the list.
+     * @param dedupAdjacent When true, ignores the new question if it is
+     * the same as the last question for that node.
      */
     fun addFollowupQuestion(
         nodeId: String,
@@ -410,7 +339,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Answer the last unanswered follow-up for the given node ID.
      *
      * If all follow-ups already have answers, this method is a no-op.
@@ -435,7 +363,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Answer a follow-up at a specific index for the given node ID.
      *
      * If the index is out of range, this method is a no-op.
@@ -460,7 +387,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Remove all follow-ups associated with the given node ID.
      */
     fun clearFollowups(nodeId: String) {
@@ -472,11 +398,17 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
+     * Clear all follow-ups for all nodes.
+     */
+    fun resetFollowups() {
+        _followups.value = LinkedHashMap()
+    }
+
+    /**
      * Build a rendered prompt string for the given node and answer.
      *
      * The template is looked up from [SurveyConfig.prompts] by node ID and
-     * uses placeholders like {{QUESTION}}, {{ANSWER}}, and {{NODE_ID}}.
+     * uses placeholders like `{{QUESTION}}`, `{{ANSWER}}`, and `{{NODE_ID}}`.
      *
      * @throws IllegalArgumentException if no prompt is defined for the node.
      */
@@ -503,8 +435,7 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
-     * Replace placeholders in a template using the format {{KEY}}.
+     * Replace placeholders in a template using the format `{{KEY}}`.
      *
      * @param template Template text containing placeholders.
      * @param vars Map of placeholder keys to replacement values.
@@ -522,7 +453,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Map a [Node.type] to a [NavKey] destination.
      */
     private fun navKeyFor(node: Node): NavKey =
@@ -537,7 +467,6 @@ open class SurveyViewModel(
         }
 
     /**
-     * English comment:
      * Push a node into the internal stack and navigate to its destination.
      *
      * This method also updates [_currentNode] and [_canGoBack].
@@ -552,11 +481,7 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Ensure that the question text for a given node ID is stored.
-     *
-     * If there is no stored question yet, the question from the node
-     * definition is inserted into the question map.
      */
     private fun ensureQuestion(id: String) {
         if (getQuestion(id).isEmpty()) {
@@ -568,7 +493,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Hook for UI to clear transient selections when the node changes.
      */
     fun onNodeChangedResetSelections() {
@@ -576,10 +500,7 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Navigate to the node with the given ID and push it onto the history.
-     *
-     * @throws IllegalStateException if the node ID does not exist.
      */
     @Synchronized
     fun goto(nodeId: String) {
@@ -589,13 +510,10 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Replace the current node with another node without stacking.
      *
      * This is effectively a "jump" that pops the current node and then
      * pushes the new node.
-     *
-     * @throws IllegalStateException if the node ID does not exist.
      */
     @Synchronized
     fun replaceTo(nodeId: String) {
@@ -612,15 +530,26 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
-     * Reset the navigation stack and move to the start node.
+     * Reset the navigation stack and move to the start node, clearing
+     * all survey answers, questions, follow-ups, and selections.
+     *
+     * Call this when starting a brand-new survey session.
      */
     @Synchronized
     fun resetToStart() {
+        // Clear navigation history.
         nav.clear()
         nodeStack.clear()
 
+        // Clear all survey state so previous session does not leak.
+        resetQuestions()
+        resetAnswers()
+        resetFollowups()
+        clearSelections()
+
+        // Re-initialize at the start node.
         val start = nodeOf(startId)
+        ensureQuestion(start.id)
         _currentNode.value = start
         nodeStack.addLast(start.id)
         nav.add(navKeyFor(start))
@@ -630,10 +559,7 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Navigate back to the previous node if possible.
-     *
-     * If already at the root node, this method is a no-op.
      */
     @Synchronized
     fun backToPrevious() {
@@ -653,11 +579,7 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Move forward to the next node based on the current node's [Node.nextId].
-     *
-     * If there is no [Node.nextId], nothing happens. If the next node ID
-     * is not present in the graph, an [IllegalStateException] is thrown.
      */
     @Synchronized
     fun advanceToNext() {
@@ -678,10 +600,7 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Get a [Node] instance for the given ID or throw an error.
-     *
-     * This method assumes configuration has already been validated.
      */
     private fun nodeOf(id: String): Node =
         graph[id] ?: error(
@@ -689,7 +608,6 @@ open class SurveyViewModel(
         )
 
     /**
-     * English comment:
      * Update [_canGoBack] based on the current size of [nodeStack].
      */
     private fun updateCanGoBack() {
@@ -697,14 +615,12 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Convert a generic immutable [Map] to a mutable [LinkedHashMap] copy.
      */
     private fun Map<String, String>.mutableLinked(): LinkedHashMap<String, String> =
         LinkedHashMap(this)
 
     /**
-     * English comment:
      * Convert a map of immutable lists to a mutable [LinkedHashMap] whose
      * values are [MutableList] copies.
      */
@@ -718,7 +634,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * English comment:
      * Convert a [LinkedHashMap] of mutable lists into a map of immutable lists.
      */
     private fun <T> LinkedHashMap<String, MutableList<T>>.toImmutableLists():
@@ -726,7 +641,6 @@ open class SurveyViewModel(
         this.mapValues { (_, list) -> list.toList() }
 
     /**
-     * English comment:
      * Initialization block that builds the graph from config and moves
      * the navigation state to the start node.
      */
@@ -738,6 +652,7 @@ open class SurveyViewModel(
 
         // Initialize navigation at the start node.
         val start = nodeOf(startId)
+        ensureQuestion(start.id)
         _currentNode.value = start
         nodeStack.addLast(start.id)
         nav.add(navKeyFor(start))
