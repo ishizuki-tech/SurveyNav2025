@@ -1,6 +1,6 @@
 # SurveyNav 2025
 
-Config-driven survey navigator app for Android, designed as a reference implementation of the "SLM Integration Framework" for small language model (SLM) workflows.
+Config-driven survey navigator app for Android, designed as a reference implementation of the **“SLM Integration Framework”** for small language model (SLM) workflows.
 
 This repository shows how to:
 
@@ -8,7 +8,7 @@ This repository shows how to:
 - Load, validate, and run those flows on Android using Jetpack Compose.
 - Attach SLM metadata (model, decoding params, etc.) that downstream engines can use.
 
-> Status: WIP / experimental. APIs and config schema may change.
+> Status: **WIP / experimental.** Public APIs and config schema are not stable yet and may change.
 
 ---
 
@@ -22,7 +22,8 @@ This repository shows how to:
     - [YAML example](#yaml-example)
 - [Getting started](#getting-started)
     - [Requirements](#requirements)
-    - [Build and run](#build-and-run)
+    - [Download (APK)](#download-apk)
+    - [Build and run from source](#build-and-run-from-source)
 - [CI / CD & GitHub integration](#ci--cd--github-integration)
     - [GitHub Pages](#github-pages)
     - [GitHub Wiki auto-update](#github-wiki-auto-update)
@@ -41,10 +42,10 @@ The main idea:
 
 - You **do not** hard-code the question flow in Kotlin.
 - Instead, you write a **`SurveyConfig`** file (YAML or JSON) that describes:
-    - Nodes (START / QUESTION / AI / REVIEW / DONE, etc.)
-    - Edges between nodes (`nextId`)
-    - Text for prompts and questions
-    - Metadata for the SLM backend (model name, decoding params, accelerator, etc.)
+    - Nodes (START / QUESTION / AI / REVIEW / DONE, etc.).
+    - Edges between nodes (`nextId`).
+    - Text for prompts and questions.
+    - Metadata for the SLM backend (model name, decoding params, accelerator, etc.).
 
 At runtime, the app:
 
@@ -58,7 +59,19 @@ This repo is intended as:
 - A **playground** for experimenting with SLM-backed question/answer flows on-device.
 
 ---
+## Demo screenshots and video
 
+[Home screen – SurveyNav 2025](images/Screenshot_20251117_134942.png)
+
+[Question screen – SurveyNav 2025](images/Screenshot_20251117_135301.png)
+
+[▶ Watch the SurveyNav 2025 demo 1 Installation](videos/Screen_recording_20251117_131203.mp4)
+
+[▶ Watch the SurveyNav 2025 demo 2 SLM Initialization](videos/Screen_recording_20251117_131343.mp4)
+
+[▶ Watch the SurveyNav 2025 demo 3 Question Evaluation](videos/Screen_recording_20251117_132537.mp4)
+
+---
 ## Features
 
 - **Config-driven survey graph**
@@ -80,7 +93,9 @@ This repo is intended as:
 - **SLM-aware metadata**
 
     - SLM configuration is represented by a serializable `SlmMeta` data class.
-    - Fields like `model_name`, `model_family`, `backend`, `accelerator`, `max_tokens`, `top_k`, `top_p`, and `stop` tokens are part of the configuration.
+    - The configuration file (YAML / JSON) uses **snake_case** keys like  
+      `model_name`, `model_family`, `max_tokens`, `top_k`, `top_p`, `temperature`, `stop`.
+    - These are mapped to Kotlin camelCase fields via `@SerialName`, so you can keep configs stable while refactoring code.
     - Actual SLM execution is intentionally decoupled, so you can plug in your own engine.
 
 - **YAML + JSON support**
@@ -103,7 +118,7 @@ High-level components:
     - `SurveyConfig.SlmMeta`
     - `NodeDTO` + `NodeType` enum for graph nodes
 
-  Includes helper methods:
+  Includes helper methods (names simplified here):
 
     - `validate(): List<String>`
     - `toJson(pretty: Boolean)`
@@ -144,7 +159,7 @@ High-level components:
 
 ### SurveyConfig schema
 
-The `SurveyConfig` data class roughly looks like this (simplified):
+The `SurveyConfig` data class roughly looks like this (simplified and aligned with the YAML keys):
 
 ```kotlin
 @Serializable
@@ -169,20 +184,24 @@ data class SurveyConfig(
 
     @Serializable
     data class SlmMeta(
-        val modelName: String = "",
-        val modelFamily: String = "",
+        @SerialName("model_name")   val modelName: String = "",
+        @SerialName("model_family") val modelFamily: String = "",
         val backend: String = "",
         val accelerator: String = "CPU",
-        val maxTokens: Int = 256,
-        @SerialName("top_k") val topK: Int = 40,
-        @SerialName("top_p") val topP: Double = 0.95,
+        @SerialName("max_tokens")   val maxTokens: Int = 256,
+        @SerialName("top_k")        val topK: Int = 40,
+        @SerialName("top_p")        val topP: Double = 0.95,
         val temperature: Double = 0.7,
         val stop: List<String> = emptyList()
     )
 }
 ```
 
-The actual code may contain more fields and stricter validation, but this gives the idea.
+Notes:
+
+- The **config file** uses snake_case keys (`model_name`, `model_family`, `max_tokens`, …).
+- The **Kotlin code** uses camelCase field names, bridged via `@SerialName`.
+- The actual project may contain more fields and stricter validation, but this gives the idea.
 
 ### YAML example
 
@@ -246,9 +265,17 @@ and adjust the file name in `MainActivity` if needed.
 - JDK 17+
 - Android SDK platform 35
 - Android build-tools 35.0.0
-- A device or emulator running a reasonably recent Android (see `minSdk` in `app/build.gradle.kts`)
+- A device or emulator running a reasonably recent Android version (see `minSdk` in `app/build.gradle.kts`)
 
-### Build and run
+### Download (APK)
+
+If you just want to try the app without building from source:
+
+- Visit the GitHub Pages site (see [GitHub Pages](#github-pages)).
+- Download the latest APK to your Android device.
+- Install it by opening the downloaded APK on your device (you may need to allow installs from your browser / file manager).
+
+### Build and run from source
 
 1. **Clone the repo**
 
@@ -259,13 +286,13 @@ and adjust the file name in `MainActivity` if needed.
 
 2. **Open in Android Studio**
 
-    - Use "Open" and select the root directory.
+    - Use “Open” and select the root directory.
     - Let Gradle sync and download dependencies.
 
 3. **Run on device/emulator**
 
     - Select the `app` run configuration.
-    - Click "Run".
+    - Click **Run**.
     - The app should start and load the default `survey_config1.yaml` from `assets/`.
 
 4. **Edit the survey**
@@ -316,21 +343,26 @@ GH_TOKEN is not configured
 
 then you need to:
 
-1. Create a **Personal Access Token** on GitHub (classic token is fine), with at least:
+1. **Create a Personal Access Token** on GitHub (a classic token is fine), with at least:
 
     - `repo` (for pushing to wiki / pages branches)
     - `workflow` (if workflows need to be triggered)
 
-2. In the repository settings, add it as a secret:
+2. **Add it as a repository secret**:
 
     - Go to: `Settings` → `Secrets and variables` → `Actions`
-    - Add new repository secret:
+    - Add a new repository secret:
         - Name: `GH_TOKEN`
         - Value: `<your personal access token>`
 
-3. Re-run the workflow.
+3. **Re-run the workflow.**
 
-If you prefer, you can also modify the workflows to use GitHub's built-in `GITHUB_TOKEN` instead of a custom `GH_TOKEN`, but the default token has some limitations when pushing to wiki or triggering downstream workflows.
+Security note:
+
+- Never commit this token to the repository or hard-code it in workflows.
+- Always store it as an Actions secret or use the built-in `GITHUB_TOKEN` where possible.
+
+If you prefer, you can also modify the workflows to use GitHub’s built-in `GITHUB_TOKEN` instead of a custom `GH_TOKEN`, but the default token has some limitations when pushing to wiki or triggering downstream workflows.
 
 ---
 
@@ -347,7 +379,7 @@ SurveyNav2025/
 │  │  │  │  └─ com/negi/survey/
 │  │  │  │     ├─ MainActivity.kt
 │  │  │  │     └─ config/
-│  │  │  │        ├─ SurveyConfig.kt (model)
+│  │  │  │        ├─ SurveyConfig.kt      (model)
 │  │  │  │        └─ SurveyConfigLoader.kt (loader + validation)
 │  │  │  └─ assets/
 │  │  │     └─ survey_config1.yaml
@@ -359,7 +391,8 @@ SurveyNav2025/
 └─ README.md  ← you are here
 ```
 
-Names and paths may vary slightly in the actual repo, but this is the intended structure.
+Names and paths may vary slightly in the actual repo, but this is the intended structure.  
+In a more advanced setup, you may extract `SurveyConfig` and `SurveyConfigLoader` into a shared library module (e.g. an `androidslm` module) and keep this app as a thin reference implementation.
 
 ---
 
@@ -372,6 +405,7 @@ Planned / possible extensions:
 - Integration demo with a specific SLM engine (e.g. llama.cpp, MediaPipe Tasks).
 - Richer validation (reachability analysis, cycle detection).
 - In-app editor to tweak and reload configs at runtime.
+- Additional examples for different domains (agriculture, education, health, etc.).
 
 Contributions, issues, and discussion are all welcome.
 
