@@ -379,7 +379,6 @@ class GitHubUploadWorker(
         fun enqueueExistingPayload(context: Context, cfg: GitHubUploader.GitHubConfig, file: File) {
             val name = file.name
 
-            // English comment:
             // Use OneTimeWorkRequest explicitly so that enqueueUniqueWork(...) overload resolves correctly.
             val req: OneTimeWorkRequest = OneTimeWorkRequestBuilder<GitHubUploadWorker>()
                 .setInputData(

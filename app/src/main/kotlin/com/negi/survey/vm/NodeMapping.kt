@@ -16,7 +16,6 @@ import com.negi.survey.config.NodeDTO
 /**
  * Convert a configuration-layer [NodeDTO] into a ViewModel-layer [Node].
  *
- * English comment:
  * - Keeps the `config` package free from any dependency on the ViewModel layer.
  * - Provides a single place to evolve mapping rules (default types, field transforms).
  *
