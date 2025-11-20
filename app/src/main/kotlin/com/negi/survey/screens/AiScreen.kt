@@ -18,6 +18,8 @@
  *   • Render chat-style history with user messages and AI JSON responses.
  *   • Manage IME, focus, and auto-scroll during streaming.
  *   • Persist answers and follow-up questions back into SurveyViewModel.
+ *   • Optionally accept a SpeechController to integrate speech-to-text
+ *     (e.g., Whisper.cpp) into the answer composer.
  *
  *  Visual design:
  *   • Strict grayscale (no color hue) with animated neutral gradients.
@@ -33,6 +35,7 @@
 package com.negi.survey.screens
 
 import android.annotation.SuppressLint
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -69,6 +72,8 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -89,14 +94,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -144,6 +147,8 @@ import kotlin.collections.ArrayDeque
  *  - Streams AI evaluation and renders it as chat bubbles via [vmAI].
  *  - Updates survey answer and follow-up questions back into [vmSurvey].
  *  - Manages IME focus, background tap-to-dismiss, and auto-scrolling.
+ *  - Optionally integrates a [SpeechController] to allow microphone-based
+ *    answer input.
  *
  * The screen does not perform any AI logic itself; all evaluation is delegated
  * to [AiViewModel.evaluateAsync].
@@ -153,6 +158,7 @@ import kotlin.collections.ArrayDeque
  * @param vmAI AI-specific ViewModel for streaming and chat state.
  * @param onNext Callback invoked when the user presses the "Next" button.
  * @param onBack Callback invoked when the user presses the "Back" button.
+ * @param speechController Optional speech controller backing the composer mic.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSerializationApi::class)
 @Composable
@@ -161,7 +167,8 @@ fun AiScreen(
     vmSurvey: SurveyViewModel,
     vmAI: AiViewModel,
     onNext: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    speechController: SpeechController? = null
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
@@ -187,6 +194,23 @@ fun AiScreen(
     var composer by remember(nodeId) { mutableStateOf(vmSurvey.getAnswer(nodeId)) }
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
+
+    // Optional speech controller derived state.
+    val (speechRecording, speechPartial, speechError) = if (speechController != null) {
+        val isRec by speechController.isRecording.collectAsState()
+        val partial by speechController.partialText.collectAsState()
+        val err by speechController.errorMessage.collectAsState()
+        Triple(isRec, partial, err)
+    } else {
+        Triple(false, "", null)
+    }
+
+    val speechStatusText: String? = when {
+        speechError != null -> speechError
+        speechController != null && speechRecording -> "Listening…"
+        else -> null
+    }
+    val speechStatusIsError = speechError != null
 
     // Seed the first question and focus composer (IME stays open).
     LaunchedEffect(nodeId, question) {
@@ -265,6 +289,14 @@ fun AiScreen(
         }
     }
 
+    // When speech recording ends with a non-empty transcript, commit it into the answer.
+    LaunchedEffect(speechRecording) {
+        if (!speechRecording && speechPartial.isNotBlank() && speechController != null) {
+            composer = speechPartial
+            vmSurvey.setAnswer(speechPartial, nodeId)
+        }
+    }
+
     // Auto-scroll to bottom when chat size changes.
     LaunchedEffect(chat.size) {
         delay(16)
@@ -279,7 +311,9 @@ fun AiScreen(
         }
     }
 
-    // Submit current answer (keeps IME open).
+    /**
+     * Submit current answer (keeps IME open).
+     */
     fun submit() {
         val answer = composer.trim()
         if (answer.isBlank() || loading) return
@@ -334,7 +368,18 @@ fun AiScreen(
                         },
                         onSend = ::submit,
                         enabled = !loading,
-                        focusRequester = focusRequester
+                        focusRequester = focusRequester,
+                        speechEnabled = speechController != null,
+                        speechRecording = speechRecording,
+                        speechStatusText = speechStatusText,
+                        speechStatusIsError = speechStatusIsError,
+                        onToggleSpeech = speechController?.let { sc ->
+                            {
+                                // Single toggle entry point; controller decides
+                                // whether to start or stop recording.
+                                sc.toggleRecording()
+                            }
+                        }
                     )
                     HorizontalDivider(
                         modifier = Modifier,
@@ -742,12 +787,18 @@ private fun JsonBubbleMono(
  * Layout:
  *  - Monotone pill container with subtle neutral rim.
  *  - Single-line primary action button for sending the answer.
+ *  - Optional microphone button for speech-to-text integration.
  *
  * @param value Current text in the composer.
  * @param onValueChange Callback invoked when the user edits the text.
  * @param onSend Callback invoked when the user presses the send button.
  * @param enabled Whether the send action is currently allowed.
  * @param focusRequester External [FocusRequester] to control IME focus.
+ * @param speechEnabled Whether the microphone UI should be shown.
+ * @param speechRecording Whether a speech session is currently active.
+ * @param speechStatusText Optional status text displayed under the composer.
+ * @param speechStatusIsError Whether [speechStatusText] represents an error.
+ * @param onToggleSpeech Optional callback toggling speech start/stop.
  */
 @Composable
 private fun ChatComposer(
@@ -755,7 +806,12 @@ private fun ChatComposer(
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
     enabled: Boolean,
-    focusRequester: FocusRequester
+    focusRequester: FocusRequester,
+    speechEnabled: Boolean = false,
+    speechRecording: Boolean = false,
+    speechStatusText: String? = null,
+    speechStatusIsError: Boolean = false,
+    onToggleSpeech: (() -> Unit)? = null
 ) {
     val cs = MaterialTheme.colorScheme
     Column(
@@ -798,6 +854,31 @@ private fun ChatComposer(
                 ),
                 textStyle = MaterialTheme.typography.bodyMedium
             )
+
+            if (speechEnabled && onToggleSpeech != null) {
+                val tint = cs.onSurfaceVariant
+                IconButton(onClick = onToggleSpeech) {
+                    Crossfade(
+                        targetState = speechRecording,
+                        label = "mic-toggle-composer"
+                    ) { rec ->
+                        if (rec) {
+                            Icon(
+                                imageVector = Icons.Filled.Stop,
+                                contentDescription = "Stop recording",
+                                tint = tint
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Filled.Mic,
+                                contentDescription = "Start recording",
+                                tint = tint
+                            )
+                        }
+                    }
+                }
+            }
+
             FilledTonalButton(
                 onClick = onSend,
                 enabled = enabled && value.isNotBlank(),
@@ -809,6 +890,20 @@ private fun ChatComposer(
                     contentDescription = "Send"
                 )
             }
+        }
+
+        if (speechStatusText != null) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = speechStatusText,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (speechStatusIsError) {
+                    cs.error
+                } else {
+                    cs.onSurfaceVariant
+                },
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp)
+            )
         }
     }
 }

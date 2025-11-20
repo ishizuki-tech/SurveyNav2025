@@ -140,6 +140,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.geometry)
     implementation(libs.androidx.compose.foundation.layout)
     implementation(libs.androidx.compose.foundation)
+    implementation(libs.androidx.lifecycle.process)
     androidTestImplementation(platform(libs.androidx.compose.bom))
 
     // Navigation 3 (Runtime/UI helpers)

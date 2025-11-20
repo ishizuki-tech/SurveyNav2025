@@ -72,6 +72,7 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.runtime.rememberSavedStateNavEntryDecorator
 import androidx.navigation3.scene.rememberSceneSetupNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
+import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
 import com.negi.survey.net.GitHubUploader
@@ -96,7 +97,6 @@ import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
-import com.negi.survey.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -408,7 +408,7 @@ fun AppNav() {
             )
         }
 
-        // Fallback in case nothing matched (defensive,ほぼ来ない想定)
+        // Fallback in case nothing matched (defensive, should rarely happen).
         mapped.ifEmpty {
             listOf(
                 ConfigOptionUi(
