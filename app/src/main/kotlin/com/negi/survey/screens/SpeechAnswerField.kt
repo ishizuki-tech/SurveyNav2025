@@ -33,28 +33,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.flow.StateFlow
-
-/**
- * Simple abstraction for a Whisper-backed speech controller.
- *
- * Implement this with your existing Whisper.cpp wrapper.
- *
- * Contract:
- * - [isRecording]: true while microphone capture + transcription is active.
- * - [partialText]: last recognized text fragment (can be empty while waiting).
- * - [errorMessage]: last error, cleared when a new session starts.
- * - [startRecording]: begin a new speech session.
- * - [stopRecording]: stop and finalize the current session.
- */
-interface SpeechController {
-    val isRecording: StateFlow<Boolean>
-    val partialText: StateFlow<String>
-    val errorMessage: StateFlow<String?>
-
-    fun startRecording()
-    fun stopRecording()
-}
 
 /**
  * Text answer field augmented with a speech-to-text microphone button.

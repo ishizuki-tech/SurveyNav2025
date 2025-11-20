@@ -72,7 +72,6 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.runtime.rememberSavedStateNavEntryDecorator
 import androidx.navigation3.scene.rememberSceneSetupNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
-import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
 import com.negi.survey.net.GitHubUploader
@@ -97,6 +96,7 @@ import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.WhisperSpeechController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -678,6 +678,9 @@ fun SurveyNavHost(
     // Global background upload HUD — always attached at the window root.
     UploadProgressOverlay()
 
+    // Single Whisper-based SpeechController shared across text/AI flows.
+    val speechVm: WhisperSpeechController = viewModel()
+
     val canGoBack by vmSurvey.canGoBack.collectAsState()
 
     NavDisplay(
@@ -708,7 +711,8 @@ fun SurveyNavHost(
                     vmSurvey = vmSurvey,
                     vmAI = vmAI,
                     onNext = { vmSurvey.advanceToNext() },
-                    onBack = { vmSurvey.backToPrevious() }
+                    onBack = { vmSurvey.backToPrevious() },
+                    speechController = speechVm
                 )
             }
 
@@ -720,7 +724,8 @@ fun SurveyNavHost(
                     vmSurvey = vmSurvey,
                     vmAI = vmAI,
                     onNext = { vmSurvey.advanceToNext() },
-                    onBack = { vmSurvey.backToPrevious() }
+                    onBack = { vmSurvey.backToPrevious() },
+                    speechController = speechVm
                 )
             }
 

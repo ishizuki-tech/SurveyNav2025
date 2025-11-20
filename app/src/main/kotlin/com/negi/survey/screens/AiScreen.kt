@@ -127,6 +127,7 @@ import com.negi.survey.slm.FollowupExtractor.extractScore
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -138,6 +139,42 @@ import kotlin.collections.ArrayDeque
  * AI Evaluation Screen — Monotone × Glass × Chat
  * =============================================================================
  */
+
+/**
+ * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
+ *
+ * Implementations are expected to:
+ *  - Expose recording state and latest recognized text as [StateFlow]s.
+ *  - Provide [startRecording] and [stopRecording] controls for the UI.
+ *  - Optionally reuse [toggleRecording] as a convenience entry point.
+ */
+interface SpeechController {
+    val isRecording: StateFlow<Boolean>
+    val partialText: StateFlow<String>
+    val errorMessage: StateFlow<String?>
+
+    /**
+     * Starts a new recording session.
+     */
+    fun startRecording()
+
+    /**
+     * Stops the current recording session.
+     */
+    fun stopRecording()
+
+    /**
+     * Convenience helper that toggles between [startRecording]
+     * and [stopRecording] based on [isRecording].
+     */
+    fun toggleRecording() {
+        if (isRecording.value) {
+            stopRecording()
+        } else {
+            startRecording()
+        }
+    }
+}
 
 /**
  * Full-screen AI evaluation screen bound to a single survey node.
