@@ -23,13 +23,11 @@ import kotlinx.coroutines.launch
  * Simple ViewModel-based SpeechController implementation.
  *
  * Wire this class to your actual Whisper.cpp JNI bridge:
- * - Allocate / reuse a Whisper context.
+ * - Allocate or reuse a Whisper context.
  * - Capture microphone PCM.
  * - Run transcription and update [partialText].
  */
-class WhisperSpeechController(
-    // Inject your own dependencies here, e.g. appContext, modelPath, whisperContext, etc.
-) : ViewModel(), SpeechController {
+class WhisperSpeechController : ViewModel(), SpeechController {
 
     private val _isRecording = MutableStateFlow(false)
     private val _partialText = MutableStateFlow("")
@@ -48,8 +46,11 @@ class WhisperSpeechController(
         // Example: start microphone + Whisper on a background dispatcher.
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                // TODO: start AudioRecord loop + Whisper streaming here
-                // and call updatePartialText(...) with interim results.
+                // TODO:
+                //  - Start AudioRecord capture.
+                //  - Feed PCM chunks into Whisper.cpp.
+                //  - Call updatePartialText(...) with interim results.
+                //  - Update [_partialText] with the final transcript.
             } catch (t: Throwable) {
                 _error.value = t.message ?: "Speech recognition failed"
                 _isRecording.value = false
@@ -59,12 +60,16 @@ class WhisperSpeechController(
 
     override fun stopRecording() {
         if (!_isRecording.value) return
-        // TODO: stop AudioRecord + finalize Whisper transcription.
+        // TODO:
+        //  - Stop AudioRecord.
+        //  - Optionally finalize Whisper.cpp decoding if needed.
         _isRecording.value = false
     }
 
     /**
-     * Call this from your Whisper callback whenever new text is available.
+     * Updates the current partial or final transcript text.
+     *
+     * Call this from the Whisper JNI callback when new text is available.
      */
     fun updatePartialText(text: String) {
         _partialText.value = text
