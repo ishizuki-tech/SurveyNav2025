@@ -37,7 +37,7 @@ android {
 
     defaultConfig {
         applicationId = appId
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -133,10 +133,13 @@ android {
 }
 
 dependencies {
+    implementation(project(":nativelib"))
+
     // ===== Compose BOM =====
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui.geometry)
     implementation(libs.androidx.compose.foundation.layout)
+    implementation(libs.androidx.compose.foundation)
     androidTestImplementation(platform(libs.androidx.compose.bom))
 
     // Navigation 3 (Runtime/UI helpers)
