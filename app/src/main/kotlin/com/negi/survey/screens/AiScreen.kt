@@ -328,9 +328,15 @@ fun AiScreen(
         }
     }
 
-    // When speech recording ends with a non-empty transcript, commit it into the answer.
-    LaunchedEffect(speechRecording) {
-        if (!speechRecording && speechPartial.isNotBlank() && speechController != null) {
+    // ★ FIX: commit recognized speech when final text arrives AND recording is off.
+    // This avoids the race where isRecording becomes false before the transcript
+    // is populated by the background transcriber.
+    LaunchedEffect(speechPartial, speechRecording) {
+        if (
+            speechController != null &&
+            !speechRecording &&
+            speechPartial.isNotBlank()
+        ) {
             composer = speechPartial
             vmSurvey.setAnswer(speechPartial, nodeId)
         }
@@ -543,18 +549,6 @@ private fun CompactTopBar(
 
 /* ───────────────────────────── Chat bubbles ─────────────────────────────── */
 
-/**
- * Monotone chat bubble with micro tail.
- *
- * Behavior:
- *  - AI messages use a darker neutral gradient and left-aligned tail.
- *  - User messages use a lighter neutral gradient and right-aligned tail.
- *  - When [isTyping] is true and [text] is blank, a typing indicator is shown.
- *
- * Rendering:
- *  - The fill and tail are drawn in [drawBehind] to avoid extra layers.
- *  - An ultra-soft radial highlight simulates inner depth.
- */
 @Composable
 private fun BubbleMono(
     text: String,
@@ -570,14 +564,12 @@ private fun BubbleMono(
     val tailW = 7f
     val tailH = 6f
 
-    // Neutral gradients (strict grayscale). AI is darker; User is lighter.
     val stops = if (isAi) {
         listOf(Color(0xFF111111), Color(0xFF1E1E1E), Color(0xFF2A2A2A))
     } else {
         listOf(Color(0xFFEDEDED), Color(0xFFD9D9D9), Color(0xFFC8C8C8))
     }
 
-    // Subtle motion to keep the surface visually alive.
     val t = rememberInfiniteTransition(label = "bubble-mono")
     val p by t.animateFloat(
         initialValue = 0f,
@@ -611,9 +603,7 @@ private fun BubbleMono(
             .widthIn(max = maxWidth)
             .drawBehind {
                 val cr = CornerRadius(corner.toPx(), corner.toPx())
-                // Main fill.
                 drawRoundRect(brush = grad, cornerRadius = cr)
-                // Tail.
                 val x = if (isAi) 12f else size.width - 12f
                 val dir = if (isAi) -1 else 1
                 drawPath(
@@ -625,7 +615,6 @@ private fun BubbleMono(
                     },
                     brush = grad
                 )
-                // Soft inner highlight for depth.
                 drawRoundRect(
                     brush = Brush.radialGradient(
                         colors = listOf(Color.White.copy(alpha = 0.06f), Color.Transparent),
@@ -651,12 +640,6 @@ private fun BubbleMono(
     }
 }
 
-/**
- * Three animated dots with phase-shifted alpha.
- *
- * A single [rememberInfiniteTransition] drives all dots, keeping cost low
- * while still providing a smooth typing indicator.
- */
 @Composable
 private fun TypingDots(color: Color) {
     val t = rememberInfiniteTransition(label = "typing")
@@ -705,19 +688,6 @@ private fun Dot(alpha: Float, color: Color) {
 
 /* ───────────────────────────── JSON bubble ──────────────────────────────── */
 
-/**
- * Collapsible JSON bubble with neutral header and copy action.
- *
- * Behavior:
- *  - In collapsed mode, shows a compact "Analysis preview…" snippet to keep
- *    the conversation readable.
- *  - In expanded mode, renders [pretty] with monospaced font and horizontal
- *    scroll so arbitrary JSON width is supported.
- *
- * @param pretty JSON string to display (already pretty-printed).
- * @param collapsedMaxHeight Maximum height for the collapsed preview text.
- * @param snack Optional [SnackbarHostState] for copy feedback.
- */
 @Composable
 private fun JsonBubbleMono(
     pretty: String,
@@ -747,7 +717,6 @@ private fun JsonBubbleMono(
             }
     ) {
         Column {
-            // Neutral header with score and copy button.
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -820,25 +789,6 @@ private fun JsonBubbleMono(
 
 /* ───────────────────────────── Composer ─────────────────────────────────── */
 
-/**
- * Slim glass composer that follows IME.
- *
- * Layout:
- *  - Monotone pill container with subtle neutral rim.
- *  - Single-line primary action button for sending the answer.
- *  - Optional microphone button for speech-to-text integration.
- *
- * @param value Current text in the composer.
- * @param onValueChange Callback invoked when the user edits the text.
- * @param onSend Callback invoked when the user presses the send button.
- * @param enabled Whether the send action is currently allowed.
- * @param focusRequester External [FocusRequester] to control IME focus.
- * @param speechEnabled Whether the microphone UI should be shown.
- * @param speechRecording Whether a speech session is currently active.
- * @param speechStatusText Optional status text displayed under the composer.
- * @param speechStatusIsError Whether [speechStatusText] represents an error.
- * @param onToggleSpeech Optional callback toggling speech start/stop.
- */
 @Composable
 private fun ChatComposer(
     value: String,
@@ -949,15 +899,6 @@ private fun ChatComposer(
 
 /* ─────────────────────────── Visual utilities ───────────────────────────── */
 
-/**
- * Animated monotone background brush.
- *
- * Implementation:
- *  - Uses a linear gradient with four grayscale stops blended with
- *    [MaterialTheme.colorScheme.surface] for subtle theme integration.
- *  - The gradient end point slowly drifts over time; only luminance changes,
- *    never hue, to keep the appearance strictly neutral.
- */
 @Composable
 private fun animatedMonotoneBackplate(): Brush {
     val cs = MaterialTheme.colorScheme
@@ -987,16 +928,6 @@ private fun animatedMonotoneBackplate(): Brush {
     )
 }
 
-/**
- * Neutral rim decoration for surfaces.
- *
- * Draws a sweep gradient border around the composable, using multiple gray
- * stops to create a subtle, premium-looking rim without strong contrast.
- *
- * @param alpha Overall opacity of the rim.
- * @param corner Corner radius to match the decorated container.
- * @param stroke Stroke width in dp (recommended range: 0.8–1.2 dp).
- */
 @Composable
 private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
@@ -1022,15 +953,6 @@ private fun Modifier.neutralEdge(
 
 /* ───────────────────────────── JSON helpers ─────────────────────────────── */
 
-/**
- * Best-effort JSON pretty-printer.
- *
- * Tries to:
- *  - Strip Markdown code fences.
- *  - Parse JSON directly; if that fails, search for the first balanced JSON
- *    object/array substring.
- *  - Pretty-print via [json] if parsing succeeds; otherwise returns [raw].
- */
 private fun prettyOrRaw(json: Json, raw: String): String {
     val stripped = stripCodeFence(raw)
     val element = parseJsonLenient(json, stripped)
@@ -1041,20 +963,12 @@ private fun prettyOrRaw(json: Json, raw: String): String {
     }
 }
 
-/**
- * Parse JSON in a lenient way by scanning for the first balanced JSON
- * object or array.
- *
- * Returns null if no parseable JSON fragment is found.
- */
 private fun parseJsonLenient(json: Json, text: String): JsonElement? {
     val trimmed = text.trim()
     if (trimmed.isEmpty()) return null
 
-    // Direct parse first.
     parseOrNull(json, trimmed)?.let { return it }
 
-    // Scan for first balanced object/array.
     var i = 0
     while (i < trimmed.length) {
         when (trimmed[i]) {
@@ -1075,15 +989,6 @@ private fun parseJsonLenient(json: Json, text: String): JsonElement? {
 private fun parseOrNull(json: Json, value: String): JsonElement? =
     runCatching { json.parseToJsonElement(value) }.getOrNull()
 
-/**
- * Strip Markdown-style code fences from a JSON snippet.
- *
- * Recognizes:
- *  ```json
- *  { ... }
- *  ```
- * and returns only the inner content.
- */
 private fun stripCodeFence(text: String): String {
     val t = text.trim()
     if (!t.startsWith("```")) return t
@@ -1094,13 +999,6 @@ private fun stripCodeFence(text: String): String {
     return t.substring(contentStart, closing).trim()
 }
 
-/**
- * Find the index of the matching closing brace/bracket for a JSON object
- * or array starting at [start].
- *
- * Accounts for nested structures and quoted strings. Returns -1 on mismatch
- * or if the structure is not fully closed.
- */
 private fun findMatchingJsonBoundary(text: String, start: Int): Int {
     if (start !in text.indices) return -1
     val open = text[start]
@@ -1135,12 +1033,6 @@ private fun findMatchingJsonBoundary(text: String, start: Int): Int {
 
 /* ───────────────────────────── Preview ─────────────────────────────────── */
 
-/**
- * Preview that renders a static example chat using the monotone theme.
- *
- * Uses fake [AiViewModel.ChatMsgVm] instances to verify the layout and
- * visual balance of bubbles, JSON card, and composer.
- */
 @SuppressLint("RememberInComposition")
 @Preview(showBackground = true, name = "Chat — Monotone Chic Preview")
 @Composable
