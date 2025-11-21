@@ -145,8 +145,8 @@ import kotlin.collections.ArrayDeque
  *
  * Implementations are expected to:
  *  - Expose recording state and latest recognized text as [StateFlow]s.
- *  - Provide [startRecording] and [stopRecording] controls for the UI.
- *  - Optionally reuse [toggleRecording] as a convenience entry point.
+ *  - Provide [startRecording] and [stopRecording] controls.
+ *  - Optionally rely on [toggleRecording] as a convenience entry point.
  */
 interface SpeechController {
     val isRecording: StateFlow<Boolean>
@@ -154,18 +154,20 @@ interface SpeechController {
     val errorMessage: StateFlow<String?>
 
     /**
-     * Starts a new recording session.
+     * Start capturing audio and producing partial text.
      */
     fun startRecording()
 
     /**
-     * Stops the current recording session.
+     * Stop capturing audio and finalize the current utterance.
      */
     fun stopRecording()
 
     /**
-     * Convenience helper that toggles between [startRecording]
-     * and [stopRecording] based on [isRecording].
+     * Convenience toggle that switches between start/stop.
+     *
+     * Default implementation uses [isRecording] to decide which
+     * low-level method to call.
      */
     fun toggleRecording() {
         if (isRecording.value) {

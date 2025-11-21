@@ -177,6 +177,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.viewmodel.navigation3.android)
+    implementation(libs.androidx.lifecycle.process)
 
     // WorkManager
     implementation(libs.androidx.work.runtime.ktx)
