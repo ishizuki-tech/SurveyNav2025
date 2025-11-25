@@ -40,7 +40,32 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.0.1_With_WhisperCpp"
+
+        /**
+         * CI-provided version name (tag-safe; no spaces).
+         *
+         * Example:
+         * - Local build: falls back to "0.0.1"
+         * - CI build   : "v1.0-20251125-0134" (exported as CI_APP_VERSION_NAME)
+         */
+        val ciVersionName = System.getenv("CI_APP_VERSION_NAME")
+        val resolvedVersionName = ciVersionName
+            ?.takeIf { it.isNotBlank() }
+            ?: "0.0.1"
+
+        // This one is used by Android / Git tags and must NOT contain spaces.
+        versionName = resolvedVersionName
+
+        /**
+         * Human-readable display version for UI / logs.
+         * Example: "v1.0-20251125-0134 with WhisperCpp"
+         */
+        val displayVersion = "$resolvedVersionName with WhisperCpp"
+        buildConfigField(
+            "String",
+            "DISPLAY_VERSION",
+            "\"$displayVersion\""
+        )
 
         // Use AndroidX Test Runner (required for Orchestrator)
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -50,8 +75,7 @@ android {
         testInstrumentationRunnerArguments["clearPackageData"] = "true"
         // useTestStorageService: scoped test storage instead of legacy external storage (A14+).
         testInstrumentationRunnerArguments["useTestStorageService"] = "true"
-        // 🔒 Safety guard: explicitly disable sharding unless a CI overrides it.
-        // Some CI/build scripts inject -e numShards=2 by default; this keeps a single run per device.
+        // Safety guard: explicitly disable sharding unless a CI overrides it.
         testInstrumentationRunnerArguments["numShards"] = "1"
         // NOTE: A CI can still override this with: -Pandroid.testInstrumentationRunnerArguments.numShards=2
     }
