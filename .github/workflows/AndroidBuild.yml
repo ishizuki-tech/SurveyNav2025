@@ -98,12 +98,41 @@ jobs:
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v3
 
+      - name: 📦 Download Whisper Models (if task exists, with debug)
+        run: |
+          set -e
+          MODULE="${{ env.MODULE_PATH }}"
+          echo "🔍 Checking for Gradle task ':${MODULE}:downloadModel' ..."
+          echo "🧩 Gradle version:"
+          ./gradlew -v || true
+
+          echo "🗂️ Listing available tasks in :${MODULE} module..."
+          ./gradlew -p "${MODULE}" tasks --all | tee gradle_tasks.log || true
+
+          if grep -q "downloadModel" gradle_tasks.log; then
+            echo "✅ Found task ':${MODULE}:downloadModel'. Running..."
+            echo "-------------------------------------------"
+            ./gradlew ":${MODULE}:downloadModel" --stacktrace --no-daemon
+            echo "-------------------------------------------"
+            echo "🎉 Model download completed successfully."
+          else
+            echo "⚠️ Task ':${MODULE}:downloadModel' not found. Skipping model download."
+            echo "📁 Debug info:"
+            echo "Current directory: $(pwd)"
+            echo "Subdirectories:"
+            ls -1
+            echo "-------------------------------------------"
+            echo "If your ${MODULE}/build.gradle.kts defines downloadModel,"
+            echo "ensure it's within the '${MODULE}' module and Gradle sync succeeds locally."
+          fi
+
       - name: Configure gradle.properties
-        shell: bash
         run: |-
           set -euo pipefail
           [[ -n "${{ secrets.GH_TOKEN }}" ]] || { echo "::error ::GH_TOKEN is not configured"; exit 1; }
+
           mkdir -p "$HOME/.gradle"
+
           cat <<'PROPS' > "$HOME/.gradle/gradle.properties"
           gh.owner=${{ env.OWNER }}
           gh.repo=${{ env.REPO }}
@@ -113,11 +142,8 @@ jobs:
           HF_TOKEN=${{ secrets.HF_TOKEN }}
           PROPS
 
-      # ----- version/tag をビルド前に計算して CI_APP_VERSION_NAME に流し込む -----
-
       - name: Derive base version name
         id: version
-        shell: bash
         run: |-
           set -Eeuo pipefail
           FILE_GRADLE="${MODULE_PATH}/build.gradle.kts"
@@ -146,7 +172,6 @@ jobs:
 
       - name: Compute release tag and export CI_APP_VERSION_NAME
         id: tag
-        shell: bash
         run: |-
           set -euo pipefail
 
@@ -159,8 +184,6 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "CI_APP_VERSION_NAME=$TAG" >> "$GITHUB_ENV"
           echo "Release tag: $TAG"
-
-      # ----- ここからビルド。Gradle 側では CI_APP_VERSION_NAME を versionName に使う -----
 
       - name: Decode signing keystore
         if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
@@ -180,7 +203,6 @@ jobs:
 
       - name: Collect outputs
         id: collect
-        shell: bash
         run: |-
           set -euo pipefail
           ROOT="${MODULE_PATH}/build/outputs"
@@ -242,7 +264,6 @@ jobs:
 
       - name: Prepare release body
         id: notes
-        shell: bash
         run: |-
           set -euo pipefail
           APKs=$(printf '%s\n' "${{ steps.collect.outputs.apk_list }}" | sed '/^$/d')
@@ -390,7 +411,7 @@ jobs:
           BASE_URL="${{ steps.info.outputs.base }}"
           LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
 
-          # ---- 1) 既存 Wiki を clone（なければ空フォルダ） ----
+          # ---- 1) Clone existing Wiki repo (if any) ----
           rm -rf wiki
           if [ -n "${GITHUB_TOKEN:-}" ]; then
             echo "Cloning existing wiki repo (if any)..."
@@ -407,7 +428,12 @@ jobs:
 
           cd wiki
 
-          # ---- 2) 今回の TAG ページを追加/更新 ----
+          # ---- 2) Ensure this is a git repo ----
+          if [ ! -d ".git" ]; then
+            git init
+          fi
+
+          # ---- 3) Add/update TAG page ----
           {
             echo "# 📦 SurveyNav — Build ${TAG}"
             echo "Generated: ${DATE}"
@@ -422,7 +448,7 @@ jobs:
             echo "- [All Releases](https://github.com/${REPO}/releases)"
           } > "${TAG}.md"
 
-          # ---- 3) Home.md を全 .md から再生成 ----
+          # ---- 4) Rebuild Home.md from all .md ----
           {
             echo "# 🏠 SurveyNav Wiki Home"
             echo "Updated: ${DATE}"
@@ -433,7 +459,6 @@ jobs:
           MAP_TMP="_link-map.txt"
           : > "$MAP_TMP"
 
-          # Home.md 自身を除く .md を、更新日時の新しい順に最大 20 件
           LIST=$(
             find . -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' -printf '%T@ %P\n' \
               | sort -nr \
@@ -445,9 +470,7 @@ jobs:
             echo "_No builds yet._" >> Home.md
           else
             echo "$LIST" | while read -r f; do
-              # f は "v0.0.1-20251125-0310.md" のようなファイル名
               base="$(basename "$f" .md)"
-              # GitHub Wiki のスラッグ化（簡易）
               slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
               printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> Home.md
               printf -- "%s.md -> %s\n" "$base.md" "$slug" >> "$MAP_TMP"
@@ -467,9 +490,8 @@ jobs:
           cat "$MAP_TMP" || true
           echo "::endgroup::"
 
-          # ---- 4) commit & push ----
+          # ---- 5) Commit & push ----
           if [ -n "${GITHUB_TOKEN:-}" ]; then
-            git init
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add .
