@@ -379,7 +379,7 @@ jobs:
 
       - name: Update Wiki (Home + TAG.md)
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |-
           set -euo pipefail
 
@@ -443,18 +443,18 @@ jobs:
           cat "$MAP_TMP" || true
           echo "::endgroup::"
 
-          if [ -n "${GH_TOKEN:-}" ]; then
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
             cd wiki
             git init
-            git config user.name "github-actions"
-            git config user.email "actions@github.com"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add .
             git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
             git branch -M master
-            git remote add origin "https://${OWNER}:${GH_TOKEN}@github.com/${REPO}.wiki.git"
+            git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git"
             git push origin master --force || echo "::warning::Failed to push wiki (is Wiki enabled?)"
           else
-            echo "::warning::GH_TOKEN not set; skip wiki push."
+            echo "::warning::GITHUB_TOKEN not set; skip wiki push."
           fi
 
       - name: Generate GH Pages (Downloads)
