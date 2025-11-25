@@ -338,19 +338,21 @@ jobs:
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
           echo "base=$BASE_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve latest release APK
-        id: latest
+      # 🔽 このビルドの TAG 用の APK/URL を解決する
+      - name: Resolve APK for this build
+        id: apk
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |-
           set -euo pipefail
           REPO="${{ steps.info.outputs.repo }}"
+          TAG_THIS="${{ steps.info.outputs.tag }}"
 
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::warning::GH_TOKEN not set; fallback to Releases page."
-            echo "latest_tag=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_name=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            echo "apk_tag=$TAG_THIS" >> "$GITHUB_OUTPUT"
+            echo "apk_name=" >> "$GITHUB_OUTPUT"
+            echo "apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -359,48 +361,48 @@ jobs:
             sudo apt-get install -y jq >/dev/null
           fi
 
-          curl -fsSL \
+          # English comment:
+          # - Query the release that matches THIS build's tag.
+          # - If it does not exist (e.g., create_release=false), we
+          #   fall back to the releases list.
+          if ! curl -fsSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/releases?per_page=10" \
-            -o releases.json
-
-          LATEST_TAG="$(jq -r '[.[] | select(.draft==false)][0].tag_name // empty' releases.json)"
-          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-            echo "::warning::No non-draft releases; fallback."
-            echo "latest_tag=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_name=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            "https://api.github.com/repos/${REPO}/releases/tags/${TAG_THIS}" \
+            -o release.json; then
+            echo "::warning::Release for tag ${TAG_THIS} not found; fallback."
+            echo "apk_tag=$TAG_THIS" >> "$GITHUB_OUTPUT"
+            echo "apk_name=" >> "$GITHUB_OUTPUT"
+            echo "apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           APK_NAME="$(
-            jq -r --arg TAG "$LATEST_TAG" '
-              (.[] | select(.draft==false and .tag_name==$TAG) | .assets[]?.name) // empty
-            ' releases.json \
+            jq -r '.assets[]?.name // empty' release.json \
             | grep -E '\.apk$' \
             | head -n1 || true
           )"
 
           if [ -n "$APK_NAME" ]; then
-            APK_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${APK_NAME}"
+            APK_URL="https://github.com/${REPO}/releases/download/${TAG_THIS}/${APK_NAME}"
           else
-            APK_URL="https://github.com/${REPO}/releases/tag/${LATEST_TAG}"
+            APK_URL="https://github.com/${REPO}/releases/tag/${TAG_THIS}"
           fi
 
-          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "latest_apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
-          echo "latest_apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
+          echo "apk_tag=$TAG_THIS" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
 
-          echo "::group::Latest release asset"
-          echo "LATEST_TAG : $LATEST_TAG"
-          echo "APK_NAME   : ${APK_NAME:-'(none)'}"
-          echo "APK_URL    : $APK_URL"
+          echo "::group::Release for this build"
+          echo "TAG_THIS : $TAG_THIS"
+          echo "APK_NAME : ${APK_NAME:-'(none)'}"
+          echo "APK_URL  : $APK_URL"
           echo "::endgroup::"
 
       - name: Update Wiki (Home + TAG.md)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APK_URL: ${{ steps.apk.outputs.apk_url }}
         run: |-
           set -euo pipefail
 
@@ -409,7 +411,7 @@ jobs:
           REPO="${{ steps.info.outputs.repo }}"
           OWNER="${{ env.OWNER }}"
           BASE_URL="${{ steps.info.outputs.base }}"
-          LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
+          BUILD_APK_URL="${APK_URL:-}"
 
           # ---- 1) Clone existing Wiki repo (if any) ----
           rm -rf wiki
@@ -439,10 +441,10 @@ jobs:
             echo "Generated: ${DATE}"
             echo ""
             echo "## ⬇️ Download"
-            if [ -n "$LATEST_APK_URL" ]; then
-              echo "- [Latest APK](${LATEST_APK_URL})"
+            if [ -n "$BUILD_APK_URL" ]; then
+              echo "- [This build APK](${BUILD_APK_URL})"
             else
-              echo "- [Latest APK](https://github.com/${REPO}/releases)"
+              echo "- [Releases](https://github.com/${REPO}/releases)"
             fi
             echo "- [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
             echo "- [All Releases](https://github.com/${REPO}/releases)"
@@ -505,6 +507,9 @@ jobs:
           fi
 
       - name: Generate GH Pages (Downloads)
+        env:
+          APK_URL: ${{ steps.apk.outputs.apk_url }}
+          APK_TAG: ${{ steps.apk.outputs.apk_tag }}
         run: |-
           set -euo pipefail
 
@@ -512,11 +517,11 @@ jobs:
           DATE="${{ steps.info.outputs.date }}"
           REPO="${{ steps.info.outputs.repo }}"
           BASE_URL="${{ steps.info.outputs.base }}"
-          LATEST_TAG="${{ steps.latest.outputs.latest_tag }}"
-          LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
+          BUILD_APK_URL="${APK_URL:-}"
+          BUILD_APK_TAG="${APK_TAG:-$TAG_THIS}"
 
-          if [ -z "$LATEST_APK_URL" ]; then
-            LATEST_APK_URL="https://github.com/${REPO}/releases"
+          if [ -z "$BUILD_APK_URL" ]; then
+            BUILD_APK_URL="https://github.com/${REPO}/releases"
           fi
 
           mkdir -p gh-pages
@@ -542,10 +547,10 @@ jobs:
           <h1>📦 SurveyNav — Latest Downloads</h1>
           <p class="muted"><strong>Generated:</strong> ${DATE}</p>
 
-          <h2>⬇️ Latest Build</h2>
-          <p><a href="${LATEST_APK_URL}">Download Latest APK</a></p>
-          <p>
-            ${LATEST_TAG:+<a href="https://github.com/${REPO}/releases/tag/${LATEST_TAG}">🔖 ${LATEST_TAG}</a> • }
+          <h2>⬇️ This Build</h2>
+          <p><a href="${BUILD_APK_URL}">Download APK for <code>${BUILD_APK_TAG}</code></a></p>
+          <p style="margin-top:8px;">
+            <a href="https://github.com/${REPO}/releases/tag/${BUILD_APK_TAG}">🔖 This tag on GitHub</a> •
             <a href="https://github.com/${REPO}/releases">📘 All Releases</a>
           </p>
 
