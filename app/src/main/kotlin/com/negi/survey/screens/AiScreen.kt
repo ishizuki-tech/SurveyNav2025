@@ -144,17 +144,26 @@ import kotlin.collections.ArrayDeque
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
  *
  * Implementations are expected to:
- *  - Expose recording state and latest recognized text as [StateFlow]s.
+ *  - Expose recording state, transcription state, and latest recognized text
+ *    as [StateFlow]s.
  *  - Provide [startRecording] and [stopRecording] controls.
  *  - Optionally rely on [toggleRecording] as a convenience entry point.
  */
 interface SpeechController {
+    /** True while microphone capture is running. */
     val isRecording: StateFlow<Boolean>
+
+    /** True while the captured audio is being transcribed. */
+    val isTranscribing: StateFlow<Boolean>
+
+    /** Latest recognized text (partial or final). */
     val partialText: StateFlow<String>
+
+    /** Optional human-readable error message. */
     val errorMessage: StateFlow<String?>
 
     /**
-     * Start capturing audio and producing partial text.
+     * Start capturing audio and producing partial or final text.
      */
     fun startRecording()
 
@@ -165,9 +174,6 @@ interface SpeechController {
 
     /**
      * Convenience toggle that switches between start/stop.
-     *
-     * Default implementation uses [isRecording] to decide which
-     * low-level method to call.
      */
     fun toggleRecording() {
         if (isRecording.value) {
@@ -219,6 +225,32 @@ fun AiScreen(
         vmSurvey.questions.map { it[nodeId].orEmpty() }
     }.collectAsState(initial = vmSurvey.getQuestion(nodeId))
 
+    // Optional speech controller derived state.
+    val speechRecording: Boolean
+    val speechPartial: String
+    val speechError: String?
+    val isTranscribing: Boolean
+
+    if (speechController != null) {
+        val rec by speechController.isRecording.collectAsState()
+        val partial by speechController.partialText.collectAsState()
+        val err by speechController.errorMessage.collectAsState()
+        val trans by speechController.isTranscribing.collectAsState()
+
+        speechRecording = rec
+        speechPartial = partial
+        speechError = err
+        isTranscribing = trans
+    } else {
+        speechRecording = false
+        speechPartial = ""
+        speechError = null
+        isTranscribing = false
+    }
+
+    // Text field should be disabled while recording or transcribing.
+    val textFieldEnabled = !speechRecording && !isTranscribing
+
     // AI state.
     val loading by vmAI.loading.collectAsState()
     val stream by vmAI.stream.collectAsState()
@@ -234,18 +266,9 @@ fun AiScreen(
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
 
-    // Optional speech controller derived state.
-    val (speechRecording, speechPartial, speechError) = if (speechController != null) {
-        val isRec by speechController.isRecording.collectAsState()
-        val partial by speechController.partialText.collectAsState()
-        val err by speechController.errorMessage.collectAsState()
-        Triple(isRec, partial, err)
-    } else {
-        Triple(false, "", null)
-    }
-
     val speechStatusText: String? = when {
         speechError != null -> speechError
+        speechController != null && isTranscribing -> "Transcribing…"
         speechController != null && speechRecording -> "Listening…"
         else -> null
     }
@@ -317,7 +340,6 @@ fun AiScreen(
                 )
             )
             vmSurvey.addFollowupQuestion(nodeId, fu)
-            vmSurvey.setQuestion(fu, nodeId)
         }
     }
 
@@ -328,15 +350,9 @@ fun AiScreen(
         }
     }
 
-    // ★ FIX: commit recognized speech when final text arrives AND recording is off.
-    // This avoids the race where isRecording becomes false before the transcript
-    // is populated by the background transcriber.
+    // Commit recognized speech once recording is finished and final text is available.
     LaunchedEffect(speechPartial, speechRecording) {
-        if (
-            speechController != null &&
-            !speechRecording &&
-            speechPartial.isNotBlank()
-        ) {
+        if (speechController != null && !speechRecording && speechPartial.isNotBlank()) {
             composer = speechPartial
             vmSurvey.setAnswer(speechPartial, nodeId)
         }
@@ -412,18 +428,15 @@ fun AiScreen(
                             vmSurvey.setAnswer(it, nodeId)
                         },
                         onSend = ::submit,
-                        enabled = !loading,
+                        enabled = textFieldEnabled && !loading,
                         focusRequester = focusRequester,
                         speechEnabled = speechController != null,
                         speechRecording = speechRecording,
+                        speechTranscribing = isTranscribing,
                         speechStatusText = speechStatusText,
                         speechStatusIsError = speechStatusIsError,
                         onToggleSpeech = speechController?.let { sc ->
-                            {
-                                // Single toggle entry point; controller decides
-                                // whether to start or stop recording.
-                                sc.toggleRecording()
-                            }
+                            { sc.toggleRecording() }
                         }
                     )
                     HorizontalDivider(
@@ -434,7 +447,7 @@ fun AiScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         TextButton(
@@ -798,6 +811,7 @@ private fun ChatComposer(
     focusRequester: FocusRequester,
     speechEnabled: Boolean = false,
     speechRecording: Boolean = false,
+    speechTranscribing: Boolean = false,
     speechStatusText: String? = null,
     speechStatusIsError: Boolean = false,
     onToggleSpeech: (() -> Unit)? = null
@@ -834,6 +848,7 @@ private fun ChatComposer(
                 placeholder = { Text("Type your answer…") },
                 minLines = 1,
                 maxLines = 5,
+                enabled = enabled,
                 colors = OutlinedTextFieldDefaults.colors(
                     unfocusedContainerColor = Color.Transparent,
                     focusedContainerColor = Color.Transparent,
@@ -846,7 +861,13 @@ private fun ChatComposer(
 
             if (speechEnabled && onToggleSpeech != null) {
                 val tint = cs.onSurfaceVariant
-                IconButton(onClick = onToggleSpeech) {
+
+                val micEnabled = (enabled || speechRecording) && !speechTranscribing
+
+                IconButton(
+                    onClick = onToggleSpeech,
+                    enabled = micEnabled
+                ) {
                     Crossfade(
                         targetState = speechRecording,
                         label = "mic-toggle-composer"
