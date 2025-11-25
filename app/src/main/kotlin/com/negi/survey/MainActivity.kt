@@ -13,13 +13,20 @@
 
 package com.negi.survey
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -27,19 +34,32 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -58,6 +78,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -336,6 +357,154 @@ fun InitGate(
         else -> {
             // Success state: hand over control to the main content.
             content()
+        }
+    }
+}
+
+/* ──────────────────────── Audio Permission Gate ─────────────────────────── */
+
+/**
+ * Simple permission gate for RECORD_AUDIO.
+ *
+ * Behaviour:
+ * - If the permission is granted, renders [content] immediately.
+ * - If not, shows a small card explaining why the microphone is needed
+ *   and offers a button to request permission.
+ * - When the user denies permanently, shows a "Settings" action that
+ *   opens the app settings page.
+ */
+@Composable
+fun AudioPermissionGate(
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    val permission = Manifest.permission.RECORD_AUDIO
+
+    var hasPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, permission) ==
+                    PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasPermission = granted
+        if (!granted) {
+            scope.launch {
+                val result = snackbarHostState.showSnackbar(
+                    message = "Microphone permission is required for voice input.",
+                    actionLabel = "Settings"
+                )
+                if (result == SnackbarResult.ActionPerformed) {
+                    val intent = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", context.packageName, null)
+                    ).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                }
+            }
+        }
+    }
+
+    if (hasPermission) {
+//        Box(
+//            modifier = modifier.fillMaxSize()
+//        ) {
+            // Main content keeps its own layout.
+            content()
+
+            // Snackbar overlays at the bottom without affecting main layout.
+//            SnackbarHost(
+//                hostState = snackbarHostState,
+//                modifier = Modifier
+//                    .align(Alignment.BottomCenter)
+//                    .fillMaxWidth()
+//                    .padding(horizontal = 16.dp, vertical = 24.dp)
+//            )
+//        }
+    } else {
+        // Permission not granted → show a simple gate.
+        val backplate = animatedBackplate()
+
+        Box(
+            modifier = modifier
+                .fillMaxSize()
+                .background(backplate)
+                .padding(24.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                tonalElevation = 6.dp,
+                shadowElevation = 8.dp,
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 360.dp)
+                    .wrapContentWidth()
+                    .neonEdgeThin()
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Mic,
+                        contentDescription = "Microphone",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(32.dp)
+                    )
+                    Text(
+                        text = "Microphone permission needed",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "To use voice input for survey answers, allow microphone access.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Button(
+                        onClick = { launcher.launch(permission) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary
+                        )
+                    ) {
+                        Text("Allow microphone")
+                    }
+                    IconButton(
+                        onClick = {
+                            val intent = Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.fromParts("package", context.packageName, null)
+                            ).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            context.startActivity(intent)
+                        }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Settings,
+                            contentDescription = "Open app settings"
+                        )
+                    }
+                }
+            }
+
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(16.dp)
+            )
         }
     }
 }
@@ -647,7 +816,9 @@ fun AppNav() {
                 }
             )
 
-            SurveyNavHost(vmSurvey, vmAI, backStack)
+            AudioPermissionGate {
+                SurveyNavHost(vmSurvey, vmAI, backStack)
+            }
         }
     }
 }
@@ -678,8 +849,17 @@ fun SurveyNavHost(
     // Global background upload HUD — always attached at the window root.
     UploadProgressOverlay()
 
+    val appContext = LocalContext.current.applicationContext
+
     // Single Whisper-based SpeechController shared across text/AI flows.
-    val speechVm: WhisperSpeechController = viewModel()
+    // Model path is interpreted as src/main/assets/models/...
+    val speechVm: WhisperSpeechController = viewModel(
+        factory = WhisperSpeechController.provideFactory(
+            appContext = appContext,
+            assetModelPath = "models/ggml-small-q5_1.bin",
+            languageCode = "en"      // or "en", "ja", "sw"
+        )
+    )
 
     val canGoBack by vmSurvey.canGoBack.collectAsState()
 
