@@ -40,7 +40,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.0.1 with WhisperCpp"
+        versionName = "0.0.1_With_WhisperCpp"
 
         // Use AndroidX Test Runner (required for Orchestrator)
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
