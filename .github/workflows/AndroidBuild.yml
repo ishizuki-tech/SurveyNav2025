@@ -390,9 +390,24 @@ jobs:
           BASE_URL="${{ steps.info.outputs.base }}"
           LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
 
-          mkdir -p wiki
+          # ---- 1) 既存 Wiki を clone（なければ空フォルダ） ----
+          rm -rf wiki
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            echo "Cloning existing wiki repo (if any)..."
+            if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git" wiki 2>/dev/null; then
+              echo "Wiki repo cloned."
+            else
+              echo "No existing wiki repo or clone failed; starting fresh."
+              mkdir -p wiki
+            fi
+          else
+            echo "::warning::GITHUB_TOKEN not set; starting with empty wiki directory."
+            mkdir -p wiki
+          fi
 
-          # Per-build page
+          cd wiki
+
+          # ---- 2) 今回の TAG ページを追加/更新 ----
           {
             echo "# 📦 SurveyNav — Build ${TAG}"
             echo "Generated: ${DATE}"
@@ -405,27 +420,36 @@ jobs:
             fi
             echo "- [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
             echo "- [All Releases](https://github.com/${REPO}/releases)"
-          } > "wiki/${TAG}.md"
+          } > "${TAG}.md"
 
-          # Home.md
+          # ---- 3) Home.md を全 .md から再生成 ----
           {
             echo "# 🏠 SurveyNav Wiki Home"
             echo "Updated: ${DATE}"
             echo ""
             echo "## 📜 Build History (latest 20)"
-          } > wiki/Home.md
+          } > Home.md
 
-          MAP_TMP="wiki/_link-map.txt"
+          MAP_TMP="_link-map.txt"
           : > "$MAP_TMP"
 
-          LIST=$(find wiki -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' | sort -r | head -n 20 || true)
+          # Home.md 自身を除く .md を、更新日時の新しい順に最大 20 件
+          LIST=$(
+            find . -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' -printf '%T@ %P\n' \
+              | sort -nr \
+              | head -n 20 \
+              | awk '{ $1=""; sub(/^ /,""); print }'
+          )
+
           if [ -z "$LIST" ]; then
-            echo "_No builds yet._" >> wiki/Home.md
+            echo "_No builds yet._" >> Home.md
           else
             echo "$LIST" | while read -r f; do
+              # f は "v0.0.1-20251125-0310.md" のようなファイル名
               base="$(basename "$f" .md)"
+              # GitHub Wiki のスラッグ化（簡易）
               slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
-              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> wiki/Home.md
+              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> Home.md
               printf -- "%s.md -> %s\n" "$base.md" "$slug" >> "$MAP_TMP"
             done
           fi
@@ -434,23 +458,24 @@ jobs:
             echo ""
             echo "## 🌐 GitHub Pages"
             echo "- [Downloads Page](${BASE_URL})"
-          } >> wiki/Home.md
+          } >> Home.md
 
           echo "::group::Wiki tree"
-          ls -R wiki || true
+          ls -R .
           echo "::endgroup::"
           echo "::group::Wiki link map"
           cat "$MAP_TMP" || true
           echo "::endgroup::"
 
+          # ---- 4) commit & push ----
           if [ -n "${GITHUB_TOKEN:-}" ]; then
-            cd wiki
             git init
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add .
             git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
             git branch -M master
+            git remote remove origin 2>/dev/null || true
             git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git"
             git push origin master --force || echo "::warning::Failed to push wiki (is Wiki enabled?)"
           else
