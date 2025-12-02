@@ -1,6 +1,18 @@
+/*
+ * =====================================================================
+ *  IshizukiTech LLC — SLM Integration Framework
+ *  ---------------------------------------------------------------------
+ *  File: GitHubUploader.kt
+ *  Author: Shu Ishizuki (石附 支)
+ *  License: MIT License
+ *  © 2025 IshizukiTech LLC. All rights reserved.
+ * =====================================================================
+ */
+
 package com.negi.survey.net
 
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -19,7 +31,7 @@ import java.util.Locale
 import kotlin.math.min
 
 /**
- * Coroutine-based GitHub file uploader for JSON and text files.
+ * Coroutine-based GitHub file uploader for JSON, text, and binary files.
  *
  * This object abstracts away the complexity of the GitHub Contents API,
  * handling retries, authentication, and progress reporting for you.
@@ -27,6 +39,8 @@ import kotlin.math.min
  * Use this class in background or worker contexts (IO dispatcher).
  */
 object GitHubUploader {
+
+    private const val TAG = "GitHubUploader"
 
     // ---------------------------------------------------------------------
     // 📦 Configuration Models
@@ -41,21 +55,21 @@ object GitHubUploader {
      * @property branch      Target branch (default: `main`).
      * @property pathPrefix  Logical root folder inside the repo.
      *
-     * - When using the [uploadJson] overload that takes [GitHubConfig], the
-     *   final path becomes:
+     * When using the [uploadJson] / [uploadFile] overloads that take [GitHubConfig],
+     * the final path becomes:
      *
-     *       pathPrefix / yyyy-MM-dd / relativePath
+     *   pathPrefix / yyyy-MM-dd / relativePath
      *
-     *   If [pathPrefix] is empty, the date folder becomes the root:
+     * If [pathPrefix] is empty, the date folder becomes the root:
      *
-     *       yyyy-MM-dd/relativePath
+     *   yyyy-MM-dd/relativePath
      */
     data class GitHubConfig(
         val owner: String,
         val repo: String,
         val token: String,
         val branch: String = "main",
-        val pathPrefix: String = ""   // ← ここを空デフォルトに
+        val pathPrefix: String = ""
     )
 
     /**
@@ -70,30 +84,22 @@ object GitHubUploader {
     )
 
     // ---------------------------------------------------------------------
-    // 🚀 Public APIs
+    // 🚀 Public APIs — JSON (text) upload
     // ---------------------------------------------------------------------
 
     /**
      * Uploads a JSON or text file to GitHub using the provided configuration.
      *
-     * - The final GitHub path has a date segment inserted automatically:
+     * The final GitHub path has a date segment inserted automatically:
      *
-     *       cfg.pathPrefix / yyyy-MM-dd / relativePath
-     *
-     *   Examples:
-     *       cfg.pathPrefix = ""
-     *       relativePath   = "survey_123.json"
-     *       → "2025-11-15/survey_123.json"
-     *
-     *       cfg.pathPrefix = "exports"
-     *       → "exports/2025-11-15/survey_123.json"
+     *   cfg.pathPrefix / yyyy-MM-dd / relativePath
      */
     suspend fun uploadJson(
         cfg: GitHubConfig,
         relativePath: String,
         content: String,
         message: String = "Upload via SurveyNav",
-        onProgressPercent: (Int) -> Unit = { _ -> }
+        onProgress: (Int) -> Unit = { _ -> }
     ): UploadResult = uploadJson(
         owner = cfg.owner,
         repo = cfg.repo,
@@ -102,14 +108,14 @@ object GitHubUploader {
         token = cfg.token,
         content = content,
         message = message,
-        onProgressPercent = onProgressPercent
+        onProgress = onProgress
     )
 
     /**
-     * Core upload function — creates or updates a file using GitHub Contents API.
+     * Core JSON upload function — creates or updates a file using GitHub Contents API.
      *
-     * - [path] is treated as a fully-resolved path. Date folder insertion
-     *   only happens in [buildPath] when using the [GitHubConfig] overload.
+     * [path] is treated as a fully-resolved path. Date folder insertion
+     * only happens in [buildPath] when using the [GitHubConfig] overload.
      */
     suspend fun uploadJson(
         owner: String,
@@ -119,16 +125,101 @@ object GitHubUploader {
         token: String,
         content: String,
         message: String = "Upload via SurveyNav",
-        onProgressPercent: (Int) -> Unit = { _ -> }
+        onProgress: (Int) -> Unit = { _ -> }
+    ): UploadResult = uploadBytes(
+        owner = owner,
+        repo = repo,
+        branch = branch,
+        path = path,
+        token = token,
+        contentBytes = content.toByteArray(Charsets.UTF_8),
+        message = message,
+        onProgress = onProgress
+    )
+
+    // ---------------------------------------------------------------------
+    // 🚀 Public APIs — Binary (WAV etc.) upload
+    // ---------------------------------------------------------------------
+
+    /**
+     * Uploads a binary file (e.g., WAV audio) using the provided configuration.
+     *
+     * The final GitHub path has a date segment inserted automatically:
+     *
+     *   cfg.pathPrefix / yyyy-MM-dd / relativePath
+     */
+    suspend fun uploadFile(
+        cfg: GitHubConfig,
+        relativePath: String,
+        bytes: ByteArray,
+        message: String = "Upload via SurveyNav",
+        onProgress: (Int) -> Unit = { _ -> }
+    ): UploadResult = uploadFile(
+        owner = cfg.owner,
+        repo = cfg.repo,
+        branch = cfg.branch,
+        path = buildPath(cfg.pathPrefix, relativePath),
+        token = cfg.token,
+        bytes = bytes,
+        message = message,
+        onProgress = onProgress
+    )
+
+    /**
+     * Core binary upload function — creates or updates a file using GitHub Contents API.
+     */
+    suspend fun uploadFile(
+        owner: String,
+        repo: String,
+        branch: String,
+        path: String,
+        token: String,
+        bytes: ByteArray,
+        message: String = "Upload via SurveyNav",
+        onProgress: (Int) -> Unit = { _ -> }
+    ): UploadResult = uploadBytes(
+        owner = owner,
+        repo = repo,
+        branch = branch,
+        path = path,
+        token = token,
+        contentBytes = bytes,
+        message = message,
+        onProgress = onProgress
+    )
+
+    // ---------------------------------------------------------------------
+    // 🔁 Shared JSON/binary implementation
+    // ---------------------------------------------------------------------
+
+    /**
+     * Shared implementation for both [uploadJson] and [uploadFile].
+     *
+     * Encodes [contentBytes] as Base64 and PUTs to the GitHub Contents API.
+     */
+    private suspend fun uploadBytes(
+        owner: String,
+        repo: String,
+        branch: String,
+        path: String,
+        token: String,
+        contentBytes: ByteArray,
+        message: String,
+        onProgress: (Int) -> Unit
     ): UploadResult = withContext(Dispatchers.IO) {
         require(token.isNotBlank()) { "GitHub token cannot be blank." }
 
         val encodedPath = encodePath(path)
 
+        Log.d(
+            TAG,
+            "uploadBytes: owner=$owner repo=$repo branch=$branch path=$path size=${contentBytes.size}"
+        )
+
         // Phase 1 — Lookup existing SHA
-        onProgressPercent(0)
+        onProgress(0)
         val existingSha = getExistingSha(owner, repo, branch, encodedPath, token)
-        onProgressPercent(10)
+        onProgress(10)
 
         // Phase 2 — Prepare JSON payload
         val payload = JSONObject().apply {
@@ -136,7 +227,7 @@ object GitHubUploader {
             put("branch", branch)
             put(
                 "content",
-                Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                Base64.encodeToString(contentBytes, Base64.NO_WRAP)
             )
             if (existingSha != null) put("sha", existingSha)
         }.toString()
@@ -156,7 +247,7 @@ object GitHubUploader {
                     os.write(requestBytes, off, len)
                     off += len
                     val pct = 10 + ((off.toDouble() / total) * 80.0).toInt()
-                    onProgressPercent(min(90, pct))
+                    onProgress(min(90, pct))
                 }
                 os.flush()
             }
@@ -164,7 +255,7 @@ object GitHubUploader {
 
         // Phase 3 — Execute request with retry/backoff
         val response = executeWithRetry("PUT", url, token, writeBody)
-        onProgressPercent(95)
+        onProgress(95)
 
         // Parse JSON result
         val json = try {
@@ -172,11 +263,13 @@ object GitHubUploader {
         } catch (e: JSONException) {
             throw IOException("Malformed JSON from GitHub: ${e.message}", e)
         }
-        onProgressPercent(100)
+        onProgress(100)
 
         val fileUrl =
             json.optJSONObject("content")?.optString("html_url")?.takeIf { it.isNotBlank() }
         val commitSha = json.optJSONObject("commit")?.optString("sha")?.takeIf { it.isNotBlank() }
+
+        Log.d(TAG, "uploadBytes: done url=$fileUrl sha=$commitSha")
 
         UploadResult(fileUrl, commitSha)
     }
@@ -274,14 +367,11 @@ object GitHubUploader {
      *
      *   prefix / yyyy-MM-dd / relative
      *
-     * - Empty segments are skipped, so:
-     *     buildPath("", "file.json")
-     *   becomes:
-     *     yyyy-MM-dd/file.json
+     * Empty segments are skipped, so:
+     *   buildPath("", "file.json") → yyyy-MM-dd/file.json
      */
     private fun buildPath(prefix: String, relative: String): String {
-        val dateSegment = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            .format(Date())
+        val dateSegment = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
         val segments = listOf(
             prefix.trim('/'),

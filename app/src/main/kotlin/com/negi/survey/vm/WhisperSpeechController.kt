@@ -19,6 +19,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.screens.SpeechController
+import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.WhisperEngine
 import com.negi.whispers.recorder.Recorder
 import java.io.File
@@ -37,6 +38,9 @@ import kotlinx.coroutines.withContext
  * - Manage recording lifecycle using [Recorder].
  * - Ensure Whisper model initialization via [WhisperEngine].
  * - Run transcription and publish the final text to [partialText].
+ * - Export recorded WAV files to a persistent "exports" folder
+ *   using [ExportUtils.exportRecordedVoice] so another layer
+ *   (e.g., GitHubUploadWorker) can upload them later.
  *
  * UI contract:
  * - [isRecording] is true while audio capture is active.
@@ -68,10 +72,10 @@ class WhisperSpeechController(
          * Default model path inside assets.
          *
          * Place your model at:
-         *   app/src/main/assets/models/ggml-small-q5_1.bin
-         * and keep this as "models/ggml-small-q5_1.bin".
+         *   app/src/main/assets/models/ggml-model-q4_0.bin
+         * and keep this as "models/ggml-model-q4_0.bin".
          */
-        private const val DEFAULT_ASSET_MODEL = "models/ggml-small-q5_1.bin"
+        private const val DEFAULT_ASSET_MODEL = "models/ggml-model-q4_0.bin"
 
         /**
          * Factory for use with Compose `viewModel(factory = ...)`.
@@ -83,7 +87,7 @@ class WhisperSpeechController(
          * val speechVm: WhisperSpeechController = viewModel(
          *     factory = WhisperSpeechController.provideFactory(
          *         appContext = ctx,
-         *         assetModelPath = "models/ggml-small-q5_1.bin",
+         *         assetModelPath = "models/ggml-model-q4_0.bin",
          *         languageCode = "auto"
          *     )
          * )
@@ -126,6 +130,8 @@ class WhisperSpeechController(
 
     /**
      * Last output WAV file produced by [recorder].
+     *
+     * This file lives under cache/whisper_rec and is treated as temporary.
      */
     private var outputFile: File? = null
 
@@ -136,6 +142,15 @@ class WhisperSpeechController(
      * operation (start or stop).
      */
     private var workerJob: Job? = null
+
+    /**
+     * Optional context for naming exported voice files.
+     *
+     * When set, exported file names look like:
+     *   voice_<surveyId>_<questionId>_YYYYMMDD_HHmmss.wav
+     */
+    private var currentSurveyId: String? = null
+    private var currentQuestionId: String? = null
 
     // ---------------------------------------------------------------------
     // State exposed to the UI
@@ -150,6 +165,24 @@ class WhisperSpeechController(
     override val isTranscribing: StateFlow<Boolean> = _isTranscribing
     override val partialText: StateFlow<String> = _partialText
     override val errorMessage: StateFlow<String?> = _error
+
+    // ---------------------------------------------------------------------
+    // Optional context setter
+    // ---------------------------------------------------------------------
+
+    /**
+     * Update the survey/question context used when exporting voice.
+     *
+     * This is used only for file naming; can be null.
+     */
+    fun updateContext(
+        surveyId: String?,
+        questionId: String?
+    ) {
+        currentSurveyId = surveyId
+        currentQuestionId = questionId
+        Log.d(TAG, "updateContext: surveyId=$surveyId, questionId=$questionId")
+    }
 
     // ---------------------------------------------------------------------
     // Recording control
@@ -200,6 +233,7 @@ class WhisperSpeechController(
                 Log.e(TAG, "startRecording: failed", t)
                 _error.value = t.message ?: "Speech recognition start failed"
                 _isRecording.value = false
+                outputFile = null
             }
         }
     }
@@ -210,8 +244,12 @@ class WhisperSpeechController(
      * Flow:
      * 1. Stop [Recorder] and finalize the WAV header.
      * 2. Validate that the file exists and is not empty.
-     * 3. Pass WAV file to [WhisperEngine.transcribeWaveFile].
-     * 4. Publish the recognized text via [updatePartialText].
+     * 3. Export WAV to a persistent "exports" folder for upload.
+     * 4. Pass WAV file to [WhisperEngine.transcribeWaveFile].
+     * 5. Publish the recognized text via [updatePartialText].
+     *
+     * The temporary cache WAV is deleted after export and transcription
+     * to avoid unbounded cache growth.
      */
     override fun stopRecording() {
         if (!_isRecording.value) {
@@ -226,6 +264,8 @@ class WhisperSpeechController(
         workerJob?.cancel()
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
+            var localWav: File? = null
+
             try {
                 // 1) Finalize WAV file.
                 Log.d(TAG, "stopRecording: awaiting recorder.stopRecording()")
@@ -233,6 +273,7 @@ class WhisperSpeechController(
 
                 val wav = outputFile
                 outputFile = null
+                localWav = wav
 
                 if (wav == null || !wav.exists()) {
                     Log.w(TAG, "stopRecording: WAV file missing")
@@ -250,11 +291,14 @@ class WhisperSpeechController(
 
                 Log.d(
                     TAG,
-                    "stopRecording: transcribing ${wav.path} " +
+                    "stopRecording: ready to export + transcribe ${wav.path} " +
                             "(bytes=${wav.length()}, frames=$frames, ~${"%.1f".format(msApprox)} ms)"
                 )
 
-                // 2) Run Whisper transcription.
+                // 2) Export WAV for later upload (e.g., SurveyExports).
+                exportRecordedVoice(wav)
+
+                // 3) Run Whisper transcription.
                 _isTranscribing.value = true
                 val result = WhisperEngine.transcribeWaveFile(
                     file = wav,
@@ -264,7 +308,7 @@ class WhisperSpeechController(
                     targetSampleRate = 16_000
                 )
 
-                // 3) Handle result.
+                // 4) Handle result.
                 result
                     .onSuccess { text ->
                         val trimmed = text.trim()
@@ -288,6 +332,21 @@ class WhisperSpeechController(
                 _error.value = t.message ?: "Speech recognition failed"
             } finally {
                 _isTranscribing.value = false
+
+                // Clean up the temporary cache WAV if it still exists.
+                localWav?.let { file ->
+                    if (file.exists()) {
+                        runCatching {
+                            if (file.delete()) {
+                                Log.d(TAG, "stopRecording: deleted cache wav ${file.path}")
+                            } else {
+                                Log.d(TAG, "stopRecording: failed to delete cache wav ${file.path}")
+                            }
+                        }.onFailure { e ->
+                            Log.w(TAG, "stopRecording: exception while deleting cache wav", e)
+                        }
+                    }
+                }
             }
         }
     }
@@ -344,6 +403,32 @@ class WhisperSpeechController(
                 "Failed to initialize Whisper model from assets/$assetModelPath",
                 e
             )
+        }
+    }
+
+    /**
+     * Export the recorded WAV into the shared "exports" directory
+     * using [ExportUtils.exportRecordedVoice].
+     *
+     * Any failure is logged but considered non-fatal for transcription.
+     */
+    private fun exportRecordedVoice(wav: File) {
+        Log.d(
+            TAG,
+            "exportRecordedVoice: delegating to ExportUtils " +
+                    "(source=${wav.path}, surveyId=$currentSurveyId, questionId=$currentQuestionId)"
+        )
+
+        runCatching {
+            val exported = ExportUtils.exportRecordedVoice(
+                context = appContext,
+                source = wav,
+                surveyId = currentSurveyId,
+                questionId = currentQuestionId
+            )
+            Log.d(TAG, "exportRecordedVoice: exported to ${exported.absolutePath}")
+        }.onFailure { e ->
+            Log.w(TAG, "exportRecordedVoice: failed, ignoring", e)
         }
     }
 

@@ -143,6 +143,15 @@ open class SurveyViewModel(
     private val graph: Map<String, Node>
 
     /**
+     * Read-only view of the runtime survey graph, keyed by node ID.
+     *
+     * This can be used by review / summary screens to access titles and
+     * question text for each node without exposing the mutable internals.
+     */
+    val nodes: Map<String, Node>
+        get() = graph
+
+    /**
      * ID of the starting node defined in [SurveyConfig.graph.startId].
      */
     private val startId: String = config.graph.startId
@@ -153,6 +162,15 @@ open class SurveyViewModel(
      * The last element corresponds to the currently active node.
      */
     private val nodeStack = ArrayDeque<String>()
+
+    /**
+     * Monotonically increasing survey session ID.
+     *
+     * This is incremented every time [resetToStart] is invoked so that
+     * UI layers (e.g., text fields) can key their local state by session.
+     */
+    private val _sessionId = MutableStateFlow(0L)
+    val sessionId: StateFlow<Long> = _sessionId.asStateFlow()
 
     /**
      * StateFlow representing the currently active [Node].
@@ -555,7 +573,10 @@ open class SurveyViewModel(
         nav.add(navKeyFor(start))
         updateCanGoBack()
 
-        Log.d(TAG, "resetToStart() -> ${start.id}")
+        // Bump session id so UI can treat this as a fresh run.
+        _sessionId.update { it + 1 }
+
+        Log.d(TAG, "resetToStart() -> ${start.id}, session=${_sessionId.value}")
     }
 
     /**
@@ -658,6 +679,6 @@ open class SurveyViewModel(
         nav.add(navKeyFor(start))
         updateCanGoBack()
 
-        Log.d(TAG, "init -> ${start.id}")
+        Log.d(TAG, "init -> ${start.id}, session=${_sessionId.value}")
     }
 }

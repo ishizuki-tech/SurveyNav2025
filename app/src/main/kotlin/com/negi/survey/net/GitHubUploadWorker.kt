@@ -11,7 +11,7 @@
  *  Summary:
  *  ---------------------------------------------------------------------
  *  Foreground-capable WorkManager coroutine worker that uploads one
- *  local JSON payload to GitHub using the REST "Create or Update File
+ *  local payload file to GitHub using the REST "Create or Update File
  *  Contents" API via [GitHubUploader].
  *
  *  This worker ensures compliance with Android 14+ background execution
@@ -24,6 +24,7 @@
  *   • Automatic exponential backoff retry on transient failures
  *   • Robust input validation and output data reporting
  *   • Automatic deletion of successfully uploaded local files
+ *   • Supports both JSON (text) and binary payloads (e.g., WAV audio)
  *
  *  Typical usage:
  *  ---------------------------------------------------------------------
@@ -36,11 +37,19 @@
  *      pathPrefix = "" // date-based folder is injected by GitHubUploader
  *  )
  *
+ *  // JSON payload:
  *  GitHubUploadWorker.enqueue(
  *      context = context,
  *      cfg = cfg,
  *      fileName = "survey_${System.currentTimeMillis()}",
  *      jsonContent = jsonString
+ *  )
+ *
+ *  // Existing file (JSON, WAV, etc.):
+ *  GitHubUploadWorker.enqueueExistingPayload(
+ *      context = context,
+ *      cfg = cfg,
+ *      file = File("/path/to/exports/voice_....wav")
  *  )
  *  ```
  * =====================================================================
@@ -53,6 +62,7 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.work.BackoffPolicy
@@ -76,12 +86,12 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Coroutine-based [WorkManager] worker responsible for uploading one local JSON file
+ * Coroutine-based [WorkManager] worker responsible for uploading one local file
  * to GitHub via [GitHubUploader]. Runs as a foreground service on Android 10+,
  * which is required for long-running background operations such as data syncs.
  *
  * Responsibilities:
- * - Read the specified file from the app's `pending_uploads` directory.
+ * - Read the specified file from disk (JSON or binary).
  * - Stream the file contents to GitHub with visible progress.
  * - Handle automatic retries using exponential backoff.
  * - Clean up successfully uploaded local files.
@@ -97,16 +107,16 @@ class GitHubUploadWorker(
      * Implementation steps:
      *  1. Parse and validate GitHub configuration and file inputs.
      *  2. Create a foreground notification for upload progress.
-     *  3. Load the JSON file into memory.
-     *  4. Call [GitHubUploader.uploadJson] with a date-based remote path
-     *     (path construction handled inside GitHubUploader via GitHubConfig).
+     *  3. Load the file content (text for JSON, bytes for others).
+     *  4. Call [GitHubUploader.uploadJson] or [GitHubUploader.uploadFile]
+     *     with a date-based remote path (path construction handled inside
+     *     GitHubUploader via GitHubConfig).
      *  5. On success, delete the local file and emit output metadata.
      *  6. On failure, schedule retry or fail permanently depending on attempts.
      *
      * @return [Result.success] on success, [Result.retry] on transient failure,
      *         or [Result.failure] when unrecoverable.
      */
-    @RequiresApi(Build.VERSION_CODES.Q)
     override suspend fun doWork(): Result {
         // ------------------------------------------------------------
         // 1️⃣ Parse and validate inputs
@@ -115,7 +125,7 @@ class GitHubUploadWorker(
             owner = inputData.getString(KEY_OWNER).orEmpty(),
             repo = inputData.getString(KEY_REPO).orEmpty(),
             token = inputData.getString(KEY_TOKEN).orEmpty(),
-            branch = inputData.getString(KEY_BRANCH).orEmpty(),
+            branch = inputData.getString(KEY_BRANCH)?.takeIf { it.isNotBlank() } ?: "main",
             pathPrefix = inputData.getString(KEY_PATH_PREFIX).orEmpty()
         )
 
@@ -139,6 +149,8 @@ class GitHubUploadWorker(
             )
         }
 
+        Log.d(TAG, "doWork: cfg=$cfg filePath=$filePath fileName=$fileName size=${pendingFile.length()}")
+
         // Remote path used only for output metadata (for UI / logs).
         // Actual upload path is constructed inside GitHubUploader based on:
         //   prefix + yyyy-MM-dd + fileName
@@ -159,45 +171,71 @@ class GitHubUploadWorker(
             )
         )
 
-        // ------------------------------------------------------------
-        // 3️⃣ Load file content into memory
-        // ------------------------------------------------------------
-        val json = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
-            return Result.failure(
-                workDataOf(ERROR_MESSAGE to "Failed to read file: ${it.message}")
+        // Keep track of last progress percentage for error notification.
+        var lastPct = 0
+
+        // Shared progress callback used by both JSON and binary uploads.
+        val progressCallback: (Int) -> Unit = { pct ->
+            lastPct = pct.coerceIn(0, 100)
+            setProgressAsync(
+                workDataOf(
+                    PROGRESS_PCT to lastPct,
+                    PROGRESS_FILE to fileName
+                )
+            )
+            setForegroundAsync(
+                foregroundInfo(
+                    notificationId = notifId,
+                    pct = lastPct,
+                    title = "Uploading $fileName"
+                )
             )
         }
 
-        var lastPct = 0
-
         // ------------------------------------------------------------
-        // 4️⃣ Execute upload and update progress in real time
+        // 3️⃣ Load file content and execute upload
         // ------------------------------------------------------------
         return try {
-            val result = GitHubUploader.uploadJson(
-                cfg = cfg,
-                relativePath = fileName,
-                content = json,
-                message = "Upload $fileName (deferred)"
-            ) { pct ->
-                lastPct = pct.coerceIn(0, 100)
-                setProgressAsync(
-                    workDataOf(
-                        PROGRESS_PCT to lastPct,
-                        PROGRESS_FILE to fileName
+            val extension = pendingFile.extension.lowercase()
+            Log.d(TAG, "doWork: extension=$extension (json == ${extension == "json"})")
+
+            // For *.json files, use the existing text-based upload.
+            // For all other extensions (e.g., wav/m4a/mp3), load raw bytes
+            // and use a generic binary upload helper in GitHubUploader.
+            val result = if (extension == "json") {
+                val json = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
+                    return Result.failure(
+                        workDataOf(ERROR_MESSAGE to "Failed to read JSON file: ${it.message}")
                     )
+                }
+
+                GitHubUploader.uploadJson(
+                    cfg = cfg,
+                    relativePath = fileName,
+                    content = json,
+                    message = "Upload $fileName (deferred)",
+                    onProgress = progressCallback
                 )
-                setForegroundAsync(
-                    foregroundInfo(
-                        notificationId = notifId,
-                        pct = lastPct,
-                        title = "Uploading $fileName"
+            } else {
+                val bytes = runCatching { pendingFile.readBytes() }.getOrElse {
+                    return Result.failure(
+                        workDataOf(ERROR_MESSAGE to "Failed to read binary file: ${it.message}")
                     )
+                }
+
+                GitHubUploader.uploadFile(
+                    cfg = cfg,
+                    relativePath = fileName,
+                    bytes = bytes,
+                    message = "Upload $fileName (deferred)",
+                    onProgress = progressCallback
                 )
             }
 
+            Log.d(TAG, "doWork: upload success fileUrl=${result.fileUrl} sha=${result.commitSha}")
+
             // --------------------------------------------------------
-            // 5️⃣ Finalization: mark as success and clean up
+            // 4️⃣ Finalization: mark as success and clean up
             // --------------------------------------------------------
             setProgressAsync(
                 workDataOf(
@@ -213,7 +251,13 @@ class GitHubUploadWorker(
                     finished = true
                 )
             )
-            runCatching { pendingFile.delete() }
+            runCatching {
+                if (pendingFile.delete()) {
+                    Log.d(TAG, "doWork: deleted local file $filePath")
+                } else {
+                    Log.d(TAG, "doWork: failed to delete local file $filePath")
+                }
+            }
 
             Result.success(
                 workDataOf(
@@ -224,8 +268,10 @@ class GitHubUploadWorker(
                 )
             )
         } catch (t: Throwable) {
+            Log.w(TAG, "doWork: upload failed for $filePath", t)
+
             // --------------------------------------------------------
-            // 6️⃣ Failure path: display failure and schedule retry
+            // 5️⃣ Failure path: display failure and schedule retry
             // --------------------------------------------------------
             setForegroundAsync(
                 foregroundInfo(
@@ -271,13 +317,16 @@ class GitHubUploadWorker(
     /**
      * Build [ForegroundInfo] with an upload progress notification.
      *
+     * This helper is implemented in a backwards-compatible way:
+     * - On Android 10+ it uses FOREGROUND_SERVICE_TYPE_DATA_SYNC.
+     * - On older versions it falls back to the 2-arg constructor.
+     *
      * @param notificationId Stable per-file ID to avoid collisions.
      * @param pct Progress percentage (0–100).
      * @param title Notification title text.
      * @param finished Whether upload is fully completed.
      * @param error Whether this notification represents an error state.
      */
-    @RequiresApi(Build.VERSION_CODES.Q)
     private fun foregroundInfo(
         notificationId: Int,
         pct: Int,
@@ -299,11 +348,18 @@ class GitHubUploadWorker(
             builder.setProgress(100, pct.coerceIn(0, 100), false)
         }
 
-        return ForegroundInfo(
-            notificationId,
-            builder.build(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        )
+        val notification = builder.build()
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(
+                notificationId,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            ForegroundInfo(notificationId, notification)
+        }
     }
 
     /**
@@ -365,7 +421,7 @@ class GitHubUploadWorker(
         const val ERROR_MESSAGE = "error"
 
         /**
-         * Enqueue a work request to upload an existing file.
+         * Enqueue a work request to upload an existing file (JSON or binary).
          *
          * - Enforced unique per file to prevent duplicate uploads.
          * - Requires an active network connection.
@@ -379,7 +435,9 @@ class GitHubUploadWorker(
         fun enqueueExistingPayload(context: Context, cfg: GitHubUploader.GitHubConfig, file: File) {
             val name = file.name
 
-            // Use OneTimeWorkRequest explicitly so that enqueueUniqueWork(...) overload resolves correctly.
+            // English comment:
+            // - Use OneTimeWorkRequest explicitly so that enqueueUniqueWork(...)
+            //   overload resolves correctly.
             val req: OneTimeWorkRequest = OneTimeWorkRequestBuilder<GitHubUploadWorker>()
                 .setInputData(
                     workDataOf(

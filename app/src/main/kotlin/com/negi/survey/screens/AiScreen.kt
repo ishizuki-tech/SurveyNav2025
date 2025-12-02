@@ -261,10 +261,23 @@ fun AiScreen(
     // Chat history for this node.
     val chat by remember(nodeId) { vmAI.chatFlow(nodeId) }.collectAsState()
 
-    // Local UI state.
-    var composer by remember(nodeId) { mutableStateOf(vmSurvey.getAnswer(nodeId)) }
+    // Survey "session" id — increases every time resetSurvey()/resetToStart() is called.
+    val sessionId by vmSurvey.sessionId.collectAsState()
+
+    // Local UI state — keyed by (nodeId, sessionId) so a brand-new survey run
+    // drops any previous text from this screen.
+    var composer by remember(nodeId, sessionId) {
+        mutableStateOf(vmSurvey.getAnswer(nodeId))
+    }
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
+
+    // Synchronize composer with Survey answers *within the same session*.
+    // When sessionId changes (new run), remember() is re-created and this
+    // effect runs again with fresh answers (usually "").
+    LaunchedEffect(nodeId, sessionId) {
+        composer = vmSurvey.getAnswer(nodeId)
+    }
 
     val speechStatusText: String? = when {
         speechError != null -> speechError
@@ -279,11 +292,6 @@ fun AiScreen(
         vmAI.chatEnsureSeedQuestion(nodeId, question)
         focusRequester.requestFocus()
         keyboard?.show()
-    }
-
-    // Keep composer text when returning to this screen.
-    LaunchedEffect(nodeId) {
-        composer = vmSurvey.getAnswer(nodeId)
     }
 
     // Errors → snackbars.
@@ -350,12 +358,50 @@ fun AiScreen(
         }
     }
 
-    // Commit recognized speech once recording is finished and final text is available.
-    LaunchedEffect(speechPartial, speechRecording) {
-        if (speechController != null && !speechRecording && speechPartial.isNotBlank()) {
-            composer = speechPartial
-            vmSurvey.setAnswer(speechPartial, nodeId)
+    // ───── Speech → TextField commit logic ─────
+
+    // Track previous states to detect utterance boundaries per (node, session).
+    var wasRecording by remember(nodeId, sessionId) { mutableStateOf(false) }
+    var wasTranscribing by remember(nodeId, sessionId) { mutableStateOf(false) }
+    var lastCommitted by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+
+    /**
+     * Commit recognized speech only when an utterance finishes
+     * (recording/transcribing -> idle) and ignore stale partials
+     * from previous sessions.
+     */
+    LaunchedEffect(speechRecording, isTranscribing, speechPartial) {
+        if (speechController == null) return@LaunchedEffect
+
+        // Detect start of a new utterance.
+        val startedThisUtterance =
+            (!wasRecording && !wasTranscribing) &&
+                    (speechRecording || isTranscribing)
+
+        if (startedThisUtterance) {
+            // New utterance: clear current answer so we do not accumulate.
+            composer = ""
+            vmSurvey.clearAnswer(nodeId)
+            lastCommitted = null
         }
+
+        // Detect end of the current utterance (both false after being true).
+        val finishedThisUtterance =
+            (wasRecording || wasTranscribing) &&
+                    !speechRecording &&
+                    !isTranscribing
+
+        if (finishedThisUtterance) {
+            val text = speechPartial.trim()
+            if (text.isNotEmpty() && text != lastCommitted) {
+                composer = text
+                vmSurvey.setAnswer(text, nodeId)
+                lastCommitted = text
+            }
+        }
+
+        wasRecording = speechRecording
+        wasTranscribing = isTranscribing
     }
 
     // Auto-scroll to bottom when chat size changes.
@@ -397,6 +443,8 @@ fun AiScreen(
             vmAI.evaluateAsync(prompt)
         }
 
+        // Local composer is cleared so the user sees an empty field after send,
+        // but the persisted answer in SurveyViewModel is kept.
         composer = ""
     }
 

@@ -936,9 +936,8 @@ fun SurveyNavHost(
                     vm = vmSurvey,
                     onRestart = {
                         // 1) Reset AI and survey internal state for a fresh run.
-                        vmAI.resetStates()
+                        vmAI.resetAll()
                         vmSurvey.resetToStart()
-
                         // 2) Reset navigation backstack so only FlowHome remains.
                         //    This assumes FlowHome is the start destination and
                         //    is present as the first entry.

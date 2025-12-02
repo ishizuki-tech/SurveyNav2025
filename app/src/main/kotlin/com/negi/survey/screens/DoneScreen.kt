@@ -14,16 +14,25 @@
  *  renders them in a simple vertical layout, and exposes export actions:
  *
  *   • Local JSON export (auto-save to device storage).
- *   • Immediate GitHub upload (online now).
+ *   • Immediate GitHub upload (online now, JSON + voice WAV).
  *   • Deferred GitHub upload via WorkManager (runs when online).
+ *   • Deferred upload of recorded voice WAV files via WorkManager.
  *
- *  Storage model:
+ *  Storage model (JSON auto-save):
  *   • API 29+ : MediaStore Downloads/SurveyNav (visible in Files app).
  *   • API 28- : app-specific external Downloads/SurveyNav (no runtime perms).
  *
  *  Notes:
  *   • JSON is built manually with a small escaper to keep dependencies light.
  *   • Newlines are not preprocessed; escapeJson() handles them correctly.
+ *   • JSON payload now includes "voice_files" array with objects:
+ *       {
+ *         "file": "...wav",
+ *         "survey_id": "...",
+ *         "question_id": "...",
+ *         "question": "...",
+ *         "answer": "..."
+ *       }
  * =====================================================================
  */
 
@@ -67,13 +76,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
+import com.negi.survey.utils.ExportUtils
 import com.negi.survey.vm.SurveyViewModel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 /**
  * Final survey screen that summarizes all collected answers and follow-ups.
@@ -81,19 +92,13 @@ import java.time.format.DateTimeFormatter
  * Responsibilities:
  *  - Read the current questions, answers, and follow-ups from [SurveyViewModel].
  *  - Render a human-readable summary of the interview session.
- *  - Build a JSON export payload covering answers + follow-ups.
+ *  - Build a JSON export payload covering answers + follow-ups + voice files.
  *  - Provide optional GitHub upload and deferred upload via WorkManager.
  *  - Optionally auto-save the JSON to device storage on first composition.
+ *  - Show and upload recorded voice WAV files exported via [ExportUtils].
  *
  * The screen is UI-only: it does not mutate the survey graph and only calls
  * back through [onRestart] when the user wants to restart the flow.
- *
- * @param vm Survey-level ViewModel providing questions, answers, and follow-ups.
- * @param onRestart Callback invoked when the user presses the "Restart" button.
- * @param gitHubConfig Optional GitHub configuration. When non-null, the
- * upload buttons are enabled and will target the configured repository/branch.
- * @param autoSaveToDevice When true, the screen will auto-save the JSON export
- * exactly once on first composition (no picker interaction required).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -113,16 +118,32 @@ fun DoneScreen(
     val context = LocalContext.current
 
     /**
+     * Snapshot of exported voice files and their metadata so the UI can show
+     * them and refresh the list after uploads.
+     */
+    val voiceFilesState = remember { mutableStateOf<List<VoiceFileInfo>>(emptyList()) }
+
+    // Scan voice files (and their meta JSON) once when the screen is first composed.
+    LaunchedEffect(Unit) {
+        val files = withContext(Dispatchers.IO) {
+            scanVoiceFiles(context)
+        }
+        voiceFilesState.value = files
+    }
+
+    val voiceFiles = voiceFilesState.value
+
+    /**
      * Build a compact JSON export representing:
      *  - "answers": per-node question/answer pairs.
      *  - "followups": per-node arrays of follow-up question/answer pairs.
-     *
-     * The payload is deterministic for a given [questions]/[answers]/[followups]
-     * snapshot; if required, entries can be sorted before writing.
+     *  - "voice_files": objects containing file + survey/question mapping.
      */
-    val jsonText = remember(questions, answers, followups) {
+    val jsonText = remember(questions, answers, followups, voiceFiles) {
         buildString {
             append("{\n")
+
+            // answers
             append("  \"answers\": {\n")
             val qEntries = questions.entries.toList()
             qEntries.forEachIndexed { idx, (id, q) ->
@@ -135,6 +156,8 @@ fun DoneScreen(
                 append("\n")
             }
             append("  },\n")
+
+            // followups
             append("  \"followups\": {\n")
             val fEntries = followups.entries.toList()
             fEntries.forEachIndexed { i, (ownerId, list) ->
@@ -153,16 +176,56 @@ fun DoneScreen(
                 if (i != fEntries.lastIndex) append(",")
                 append("\n")
             }
-            append("  }\n")
+            append("  },\n")
+
+            // voice_files with question/answer attached.
+            append("  \"voice_files\": [\n")
+            voiceFiles.forEachIndexed { idx, info ->
+                val qId = info.questionId
+                val questionText = qId?.let { questions[it] }.orEmpty()
+                val answerText = qId?.let { answers[it] }.orEmpty()
+
+                append("    {\n")
+                append("      \"file\": \"")
+                    .append(escapeJson(info.file.name))
+                    .append("\",\n")
+
+                info.surveyId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let {
+                        append("      \"survey_id\": \"")
+                            .append(escapeJson(it))
+                            .append("\",\n")
+                    }
+
+                qId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let {
+                        append("      \"question_id\": \"")
+                            .append(escapeJson(it))
+                            .append("\",\n")
+                    }
+
+                append("      \"question\": \"")
+                    .append(escapeJson(questionText))
+                    .append("\",\n")
+                append("      \"answer\": \"")
+                    .append(escapeJson(answerText))
+                    .append("\"\n")
+                append("    }")
+                if (idx != voiceFiles.lastIndex) append(",")
+                append("\n")
+            }
+            append("  ]\n")
+
             append("}\n")
         }
     }
 
-    // Run once to auto-save export JSON (no picker, no blocking UI).
+    // Auto-save JSON once if requested.
     val autoSavedOnce = remember { mutableStateOf(false) }
     LaunchedEffect(autoSaveToDevice, jsonText) {
         if (autoSaveToDevice && !autoSavedOnce.value) {
-            // Use a human-friendly, timestamped file name for device storage as well.
             val fileName = buildSurveyFileName()
             runCatching {
                 val result = withContext(Dispatchers.IO) {
@@ -261,14 +324,45 @@ fun DoneScreen(
                 }
             }
 
+            Spacer(Modifier.height(20.dp))
+
+            // Recorded voice section.
+            Text("■ Recorded voice files", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            if (voiceFiles.isEmpty()) {
+                Text(
+                    text = "No voice recordings exported.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            } else {
+                Text(
+                    text = "${voiceFiles.size} file(s) in exports/voice (pending upload).",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(Modifier.height(4.dp))
+                voiceFiles.take(3).forEach { info ->
+                    Text(
+                        text = "• ${info.file.name}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (voiceFiles.size > 3) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = "… and more",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
             Spacer(Modifier.height(24.dp))
 
-            // Export / upload actions.
+            // Export / upload actions (JSON + voice).
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Immediate GitHub upload (requires network now).
+                // Immediate GitHub upload (JSON + voice WAV).
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
@@ -276,24 +370,55 @@ fun DoneScreen(
                             scope.launch {
                                 uploading.value = true
                                 try {
-                                    // Use a human-readable, timestamped file name.
-                                    val fileName = buildSurveyFileName()
+                                    val cfg = gitHubConfig
 
-                                    // Use the GitHubConfig-based overload so that
-                                    // the date-based path logic inside GitHubUploader
-                                    // (e.g., yyyy-MM-dd/fileName) is consistently applied.
-                                    val result = withContext(Dispatchers.IO) {
-                                        GitHubUploader.uploadJson(
-                                            cfg = gitHubConfig,
-                                            relativePath = fileName,
-                                            content = jsonText,
-                                            message = "Upload $fileName"
+                                    val (jsonResult, uploadedVoices) =
+                                        withContext(Dispatchers.IO) {
+                                            val fileName = buildSurveyFileName()
+
+                                            // 1) Upload JSON summary.
+                                            val jsonRes = GitHubUploader.uploadJson(
+                                                cfg = cfg,
+                                                relativePath = fileName,
+                                                content = jsonText,
+                                                message = "Upload $fileName"
+                                            )
+
+                                            // 2) Scan voice files again to get a fresh list.
+                                            val currentVoiceFiles = scanVoiceFiles(context)
+
+                                            var voiceCount = 0
+                                            currentVoiceFiles.forEach { info ->
+                                                val file = info.file
+                                                val bytes = file.readBytes()
+                                                GitHubUploader.uploadFile(
+                                                    cfg = cfg,
+                                                    relativePath = file.name,
+                                                    bytes = bytes,
+                                                    message = "Upload ${file.name}"
+                                                )
+                                                runCatching { file.delete() }
+                                                voiceCount++
+                                            }
+
+                                            jsonRes to voiceCount
+                                        }
+
+                                    val label =
+                                        jsonResult.fileUrl ?: jsonResult.commitSha ?: "(no URL)"
+                                    if (uploadedVoices > 0) {
+                                        snackbar.showOnce(
+                                            "Uploaded JSON + $uploadedVoices voice file(s): $label"
                                         )
+                                    } else {
+                                        snackbar.showOnce("Uploaded JSON: $label")
                                     }
 
-                                    snackbar.showOnce(
-                                        "Uploaded: ${result.fileUrl ?: result.commitSha}"
-                                    )
+                                    // Refresh voice file list after deletion.
+                                    val remaining = withContext(Dispatchers.IO) {
+                                        scanVoiceFiles(context)
+                                    }
+                                    voiceFilesState.value = remaining
                                 } catch (e: Exception) {
                                     snackbar.showOnce("Upload failed: ${e.message}")
                                 } finally {
@@ -307,12 +432,10 @@ fun DoneScreen(
                     }
                 }
 
-                // Deferred GitHub upload via WorkManager.
+                // Deferred GitHub upload for JSON via WorkManager.
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
-                            // Use the same naming scheme so on-device file names
-                            // and GitHub paths stay aligned.
                             val fileName = buildSurveyFileName()
                             GitHubUploadWorker.enqueue(
                                 context = context,
@@ -322,19 +445,57 @@ fun DoneScreen(
                             )
                             scope.launch {
                                 snackbar.showOnce(
-                                    "Upload scheduled (will run when online)."
+                                    "Upload scheduled (JSON, will run when online)."
                                 )
                             }
                         }
                     ) {
-                        Text("Upload when Online")
+                        Text("Upload JSON later")
                     }
                 }
 
                 Spacer(Modifier.weight(1f))
             }
 
-            Spacer(Modifier.height(1.dp))
+            Spacer(Modifier.height(12.dp))
+
+            // Voice upload actions row (deferred).
+            if (gitHubConfig != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            if (voiceFiles.isEmpty()) {
+                                scope.launch {
+                                    snackbar.showOnce("No voice recordings to upload.")
+                                }
+                            } else {
+                                voiceFiles.forEach { info ->
+                                    GitHubUploadWorker.enqueueExistingPayload(
+                                        context = context,
+                                        cfg = gitHubConfig,
+                                        file = info.file
+                                    )
+                                }
+                                scope.launch {
+                                    snackbar.showOnce(
+                                        "Upload scheduled (${voiceFiles.size} voice file(s))."
+                                    )
+                                }
+                            }
+                        },
+                        enabled = true
+                    ) {
+                        Text("Upload voice recordings later")
+                    }
+
+                    Spacer(Modifier.weight(1f))
+                }
+
+                Spacer(Modifier.height(12.dp))
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -347,7 +508,6 @@ fun DoneScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            // Show a friendly completion message once.
             LaunchedEffect(Unit) {
                 snackbar.showOnce("Thank you for your responses")
             }
@@ -362,10 +522,6 @@ fun DoneScreen(
 /**
  * Build a human-friendly survey file name such as:
  * "survey_2025-11-15_14-32-08.json".
- *
- * - Uses local device time for readability.
- * - Keeps a stable "survey_" prefix so that files
- *   group naturally in file explorers and GitHub.
  */
 private fun buildSurveyFileName(prefix: String = "survey"): String {
     val now = LocalDateTime.now()
@@ -374,37 +530,86 @@ private fun buildSurveyFileName(prefix: String = "survey"): String {
 }
 
 /* ============================================================
- * Auto-save helpers (no user interaction)
+ * Voice scan helpers
  * ============================================================ */
 
 /**
- * Result of a JSON save operation.
+ * UI-facing voice file description used by DoneScreen.
  *
- * Exactly one of [uri] or [file] is non-null depending on the storage
- * mechanism that was used.
- *
- * @property uri Content URI for the file in MediaStore (API 29+), or null.
- * @property file [File] handle for app-specific external storage (pre-Q), or null.
- * @property location Human-readable location hint for user-facing messaging.
+ * - [file] is the actual WAV file under exports/voice.
+ * - [surveyId] and [questionId] come from the sidecar meta JSON if present.
  */
+private data class VoiceFileInfo(
+    val file: File,
+    val surveyId: String?,
+    val questionId: String?
+)
+
+/**
+ * Internal representation of voice meta loaded from the sidecar JSON.
+ */
+private data class VoiceMeta(
+    val surveyId: String?,
+    val questionId: String?
+)
+
+/**
+ * Scan exported voice WAV files under exports/voice and attach metadata
+ * from their sidecar .meta.json files when available.
+ */
+private fun scanVoiceFiles(context: android.content.Context): List<VoiceFileInfo> {
+    val voiceDir = ExportUtils.getVoiceExportDir(context)
+    if (!voiceDir.exists() || !voiceDir.isDirectory) return emptyList()
+
+    val wavFiles = voiceDir.listFiles { f ->
+        f.isFile &&
+                !f.name.startsWith(".") &&
+                f.name.lowercase().endsWith(".wav")
+    } ?: return emptyList()
+
+    return wavFiles
+        .map { wav ->
+            val meta = loadVoiceMeta(voiceDir, wav)
+            VoiceFileInfo(
+                file = wav,
+                surveyId = meta?.surveyId,
+                questionId = meta?.questionId
+            )
+        }
+        .sortedByDescending { it.file.lastModified() }
+}
+
+/**
+ * Load sidecar meta JSON for a WAV file, if present.
+ *
+ * Looks for:
+ *   <baseName>.meta.json
+ * in the same directory as the WAV file.
+ */
+private fun loadVoiceMeta(dir: File, wavFile: File): VoiceMeta? {
+    val base = wavFile.name.substringBeforeLast('.', wavFile.name)
+    val metaFile = File(dir, "$base.meta.json")
+    if (!metaFile.exists()) return null
+
+    return runCatching {
+        val text = metaFile.readText(Charsets.UTF_8)
+        val obj = JSONObject(text)
+        val surveyId = obj.optString("survey_id", "").ifBlank { null }
+        val questionId = obj.optString("question_id", "").ifBlank { null }
+        VoiceMeta(surveyId = surveyId, questionId = questionId)
+    }.getOrNull()
+}
+
+/* ============================================================
+ * Auto-save helpers (no user interaction)
+ * ============================================================ */
+
 private data class SaveResult(
     val uri: Uri?,
     val file: File?,
     val location: String
 )
 
-/**
- * Save JSON content to device storage without user interaction.
- *
- * Behavior:
- *  - API 29+ : Writes into MediaStore Downloads/SurveyNav using RELATIVE_PATH.
- *  - API 28- : Writes into app-specific external Downloads/SurveyNav directory.
- *
- * @param context Android [android.content.Context].
- * @param fileName Target file name, e.g. `"survey_2025-11-15_14-32-08.json"`.
- * @param content JSON payload to write.
- * @return [SaveResult] describing where the file ended up.
- */
 private fun saveJsonAutomatically(
     context: android.content.Context,
     fileName: String,
@@ -417,15 +622,6 @@ private fun saveJsonAutomatically(
     }
 }
 
-/**
- * API 29+ implementation that writes JSON into the system Downloads collection.
- *
- * Files are placed under:
- *  Downloads/SurveyNav/[fileName]
- *
- * The resulting file is visible to the system Files app and other consumers
- * with access to the Downloads collection.
- */
 @RequiresApi(Build.VERSION_CODES.Q)
 private fun saveToDownloadsQPlus(
     context: android.content.Context,
@@ -462,13 +658,6 @@ private fun saveToDownloadsQPlus(
     }
 }
 
-/**
- * Pre-API 29 implementation that writes JSON into app-specific external
- * storage under Downloads/SurveyNav.
- *
- * This does not require runtime storage permissions because it uses
- * the app-owned external files directory.
- */
 private fun saveToAppExternalPreQ(
     context: android.content.Context,
     fileName: String,
@@ -490,28 +679,11 @@ private fun saveToAppExternalPreQ(
  * Snackbar + JSON utilities
  * ============================================================ */
 
-/**
- * Show a single snackbar message, dismissing any currently visible snackbar
- * first to avoid stacking multiple messages.
- */
 private suspend fun SnackbarHostState.showOnce(message: String) {
     currentSnackbarData?.dismiss()
     showSnackbar(message)
 }
 
-/**
- * Minimal JSON string escaper.
- *
- * Escapes:
- *  - Double quotes (`"`) → `\"`
- *  - Backslashes (`\`)  → `\\`
- *  - Newlines           → `\n`
- *  - Carriage returns   → `\r`
- *  - Tabs               → `\t`
- *
- * The implementation intentionally does not handle every possible Unicode
- * control character, but is sufficient for typical survey text content.
- */
 private fun escapeJson(s: String): String =
     buildString(s.length + 8) {
         s.forEach { ch ->
