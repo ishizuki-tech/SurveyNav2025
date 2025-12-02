@@ -54,7 +54,7 @@ graph:
 
 slm:
   accelerator: "GPU"
-  max_tokens: 4096
+  max_tokens: 2048
   top_k: 10
   top_p: 0.2
   temperature: 0.5

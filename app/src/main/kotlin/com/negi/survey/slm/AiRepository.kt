@@ -227,6 +227,10 @@ class SlmDirectRepository(
                 }
 
                 try {
+
+                    SLM.cancel(model)
+                    SLM.resetSession(model)
+
                     SLM.runInference(
                         model = model,
                         input = prompt,

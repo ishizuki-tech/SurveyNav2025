@@ -13,13 +13,20 @@
 
 package com.negi.survey
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -27,19 +34,32 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -58,6 +78,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -76,6 +97,7 @@ import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.screens.AiScreen
+import com.negi.survey.screens.ConfigOptionUi
 import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.ReviewScreen
@@ -95,7 +117,6 @@ import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
-import com.negi.survey.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -107,8 +128,8 @@ import kotlin.coroutines.resumeWithException
  * Root activity of the SurveyNav app.
  *
  * - Enables edge-to-edge system bars with dark (black) backgrounds.
- * - Delegates all UI to [AppNav] which hosts the survey flow, model
- *   download gate, and SLM initialization gate.
+ * - Delegates all UI to [AppNav] which hosts the configuration selector,
+ *   survey flow, model download gate, and SLM initialization gate.
  */
 class MainActivity : ComponentActivity() {
 
@@ -209,7 +230,12 @@ fun InitGate(
     var error by remember(key) { mutableStateOf<Throwable?>(null) }
     val scope = rememberCoroutineScope()
 
-    // Small helper that (re)starts the initialization coroutine.
+    /**
+     * Starts or restarts the initialization coroutine.
+     *
+     * This helper is used both on first composition and when the user taps
+     * the retry button after an error.
+     */
     fun kick() {
         isLoading = true
         error = null
@@ -339,29 +365,220 @@ fun InitGate(
 /**
  * Top-level navigation host for the SurveyNav app.
  *
- * - Loads the YAML survey configuration from assets.
- * - Builds [AppViewModel] to manage model download and SLM defaults.
- * - Shows [DownloadGate] while the SLM model file is being downloaded.
- * - Once downloaded, initializes SLM via [InitGate] and then hosts the
- *   survey navigation flow with [SurveyNavHost].
+ * Stages:
+ *  1) Intro/config selector:
+ *     - Uses [IntroScreen] to let the user pick which YAML asset to load.
+ *  2) Config load:
+ *     - Loads [SurveyConfig] from the chosen asset with
+ *       [SurveyConfigLoader.fromAssets].
+ *  3) Model download:
+ *     - Uses [AppViewModel] and [DownloadGate] to download the SLM model
+ *       file using defaults from `modelDefaults`.
+ *  4) SLM initialization:
+ *     - Initializes the SLM runtime via [InitGate].
+ *  5) Survey navigation:
+ *     - Hosts the survey flow in [SurveyNavHost].
  */
 @Composable
 fun AppNav() {
     val appContext = LocalContext.current.applicationContext
 
-    // 1) Load survey YAML once (graph + SLM metadata + model defaults).
-    val config: SurveyConfig = remember(appContext) {
-        SurveyConfigLoader.fromAssets(appContext, "survey_config1.yaml")
+    // Configuration options surfaced on the intro screen.
+    // Automatically discover survey_config*.yaml under assets.
+    val options = remember(appContext) {
+        val assetManager = appContext.assets
+
+        // List asset files and pick only survey_config*.yaml
+        val files = assetManager.list("")?.toList().orEmpty()
+
+        val yamlFiles = files
+            .filter { it.startsWith("survey_config") && it.endsWith(".yaml") }
+            .sorted()
+
+        // Map each file to a ConfigOptionUi.
+        val mapped = yamlFiles.map { fileName ->
+            val base = fileName.removeSuffix(".yaml")
+
+            val label = when (fileName) {
+                "survey_config1.yaml" -> "Demo config"
+                "survey_config2.yaml" -> "Full (1 follow-up)"
+                "survey_config3.yaml" -> "Full (3 follow-ups)"
+                else -> base
+                    .replace('_', ' ')
+                    .replaceFirstChar { ch ->
+                        if (ch.isLowerCase()) ch.titlecase() else ch.toString()
+                    }
+            }
+
+            val description = when (fileName) {
+                "survey_config1.yaml" ->
+                    "Short FAW demo with a few questions."
+                "survey_config2.yaml" ->
+                    "Long-form survey with a single follow-up per item."
+                "survey_config3.yaml" ->
+                    "Long-form survey with three follow-ups per item."
+                else ->
+                    "Survey configuration loaded from $fileName."
+            }
+
+            ConfigOptionUi(
+                id = fileName,
+                label = label,
+                description = description
+            )
+        }
+
+        // Fallback in case nothing matched (defensive, should rarely happen).
+        mapped.ifEmpty {
+            listOf(
+                ConfigOptionUi(
+                    id = "survey_config1.yaml",
+                    label = "Default config",
+                    description = "Fallback survey configuration."
+                )
+            )
+        }
     }
 
-    // 2) Build AppViewModel with overrides injected from YAML model_defaults.
+    var chosen by remember { mutableStateOf<ConfigOptionUi?>(null) }
+    var config by remember { mutableStateOf<SurveyConfig?>(null) }
+    var configLoading by remember { mutableStateOf(false) }
+    var configError by remember { mutableStateOf<String?>(null) }
+
+    // Stage 1: no config chosen yet → show intro/config selector.
+    if (chosen == null) {
+        IntroScreen(
+            options = options,
+            defaultOptionId = options.firstOrNull()?.id,
+            onStart = { option ->
+                chosen = option
+            }
+        )
+        return
+    }
+
+    // Stage 2: load the chosen configuration once per selection.
+    LaunchedEffect(chosen!!.id) {
+        configLoading = true
+        configError = null
+        try {
+            val loaded = withContext(Dispatchers.IO) {
+                SurveyConfigLoader.fromAssets(appContext, chosen!!.id)
+            }
+            config = loaded
+        } catch (t: Throwable) {
+            config = null
+            configError = t.message ?: "Failed to load survey configuration."
+        } finally {
+            configLoading = false
+        }
+    }
+
+    val backplate = animatedBackplate()
+
+    when {
+        configLoading || (config == null && configError == null) -> {
+            // Config loading in progress.
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(backplate)
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(
+                    tonalElevation = 6.dp,
+                    shadowElevation = 8.dp,
+                    shape = MaterialTheme.shapes.large,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                    modifier = Modifier
+                        .wrapContentWidth()
+                        .neonEdgeThin()
+                ) {
+                    Column(
+                        Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(28.dp),
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
+                        Spacer(Modifier.height(14.dp))
+                        Text(
+                            text = "Loading survey configuration…",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Parsing YAML graph and SLM metadata",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            return
+        }
+
+        configError != null -> {
+            // Config load failed → show error and allow going back to selector.
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(backplate)
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(
+                    tonalElevation = 6.dp,
+                    shadowElevation = 8.dp,
+                    shape = MaterialTheme.shapes.large,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                    modifier = Modifier
+                        .wrapContentWidth()
+                        .neonEdgeThin(
+                            color = MaterialTheme.colorScheme.error,
+                            intensity = 0.05f
+                        )
+                ) {
+                    Column(
+                        Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = configError!!,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = {
+                                // Go back to the selector so the user can pick again.
+                                chosen = null
+                                config = null
+                                configError = null
+                            }
+                        ) {
+                            Text("Back to config selector")
+                        }
+                    }
+                }
+            }
+            return
+        }
+    }
+
+    // At this point the configuration is successfully loaded.
+    val cfg = config!!
+
+    // 3) Build AppViewModel with overrides injected from YAML model_defaults.
     val appVm: AppViewModel = viewModel(
         factory = AppViewModel.factoryFromOverrides(
-            modelUrlOverride = config.modelDefaults.defaultModelUrl,
-            fileNameOverride = config.modelDefaults.defaultFileName,
-            timeoutMsOverride = config.modelDefaults.timeoutMs,
-            uiThrottleMsOverride = config.modelDefaults.uiThrottleMs,
-            uiMinDeltaBytesOverride = config.modelDefaults.uiMinDeltaBytes
+            modelUrlOverride = cfg.modelDefaults.defaultModelUrl,
+            fileNameOverride = cfg.modelDefaults.defaultFileName,
+            timeoutMsOverride = cfg.modelDefaults.timeoutMs,
+            uiThrottleMsOverride = cfg.modelDefaults.uiThrottleMs,
+            uiMinDeltaBytesOverride = cfg.modelDefaults.uiMinDeltaBytes
         )
     )
 
@@ -379,12 +596,12 @@ fun AppNav() {
         onRetry = { appVm.ensureModelDownloaded(appContext) }
     ) { modelFile ->
 
-        // 3) Build SLM model configuration map from YAML metadata.
-        val modelConfig = remember(config) { buildModelConfig(config.slm) }
+        // 4) Build SLM model configuration map from YAML metadata.
+        val modelConfig = remember(cfg) { buildModelConfig(cfg.slm) }
 
-        // 4) Create a concrete SLM model descriptor.
+        // 5) Create a concrete SLM model descriptor.
         val slmModel = remember(modelFile.absolutePath, modelConfig) {
-            val modelName = config.modelDefaults.defaultFileName
+            val modelName = cfg.modelDefaults.defaultFileName
                 ?.substringBeforeLast('.')
                 ?.ifBlank { null }
                 ?: "ondevice-slm"
@@ -396,7 +613,7 @@ fun AppNav() {
             )
         }
 
-        // 5) Initialize SLM instance under InitGate.
+        // 6) Initialize SLM instance under InitGate.
         InitGate(
             key = slmModel,
             progressText = "Initializing Small Language Model…",
@@ -428,8 +645,8 @@ fun AppNav() {
             val backStack = rememberNavBackStack(FlowHome)
 
             // Repository used by AI ViewModel to talk to SLM.
-            val repo: Repository = remember(appContext, slmModel, config) {
-                SlmDirectRepository(slmModel, config)
+            val repo: Repository = remember(appContext, slmModel, cfg) {
+                SlmDirectRepository(slmModel, cfg)
             }
 
             // Survey ViewModel: holds graph position, answers, and follow-ups.
@@ -437,7 +654,7 @@ fun AppNav() {
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
                     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                        SurveyViewModel(nav = backStack, config = config) as T
+                        SurveyViewModel(nav = backStack, config = cfg) as T
                 }
             )
 
@@ -470,7 +687,7 @@ fun AppNav() {
  * - When [DoneScreen] calls `onRestart`, this function:
  *   1) Resets AI and survey state.
  *   2) Shrinks [backStack] to a single FlowHome entry.
- *   3) Causes [NavDisplay] to render IntroScreen again.
+ *   3) Causes [NavDisplay] to render [HomeScreen] again.
  */
 @Composable
 fun SurveyNavHost(
@@ -481,6 +698,7 @@ fun SurveyNavHost(
     // Global background upload HUD — always attached at the window root.
     UploadProgressOverlay()
 
+    val appContext = LocalContext.current.applicationContext
     val canGoBack by vmSurvey.canGoBack.collectAsState()
 
     NavDisplay(
@@ -491,9 +709,9 @@ fun SurveyNavHost(
             rememberViewModelStoreNavEntryDecorator()
         ),
         entryProvider = entryProvider {
-            // Home (intro) screen.
+            // Home screen shown after SLM is initialized and config is loaded.
             entry<FlowHome> {
-                IntroScreen(
+                HomeScreen(
                     onStart = {
                         // Reset internal state and advance to the first node.
                         vmSurvey.resetToStart()
@@ -554,16 +772,15 @@ fun SurveyNavHost(
                     vm = vmSurvey,
                     onRestart = {
                         // 1) Reset AI and survey internal state for a fresh run.
-                        vmAI.resetStates()
+                        vmAI.resetAll()
                         vmSurvey.resetToStart()
-
                         // 2) Reset navigation backstack so only FlowHome remains.
                         //    This assumes FlowHome is the start destination and
                         //    is present as the first entry.
                         while (backStack.size > 1) {
                             backStack.removeLastOrNull()
                         }
-                        // After this, NavDisplay will render FlowHome again.
+                        // After this, NavDisplay will render HomeScreen again.
                     },
                     gitHubConfig = gh
                 )
@@ -577,6 +794,59 @@ fun SurveyNavHost(
     BackHandler(enabled = canGoBack) {
         vmAI.resetStates()
         vmSurvey.backToPrevious()
+    }
+}
+
+/**
+ * Simple home screen shown after model initialization.
+ *
+ * This screen intentionally keeps the visual language similar to the
+ * loading/error gates so that the transition into the survey feels
+ * continuous, while all config selection work has already been done
+ * in [AppNav]'s intro stage.
+ */
+@Composable
+private fun HomeScreen(
+    onStart: () -> Unit
+) {
+    val backplate = animatedBackplate()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .wrapContentWidth()
+                .neonEdgeThin()
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "Survey ready",
+                    style = MaterialTheme.typography.titleLarge
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Tap Start to begin answering the configured survey.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(16.dp))
+                OutlinedButton(onClick = onStart) {
+                    Text("Start survey")
+                }
+            }
+        }
     }
 }
 

@@ -186,7 +186,6 @@ dependencies {
     implementation(libs.androidx.media3.ui)
 
     // MediaPipe GenAI
-    implementation(libs.mediapipe.tasks.text)
     implementation(libs.mediapipe.tasks.genai)
 
     // Accompanist
