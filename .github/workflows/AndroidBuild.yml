@@ -98,12 +98,41 @@ jobs:
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v3
 
+      - name: 📦 Download Whisper Models (if task exists, with debug)
+        run: |
+          set -e
+          MODULE="${{ env.MODULE_PATH }}"
+          echo "🔍 Checking for Gradle task ':${MODULE}:downloadModel' ..."
+          echo "🧩 Gradle version:"
+          ./gradlew -v || true
+
+          echo "🗂️ Listing available tasks in :${MODULE} module..."
+          ./gradlew -p "${MODULE}" tasks --all | tee gradle_tasks.log || true
+
+          if grep -q "downloadModel" gradle_tasks.log; then
+            echo "✅ Found task ':${MODULE}:downloadModel'. Running..."
+            echo "-------------------------------------------"
+            ./gradlew ":${MODULE}:downloadModel" --stacktrace --no-daemon
+            echo "-------------------------------------------"
+            echo "🎉 Model download completed successfully."
+          else
+            echo "⚠️ Task ':${MODULE}:downloadModel' not found. Skipping model download."
+            echo "📁 Debug info:"
+            echo "Current directory: $(pwd)"
+            echo "Subdirectories:"
+            ls -1
+            echo "-------------------------------------------"
+            echo "If your ${MODULE}/build.gradle.kts defines downloadModel,"
+            echo "ensure it's within the '${MODULE}' module and Gradle sync succeeds locally."
+          fi
+
       - name: Configure gradle.properties
-        shell: bash
         run: |-
           set -euo pipefail
           [[ -n "${{ secrets.GH_TOKEN }}" ]] || { echo "::error ::GH_TOKEN is not configured"; exit 1; }
+
           mkdir -p "$HOME/.gradle"
+
           cat <<'PROPS' > "$HOME/.gradle/gradle.properties"
           gh.owner=${{ env.OWNER }}
           gh.repo=${{ env.REPO }}
@@ -112,6 +141,49 @@ jobs:
           gh.token=${{ secrets.GH_TOKEN }}
           HF_TOKEN=${{ secrets.HF_TOKEN }}
           PROPS
+
+      - name: Derive base version name
+        id: version
+        run: |-
+          set -Eeuo pipefail
+          FILE_GRADLE="${MODULE_PATH}/build.gradle.kts"
+          FILE_MANIFEST="${MODULE_PATH}/src/main/AndroidManifest.xml"
+          VERSION=""
+
+          # English comment:
+          # - Try to extract a literal versionName from Gradle or Manifest.
+          # - For the current setup, this will usually fail (versionName is computed),
+          #   so we fall back to a sane default "0.0.1".
+          if [[ -f "$FILE_GRADLE" ]]; then
+            VERSION=$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*[:=][[:space:]]*"([^"]+)".*/\1/p' "$FILE_GRADLE" | head -n1 || true)
+          fi
+
+          if [[ -z "${VERSION:-}" && -f "$FILE_MANIFEST" ]]; then
+            VERSION=$(sed -nE 's/.*versionName="([^"]+)".*/\1/p' "$FILE_MANIFEST" | head -n1 || true)
+          fi
+
+          # Fallback to a base version that matches the Gradle defaultConfig.
+          if [[ -z "${VERSION:-}" ]]; then
+            VERSION="0.0.1"
+          fi
+
+          echo "Base version: ${VERSION}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Compute release tag and export CI_APP_VERSION_NAME
+        id: tag
+        run: |-
+          set -euo pipefail
+
+          BASE_VERSION="${{ steps.version.outputs.version }}"
+          # English comment:
+          # - Tag format: v<base>-YYYYMMDD-HHMM (tag-safe, no spaces).
+          TAG="v${BASE_VERSION}-$(date '+%Y%m%d-%H%M')"
+
+          echo "Computed TAG=${TAG}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "CI_APP_VERSION_NAME=$TAG" >> "$GITHUB_ENV"
+          echo "Release tag: $TAG"
 
       - name: Decode signing keystore
         if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
@@ -131,7 +203,6 @@ jobs:
 
       - name: Collect outputs
         id: collect
-        shell: bash
         run: |-
           set -euo pipefail
           ROOT="${MODULE_PATH}/build/outputs"
@@ -191,32 +262,8 @@ jobs:
           path: ${{ steps.collect.outputs.map_list }}
           retention-days: 14
 
-      - name: Derive version name
-        id: version
-        shell: bash
-        run: |-
-          set -Eeuo pipefail
-          FILE_GRADLE="${MODULE_PATH}/build.gradle.kts"
-          FILE_MANIFEST="${MODULE_PATH}/src/main/AndroidManifest.xml"
-          VERSION=""
-
-          if [[ -f "$FILE_GRADLE" ]]; then
-            VERSION=$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*[:=][[:space:]]*"([^"]+)".*/\1/p' "$FILE_GRADLE" | head -n1 || true)
-          fi
-
-          if [[ -z "${VERSION:-}" && -f "$FILE_MANIFEST" ]]; then
-            VERSION=$(sed -nE 's/.*versionName="([^"]+)".*/\1/p' "$FILE_MANIFEST" | head -n1 || true)
-          fi
-
-          if [[ -z "${VERSION:-}" ]]; then
-            VERSION="0.0.0"
-          fi
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Prepare release body
         id: notes
-        shell: bash
         run: |-
           set -euo pipefail
           APKs=$(printf '%s\n' "${{ steps.collect.outputs.apk_list }}" | sed '/^$/d')
@@ -246,15 +293,6 @@ jobs:
             done
             echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Compute release tag
-        id: tag
-        shell: bash
-        run: |-
-          set -euo pipefail
-          TAG="v${{ steps.version.outputs.version }}-$(date '+%Y%m%d-%H%M')"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
 
       - name: Publish GitHub Release
         if: ${{ inputs.create_release && (steps.collect.outputs.apk_count != '0' || steps.collect.outputs.aab_count != '0') }}
@@ -300,19 +338,21 @@ jobs:
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
           echo "base=$BASE_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve latest release APK
-        id: latest
+      # 🔽 このビルドの TAG 用の APK/URL を解決する
+      - name: Resolve APK for this build
+        id: apk
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |-
           set -euo pipefail
           REPO="${{ steps.info.outputs.repo }}"
+          TAG_THIS="${{ steps.info.outputs.tag }}"
 
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::warning::GH_TOKEN not set; fallback to Releases page."
-            echo "latest_tag=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_name=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            echo "apk_tag=$TAG_THIS" >> "$GITHUB_OUTPUT"
+            echo "apk_name=" >> "$GITHUB_OUTPUT"
+            echo "apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -321,48 +361,48 @@ jobs:
             sudo apt-get install -y jq >/dev/null
           fi
 
-          curl -fsSL \
+          # English comment:
+          # - Query the release that matches THIS build's tag.
+          # - If it does not exist (e.g., create_release=false), we
+          #   fall back to the releases list.
+          if ! curl -fsSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/releases?per_page=10" \
-            -o releases.json
-
-          LATEST_TAG="$(jq -r '[.[] | select(.draft==false)][0].tag_name // empty' releases.json)"
-          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-            echo "::warning::No non-draft releases; fallback."
-            echo "latest_tag=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_name=" >> "$GITHUB_OUTPUT"
-            echo "latest_apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
+            "https://api.github.com/repos/${REPO}/releases/tags/${TAG_THIS}" \
+            -o release.json; then
+            echo "::warning::Release for tag ${TAG_THIS} not found; fallback."
+            echo "apk_tag=$TAG_THIS" >> "$GITHUB_OUTPUT"
+            echo "apk_name=" >> "$GITHUB_OUTPUT"
+            echo "apk_url=https://github.com/${REPO}/releases" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           APK_NAME="$(
-            jq -r --arg TAG "$LATEST_TAG" '
-              (.[] | select(.draft==false and .tag_name==$TAG) | .assets[]?.name) // empty
-            ' releases.json \
+            jq -r '.assets[]?.name // empty' release.json \
             | grep -E '\.apk$' \
             | head -n1 || true
           )"
 
           if [ -n "$APK_NAME" ]; then
-            APK_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${APK_NAME}"
+            APK_URL="https://github.com/${REPO}/releases/download/${TAG_THIS}/${APK_NAME}"
           else
-            APK_URL="https://github.com/${REPO}/releases/tag/${LATEST_TAG}"
+            APK_URL="https://github.com/${REPO}/releases/tag/${TAG_THIS}"
           fi
 
-          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "latest_apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
-          echo "latest_apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
+          echo "apk_tag=$TAG_THIS" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
 
-          echo "::group::Latest release asset"
-          echo "LATEST_TAG : $LATEST_TAG"
-          echo "APK_NAME   : ${APK_NAME:-'(none)'}"
-          echo "APK_URL    : $APK_URL"
+          echo "::group::Release for this build"
+          echo "TAG_THIS : $TAG_THIS"
+          echo "APK_NAME : ${APK_NAME:-'(none)'}"
+          echo "APK_URL  : $APK_URL"
           echo "::endgroup::"
 
       - name: Update Wiki (Home + TAG.md)
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APK_URL: ${{ steps.apk.outputs.apk_url }}
         run: |-
           set -euo pipefail
 
@@ -371,44 +411,70 @@ jobs:
           REPO="${{ steps.info.outputs.repo }}"
           OWNER="${{ env.OWNER }}"
           BASE_URL="${{ steps.info.outputs.base }}"
-          LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
+          BUILD_APK_URL="${APK_URL:-}"
 
-          mkdir -p wiki
+          # ---- 1) Clone existing Wiki repo (if any) ----
+          rm -rf wiki
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            echo "Cloning existing wiki repo (if any)..."
+            if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git" wiki 2>/dev/null; then
+              echo "Wiki repo cloned."
+            else
+              echo "No existing wiki repo or clone failed; starting fresh."
+              mkdir -p wiki
+            fi
+          else
+            echo "::warning::GITHUB_TOKEN not set; starting with empty wiki directory."
+            mkdir -p wiki
+          fi
 
-          # Per-build page
+          cd wiki
+
+          # ---- 2) Ensure this is a git repo ----
+          if [ ! -d ".git" ]; then
+            git init
+          fi
+
+          # ---- 3) Add/update TAG page ----
           {
             echo "# 📦 SurveyNav — Build ${TAG}"
             echo "Generated: ${DATE}"
             echo ""
             echo "## ⬇️ Download"
-            if [ -n "$LATEST_APK_URL" ]; then
-              echo "- [Latest APK](${LATEST_APK_URL})"
+            if [ -n "$BUILD_APK_URL" ]; then
+              echo "- [This build APK](${BUILD_APK_URL})"
             else
-              echo "- [Latest APK](https://github.com/${REPO}/releases)"
+              echo "- [Releases](https://github.com/${REPO}/releases)"
             fi
             echo "- [This tag assets](https://github.com/${REPO}/releases/tag/${TAG})"
             echo "- [All Releases](https://github.com/${REPO}/releases)"
-          } > "wiki/${TAG}.md"
+          } > "${TAG}.md"
 
-          # Home.md
+          # ---- 4) Rebuild Home.md from all .md ----
           {
             echo "# 🏠 SurveyNav Wiki Home"
             echo "Updated: ${DATE}"
             echo ""
             echo "## 📜 Build History (latest 20)"
-          } > wiki/Home.md
+          } > Home.md
 
-          MAP_TMP="wiki/_link-map.txt"
+          MAP_TMP="_link-map.txt"
           : > "$MAP_TMP"
 
-          LIST=$(find wiki -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' | sort -r | head -n 20 || true)
+          LIST=$(
+            find . -maxdepth 1 -type f -name '*.md' ! -name 'Home.md' -printf '%T@ %P\n' \
+              | sort -nr \
+              | head -n 20 \
+              | awk '{ $1=""; sub(/^ /,""); print }'
+          )
+
           if [ -z "$LIST" ]; then
-            echo "_No builds yet._" >> wiki/Home.md
+            echo "_No builds yet._" >> Home.md
           else
             echo "$LIST" | while read -r f; do
               base="$(basename "$f" .md)"
               slug="$(printf '%s' "$base" | sed -E 's@[[:space:]]+@-@g; s@/@-@g; s/-+/-/g')"
-              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> wiki/Home.md
+              printf -- "- [%s](https://github.com/%s/wiki/%s)\n" "$base" "$REPO" "$slug" >> Home.md
               printf -- "%s.md -> %s\n" "$base.md" "$slug" >> "$MAP_TMP"
             done
           fi
@@ -417,30 +483,33 @@ jobs:
             echo ""
             echo "## 🌐 GitHub Pages"
             echo "- [Downloads Page](${BASE_URL})"
-          } >> wiki/Home.md
+          } >> Home.md
 
           echo "::group::Wiki tree"
-          ls -R wiki || true
+          ls -R .
           echo "::endgroup::"
           echo "::group::Wiki link map"
           cat "$MAP_TMP" || true
           echo "::endgroup::"
 
-          if [ -n "${GH_TOKEN:-}" ]; then
-            cd wiki
-            git init
-            git config user.name "github-actions"
-            git config user.email "actions@github.com"
+          # ---- 5) Commit & push ----
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add .
             git commit -m "Update Wiki ${TAG}" || git commit --allow-empty -m "Ensure wiki"
             git branch -M master
-            git remote add origin "https://${OWNER}:${GH_TOKEN}@github.com/${REPO}.wiki.git"
+            git remote remove origin 2>/dev/null || true
+            git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.wiki.git"
             git push origin master --force || echo "::warning::Failed to push wiki (is Wiki enabled?)"
           else
-            echo "::warning::GH_TOKEN not set; skip wiki push."
+            echo "::warning::GITHUB_TOKEN not set; skip wiki push."
           fi
 
       - name: Generate GH Pages (Downloads)
+        env:
+          APK_URL: ${{ steps.apk.outputs.apk_url }}
+          APK_TAG: ${{ steps.apk.outputs.apk_tag }}
         run: |-
           set -euo pipefail
 
@@ -448,11 +517,11 @@ jobs:
           DATE="${{ steps.info.outputs.date }}"
           REPO="${{ steps.info.outputs.repo }}"
           BASE_URL="${{ steps.info.outputs.base }}"
-          LATEST_TAG="${{ steps.latest.outputs.latest_tag }}"
-          LATEST_APK_URL="${{ steps.latest.outputs.latest_apk_url }}"
+          BUILD_APK_URL="${APK_URL:-}"
+          BUILD_APK_TAG="${APK_TAG:-$TAG_THIS}"
 
-          if [ -z "$LATEST_APK_URL" ]; then
-            LATEST_APK_URL="https://github.com/${REPO}/releases"
+          if [ -z "$BUILD_APK_URL" ]; then
+            BUILD_APK_URL="https://github.com/${REPO}/releases"
           fi
 
           mkdir -p gh-pages
@@ -478,10 +547,10 @@ jobs:
           <h1>📦 SurveyNav — Latest Downloads</h1>
           <p class="muted"><strong>Generated:</strong> ${DATE}</p>
 
-          <h2>⬇️ Latest Build</h2>
-          <p><a href="${LATEST_APK_URL}">Download Latest APK</a></p>
-          <p>
-            ${LATEST_TAG:+<a href="https://github.com/${REPO}/releases/tag/${LATEST_TAG}">🔖 ${LATEST_TAG}</a> • }
+          <h2>⬇️ This Build</h2>
+          <p><a href="${BUILD_APK_URL}">Download APK for <code>${BUILD_APK_TAG}</code></a></p>
+          <p style="margin-top:8px;">
+            <a href="https://github.com/${REPO}/releases/tag/${BUILD_APK_TAG}">🔖 This tag on GitHub</a> •
             <a href="https://github.com/${REPO}/releases">📘 All Releases</a>
           </p>
 
