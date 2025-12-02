@@ -156,11 +156,11 @@ prompts:
 model_defaults:
   # Model download UI defaults
 
-  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
-  default_file_name: "Gemma3n4B.litertlm"
+#  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+#  default_file_name: "Gemma3n4B.litertlm"
 
-  # default_model_url: "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/swahili-gemma-1b-fp16-instruct.task"
-  # default_file_name: "swahili-gemma-1b-fp16.task"
+  default_model_url: "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/swahili-gemma-1b-fp16-instruct.task"
+  default_file_name: "swahili-gemma-1b-fp16.task"
 
   # default_model_url: "https://huggingface.co/google/gemma-3n-E2B-it-litert-lm/resolve/main/gemma-3n-E2B-it-int4.litertlm"
   # default_file_name: "Gemma3n2B.litertlm"
