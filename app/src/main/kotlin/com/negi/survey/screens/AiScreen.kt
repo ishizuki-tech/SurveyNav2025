@@ -126,6 +126,7 @@ import androidx.compose.ui.unit.sp
 import com.negi.survey.slm.FollowupExtractor.extractScore
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
+import com.negi.survey.vm.WhisperSpeechController
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
@@ -263,6 +264,16 @@ fun AiScreen(
 
     // Survey "session" id — increases every time resetSurvey()/resetToStart() is called.
     val sessionId by vmSurvey.sessionId.collectAsState()
+
+    // If the speech controller is a WhisperSpeechController, update its
+    // context so that exported voice files can be associated with [nodeId].
+    val whisperController = speechController as? WhisperSpeechController
+    LaunchedEffect(nodeId, sessionId, whisperController) {
+        whisperController?.updateContext(
+            surveyId = null,      // Optional: can be wired to vmSurvey-level id later.
+            questionId = nodeId   // This is used to link voice → question/answer.
+        )
+    }
 
     // Local UI state — keyed by (nodeId, sessionId) so a brand-new survey run
     // drops any previous text from this screen.

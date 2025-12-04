@@ -25,14 +25,16 @@
  *  Notes:
  *   • JSON is built manually with a small escaper to keep dependencies light.
  *   • Newlines are not preprocessed; escapeJson() handles them correctly.
- *   • JSON payload now includes "voice_files" array with objects:
- *       {
- *         "file": "...wav",
- *         "survey_id": "...",
- *         "question_id": "...",
- *         "question": "...",
- *         "answer": "..."
- *       }
+ *   • JSON payload now includes:
+ *       - "answers": question/answer pairs with optional "audio" array.
+ *       - "voice_files": array with objects:
+ *           {
+ *             "file": "...wav",
+ *             "survey_id": "...",
+ *             "question_id": "...",
+ *             "question": "...",
+ *             "answer": "..."
+ *           }
  * =====================================================================
  */
 
@@ -135,22 +137,55 @@ fun DoneScreen(
 
     /**
      * Build a compact JSON export representing:
-     *  - "answers": per-node question/answer pairs.
+     *  - "answers": per-node question/answer pairs (+ optional "audio" array).
      *  - "followups": per-node arrays of follow-up question/answer pairs.
      *  - "voice_files": objects containing file + survey/question mapping.
      */
     val jsonText = remember(questions, answers, followups, voiceFiles) {
+        // Pre-compute mapping from questionId to a list of voice files.
+        val voiceByQuestionId: Map<String, List<VoiceFileInfo>> =
+            voiceFiles
+                .mapNotNull { info ->
+                    val qId = info.questionId ?: return@mapNotNull null
+                    qId to info
+                }
+                .groupBy({ it.first }, { it.second })
+
         buildString {
             append("{\n")
 
-            // answers
+            // answers with optional audio array
             append("  \"answers\": {\n")
             val qEntries = questions.entries.toList()
             qEntries.forEachIndexed { idx, (id, q) ->
                 val a = answers[id].orEmpty()
-                append("    \"").append(escapeJson(id)).append("\": {\n")
-                append("      \"question\": \"").append(escapeJson(q)).append("\",\n")
-                append("      \"answer\": \"").append(escapeJson(a)).append("\"\n")
+                val audioList = voiceByQuestionId[id].orEmpty()
+
+                append("    \"")
+                    .append(escapeJson(id))
+                    .append("\": {\n")
+                append("      \"question\": \"")
+                    .append(escapeJson(q))
+                    .append("\",\n")
+                append("      \"answer\": \"")
+                    .append(escapeJson(a))
+                    .append("\"")
+
+                if (audioList.isNotEmpty()) {
+                    append(",\n")
+                    append("      \"audio\": [\n")
+                    audioList.forEachIndexed { j, info ->
+                        append("        { \"file\": \"")
+                            .append(escapeJson(info.file.name))
+                            .append("\" }")
+                        if (j != audioList.lastIndex) append(",")
+                        append("\n")
+                    }
+                    append("      ]\n")
+                } else {
+                    append("\n")
+                }
+
                 append("    }")
                 if (idx != qEntries.lastIndex) append(",")
                 append("\n")
