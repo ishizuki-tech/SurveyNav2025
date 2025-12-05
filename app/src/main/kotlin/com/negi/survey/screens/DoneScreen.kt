@@ -483,25 +483,6 @@ fun DoneScreen(
                                     "Upload scheduled (JSON, will run when online)."
                                 )
                             }
-                        }
-                    ) {
-                        Text("Upload JSON later")
-                    }
-                }
-
-                Spacer(Modifier.weight(1f))
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // Voice upload actions row (deferred).
-            if (gitHubConfig != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Button(
-                        onClick = {
                             if (voiceFiles.isEmpty()) {
                                 scope.launch {
                                     snackbar.showOnce("No voice recordings to upload.")
@@ -520,17 +501,16 @@ fun DoneScreen(
                                     )
                                 }
                             }
-                        },
-                        enabled = true
+                        }
                     ) {
-                        Text("Upload voice recordings later")
+                        Text("Upload later")
                     }
-
-                    Spacer(Modifier.weight(1f))
                 }
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.weight(1f))
             }
+
+            Spacer(Modifier.height(12.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
