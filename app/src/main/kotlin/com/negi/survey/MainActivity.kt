@@ -762,7 +762,7 @@ fun AppNav() {
             )
         }
 
-        // 6) Initialize SLM instance under InitGate.
+        // 5) Initialize SLM instance under InitGate.
         InitGate(
             key = slmModel,
             progressText = "Initializing Small Language Model…",
@@ -838,7 +838,7 @@ fun AppNav() {
  * - When [DoneScreen] calls `onRestart`, this function:
  *   1) Resets AI and survey state.
  *   2) Shrinks [backStack] to a single FlowHome entry.
- *   3) Causes [NavDisplay] to render [HomeScreen] again.
+ *   3) Causes [NavDisplay] to render IntroScreen again.
  */
 @Composable
 fun SurveyNavHost(
@@ -936,15 +936,16 @@ fun SurveyNavHost(
                     vm = vmSurvey,
                     onRestart = {
                         // 1) Reset AI and survey internal state for a fresh run.
-                        vmAI.resetAll()
+                        vmAI.resetStates()
                         vmSurvey.resetToStart()
+
                         // 2) Reset navigation backstack so only FlowHome remains.
                         //    This assumes FlowHome is the start destination and
                         //    is present as the first entry.
                         while (backStack.size > 1) {
                             backStack.removeLastOrNull()
                         }
-                        // After this, NavDisplay will render HomeScreen again.
+                        // After this, NavDisplay will render FlowHome again.
                     },
                     gitHubConfig = gh
                 )

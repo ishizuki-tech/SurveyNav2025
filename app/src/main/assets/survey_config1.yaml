@@ -54,10 +54,10 @@ graph:
 
 slm:
   accelerator: "GPU"
-  max_tokens: 512
-  top_k: 5
+  max_tokens: 4096
+  top_k: 10
   top_p: 0.2
-  temperature: 0.1
+  temperature: 0.5
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
   turn_end: "<end_of_turn>"
@@ -156,11 +156,11 @@ prompts:
 model_defaults:
   # Model download UI defaults
 
-#  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
-#  default_file_name: "Gemma3n4B.litertlm"
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
 
-  default_model_url: "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/swahili-gemma-1b-fp16-instruct.task"
-  default_file_name: "swahili-gemma-1b-fp16.task"
+  # default_model_url: "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/swahili-gemma-1b-fp16-instruct.task"
+  # default_file_name: "swahili-gemma-1b-fp16.task"
 
   # default_model_url: "https://huggingface.co/google/gemma-3n-E2B-it-litert-lm/resolve/main/gemma-3n-E2B-it-int4.litertlm"
   # default_file_name: "Gemma3n2B.litertlm"
