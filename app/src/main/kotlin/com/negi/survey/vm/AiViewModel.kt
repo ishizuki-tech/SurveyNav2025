@@ -30,8 +30,10 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -154,9 +156,7 @@ class AiViewModel(
             .map { it[nodeId] ?: emptyList() }
             .stateIn(
                 scope = viewModelScope,
-                started = kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(
-                    stopTimeoutMillis = 5000
-                ),
+                started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5000),
                 initialValue = emptyList()
             )
 
@@ -257,11 +257,10 @@ class AiViewModel(
      *   1) prepares UI state
      *   2) starts a single evaluation job
      *   3) awaits its completion
-     * - The actual evaluation logic lives in [startEvaluationInternal].
      *
      * Timeout semantics:
      * - A timeout still attempts to parse whatever was streamed so far.
-     * - [AiEvent.Final] is emitted exactly once per call.
+     * - [AiEvent.Final] is emitted at most once per call.
      * - [AiEvent.Timeout] is emitted in addition when applicable.
      */
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
@@ -275,13 +274,11 @@ class AiViewModel(
             .onFailure { t -> Log.e(TAG, "evaluate: buildPrompt failed", t) }
             .getOrElse { prompt }
 
-        // Prevent concurrent runs.
         if (!running.compareAndSet(false, true)) {
             Log.w(TAG, "evaluate: already running -> returning current score=${_score.value}")
             return _score.value
         }
 
-        // Defensive: cancel any stale job reference.
         evalJob?.cancel()
         evalJob = null
 
@@ -299,18 +296,12 @@ class AiViewModel(
 
         finalizeRunFlags()
 
-        Log.d(
-            TAG,
-            "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}"
-        )
+        Log.d(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
         return _score.value
     }
 
     /**
      * Fire-and-forget variant of [evaluate].
-     *
-     * This method shares the same internal implementation to avoid
-     * subtle differences in timeout/cancel/error behavior.
      *
      * @return [Job] representing the launched evaluation.
      */
@@ -325,7 +316,7 @@ class AiViewModel(
             .getOrElse { prompt }
 
         if (!running.compareAndSet(false, true)) {
-            Log.w(TAG, "evaluateAsync: already running -> skip")
+            Log.w(TAG, "evaluateAsync: already running -> returning existing job")
             return evalJob ?: viewModelScope.launch { }
         }
 
@@ -341,7 +332,6 @@ class AiViewModel(
         )
         evalJob = job
 
-        // When the async job completes, ensure flags are consistent.
         job.invokeOnCompletion {
             finalizeRunFlags()
         }
@@ -359,6 +349,7 @@ class AiViewModel(
      */
     fun cancel() {
         Log.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
+
         runCatching { evalJob?.cancel() }
             .onFailure { t -> Log.w(TAG, "cancel: exception during cancel (ignored)", t) }
 
@@ -424,9 +415,6 @@ class AiViewModel(
         var totalChars = 0
         var timedOut = false
 
-        /**
-         * Ensure [AiEvent.Final] is emitted exactly once.
-         */
         var finalEmitted = false
 
         try {
@@ -447,13 +435,12 @@ class AiViewModel(
                 timedOut = true
                 Log.w(TAG, "evaluate: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
+                // Treat only timeout-like cancellations as soft timeouts.
+                // For user-driven cancellation, rethrow and let the outer catch handle events.
                 if (looksLikeTimeout(e)) {
                     timedOut = true
                     Log.w(TAG, "evaluate: timeout-like cancellation (${e.javaClass.name})")
                 } else {
-                    _error.value = "cancelled"
-                    _events.tryEmit(AiEvent.Cancelled)
-                    Log.w(TAG, "evaluate: explicit cancellation (${e.javaClass.name})")
                     throw e
                 }
             }
@@ -485,10 +472,7 @@ class AiViewModel(
                 finalEmitted = true
 
                 if (DEBUG_LOGS) {
-                    Log.i(
-                        TAG,
-                        "Score=$parsedScore, FU[0]=${q0 ?: "<none>"} FU[1..]=${top3.drop(1)}"
-                    )
+                    Log.i(TAG, "Score=$parsedScore, FU[0]=${q0 ?: "<none>"} FU[1..]=${top3.drop(1)}")
                 }
             } else {
                 Log.w(TAG, "evaluate: no output produced (stream & buffer empty)")
@@ -501,11 +485,15 @@ class AiViewModel(
                 _events.tryEmit(AiEvent.Timeout)
             }
         } catch (e: CancellationException) {
-            if (!finalEmitted) {
-                _events.tryEmit(AiEvent.Cancelled)
-            }
             _error.value = "cancelled"
-            Log.w(TAG, "evaluate: propagate cancellation", e)
+
+            if (!finalEmitted) {
+                // Best-effort terminal snapshot for UI that expects a final signal.
+                _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
+            }
+
+            _events.tryEmit(AiEvent.Cancelled)
+            Log.w(TAG, "evaluate: cancelled", e)
             throw e
         } catch (t: Throwable) {
             val msg = t.message ?: "error"
@@ -532,8 +520,7 @@ class AiViewModel(
         _followups.value = emptyList()
         _raw.value = null
 
-        // UX choice:
-        // Preserve recent timeout/cancel labels unless explicitly overwritten.
+        // Preserve recent timeout/cancel badges unless overwritten by a new error.
         if (_error.value != "timeout" && _error.value != "cancelled") {
             _error.value = null
         }
@@ -577,7 +564,7 @@ class AiViewModel(
     private fun sha256Hex(input: String): String = runCatching {
         val md = MessageDigest.getInstance("SHA-256")
         val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
-        bytes.joinToString("") { "%02x".format(it) }
+        bytes.joinToString("") { b -> "%02x".format(b.toInt() and 0xff) }
     }.getOrElse { "sha256_error" }
 }
 
@@ -598,7 +585,7 @@ sealed interface AiEvent {
     data class Stream(val chunk: String) : AiEvent
 
     /**
-     * Emitted once at the end (even on timeout) with the best-available final buffer.
+     * Emitted at the end with the best-available final buffer.
      *
      * @param raw Raw text payload accumulated from the model.
      * @param score Parsed score (0..100) or null.

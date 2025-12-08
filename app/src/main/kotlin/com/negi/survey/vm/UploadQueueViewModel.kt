@@ -41,10 +41,10 @@ import kotlinx.coroutines.flow.map
 data class UploadItemUi(
     val id: String,
     val fileName: String,
-    val percent: Int?,          // null = unknown / not reported
+    val percent: Int?,
     val state: WorkInfo.State,
-    val fileUrl: String?,       // populated on success
-    val message: String? = null // short status line for the HUD
+    val fileUrl: String?,
+    val message: String? = null
 )
 
 /* ───────────────────────────── ViewModel ───────────────────────────── */
@@ -87,12 +87,9 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
                     .map { wi -> wi.toUploadItemUi() }
                     .sortedWith(
                         compareBy<UploadItemUi> { it.priorityRank() }
-                            .thenBy(String.CASE_INSENSITIVE_ORDER) { it.fileName }
+                            .thenBy { it.fileName.lowercase(Locale.ROOT) }
                     )
             }
-            /**
-             * Emit only when something that affects rendering actually changed.
-             */
             .distinctUntilChanged { old, new -> listsRenderEqual(old, new) }
 
     /**
@@ -111,9 +108,9 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      * Convert [WorkInfo] into an [UploadItemUi] with derived status text.
      */
     private fun WorkInfo.toUploadItemUi(): UploadItemUi {
-        val pct: Int? = extractPercent(this)
-        val name: String = extractFileName(this)
-        val url: String? = outputData
+        val name = extractFileName(this)
+        val pct = extractPercent(this)
+        val url = outputData
             .getString(GitHubUploadWorker.OUT_FILE_URL)
             ?.takeIf { it.isNotBlank() }
 
@@ -141,19 +138,19 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      *
      * Progress sources (in order of priority):
      *  1. `progress[PROGRESS_PCT]` during upload.
-     *  2. `outputData[PROGRESS_PCT]` on completion.
+     *  2. `outputData[PROGRESS_PCT]` if a legacy worker writes it.
+     *  3. Treat SUCCEEDED as 100 when no explicit pct exists.
      *
      * Returns null when progress is missing or invalid.
      */
     private fun extractPercent(wi: WorkInfo): Int? {
         val fromProgress = wi.progress.getInt(GitHubUploadWorker.PROGRESS_PCT, -1)
+        if (fromProgress in 0..100) return fromProgress
+
         val fromOutput = wi.outputData.getInt(GitHubUploadWorker.PROGRESS_PCT, -1)
-        val raw = when {
-            fromProgress >= 0 -> fromProgress
-            fromOutput >= 0 -> fromOutput
-            else -> -1
-        }
-        return raw.takeIf { it in 0..100 }
+        if (fromOutput in 0..100) return fromOutput
+
+        return if (wi.state == WorkInfo.State.SUCCEEDED) 100 else null
     }
 
     /**
@@ -161,14 +158,13 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      *
      * Resolution order:
      *  1. `progress[PROGRESS_FILE]` during upload.
-     *  2. `outputData[OUT_FILE_NAME]` after success/failure.
+     *  2. `outputData[OUT_FILE_NAME]` after completion.
      *  3. A tag formatted as `"${GitHubUploadWorker.TAG}:file:<name>"`.
-     *  4. `input_file` from progress or output.
+     *  4. `input_file` from progress or output (optional convention).
      *  5. Fallback `"upload-<4chars>.json"` using work ID prefix.
      *
      * Note:
-     * - WorkInfo does not reliably expose inputData, so we cannot read
-     *   the original WorkRequest input here.
+     * - WorkInfo does not reliably expose inputData.
      */
     private fun extractFileName(wi: WorkInfo): String {
         progressName(wi)?.let { return it }
@@ -189,10 +185,11 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
             ?.takeIf { it.isNotBlank() }
 
     /**
-     * Best-effort name inference from progress/output.
+     * Optional convention-based name inference from progress/output.
      *
-     * This assumes the worker echoes the input file name into progress
-     * early and into output on completion.
+     * This is useful when another uploader implementation writes:
+     * - progress["input_file"]
+     * - outputData["input_file"]
      */
     private fun inputName(wi: WorkInfo): String? {
         wi.progress
@@ -215,9 +212,8 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      *  - "${GitHubUploadWorker.TAG}:file:<name>"
      */
     private fun tagName(wi: WorkInfo): String? {
-        val prefix = "${GitHubUploadWorker.TAG}:file:"
-        val tag = wi.tags.firstOrNull { it.startsWith(prefix) } ?: return null
-        val name = tag.removePrefix(prefix)
+        val tag = wi.tags.firstOrNull { it.startsWith(FILE_TAG_PREFIX) } ?: return null
+        val name = tag.removePrefix(FILE_TAG_PREFIX)
         return name.takeIf { it.isNotBlank() }
     }
 
@@ -236,7 +232,7 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Lightweight deep equality for the fields that affect rendering.
+     * Lightweight deep equality for fields that affect rendering.
      *
      * This intentionally ignores [UploadItemUi.message], because it is
      * derived from [UploadItemUi.state].
@@ -272,6 +268,9 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private const val KEY_INPUT_FILE = "input_file"
+
+        private val FILE_TAG_PREFIX: String =
+            "${GitHubUploadWorker.TAG}:file:"
 
         /**
          * Compose-friendly factory.

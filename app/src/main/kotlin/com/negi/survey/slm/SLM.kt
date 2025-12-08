@@ -33,6 +33,7 @@ import android.util.Log
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -45,7 +46,7 @@ enum class Accelerator(val label: String) { CPU("CPU"), GPU("GPU") }
  */
 enum class ConfigKey { MAX_TOKENS, TOP_K, TOP_P, TEMPERATURE, ACCELERATOR }
 
-// Default values for model parameters
+/** Default values for model parameters. */
 private const val DEFAULT_MAX_TOKEN = 256
 private const val DEFAULT_TOP_K = 40
 private const val DEFAULT_TOP_P = 0.9f
@@ -99,32 +100,36 @@ data class Model(
 }
 
 /**
+ * Snapshot of session parameters derived from [Model.config].
+ */
+data class SessionParams(
+    val topK: Int = DEFAULT_TOP_K,
+    val topP: Float = DEFAULT_TOP_P,
+    val temperature: Float = DEFAULT_TEMPERATURE
+)
+
+/**
  * Holds the initialized engine and session for a model.
  *
  * @property engine Underlying LlmInference engine instance.
  * @property session Active LlmInferenceSession that can be rebuilt.
  * @property state Current run state for this model instance.
+ * @property lastParams The parameters used to build the current session.
  */
 data class LlmModelInstance(
     val engine: LlmInference,
     @Volatile var session: LlmInferenceSession,
     val state: AtomicReference<RunState> = AtomicReference(RunState.IDLE),
+    @Volatile var lastParams: SessionParams = SessionParams()
 )
 
 /**
  * Safe Language Model inference helper.
- *
- * High-level contract:
- * - [initialize] prepares an engine + session; idempotent when idle.
- * - [runInference] streams partial results and eventually calls [CleanUpListener].
- * - [cancel] attempts to stop the current generation and synthesize cleanup.
- * - [resetSession] rebuilds the session while reusing the engine when idle.
- * - [cleanUp] fully disposes engine/session and clears listeners.
  */
 object SLM {
 
     /** Per-model cleanup listeners keyed by model identity. */
-    private val cleanUpListeners = ConcurrentHashMap<String, CleanUpListener>()
+    private val cleanUpListeners = ConcurrentHashMap<String, () -> Unit>()
 
     /**
      * Returns true when the model has an instance and its run state is not [RunState.IDLE].
@@ -134,12 +139,6 @@ object SLM {
 
     /**
      * Initializes an engine + session for [model].
-     *
-     * Behavior:
-     * - If the existing instance is not idle, the call fails and [onDone] receives a message.
-     * - If idle, the old session/engine are closed and replaced by a fresh instance.
-     * - On success, [onDone] receives an empty string.
-     * - On failure, [onDone] receives a cleaned error message.
      */
     @Synchronized
     fun initialize(context: Context, model: Model, onDone: (String) -> Unit) {
@@ -151,9 +150,10 @@ object SLM {
                 onDone("Model '${model.name}' is busy. Try again after done=true or call cancel().")
                 return
             }
+
             oldSession = inst.session
             oldEngine = inst.engine
-            cleanUpListeners.remove(keyOf(model))?.invoke()
+            cleanUpListeners.remove(keyOf(model))
             model.instance = null
         }
 
@@ -198,8 +198,15 @@ object SLM {
         }
 
         try {
-            val session = buildSessionFromModel(engine, topK, topP, temp)
-            model.instance = LlmModelInstance(engine, session)
+            val params = SessionParams(topK = topK, topP = topP, temperature = temp)
+            val session = buildSession(engine, params)
+
+            model.instance = LlmModelInstance(
+                engine = engine,
+                session = session,
+                lastParams = params
+            )
+
             onDone("")
         } catch (e: Exception) {
             Log.e(TAG, "Session init failed: ${e.message}", e)
@@ -210,29 +217,20 @@ object SLM {
 
     /**
      * Rebuilds the [LlmInferenceSession] for [model] while keeping the current engine.
-     *
-     * Requirements:
-     * - The model must have an existing instance.
-     * - The instance must be idle.
-     *
-     * @return true on successful reset; false if conditions are not met or reset failed.
      */
     fun resetSession(model: Model): Boolean {
         val snap = synchronized(this) {
             val inst = model.instance ?: return false
             if (inst.state.get() != RunState.IDLE) return false
-            Snap(
-                inst.engine,
-                inst.session,
-                sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOP_K)),
-                sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOP_P)),
-                sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
-            )
+
+            val params = paramsFromModel(model)
+            Snap(inst.engine, inst.session, params)
         }
 
         tryCloseQuietly(snap.oldSession)
+
         val newSession = try {
-            buildSessionFromModel(snap.engine, snap.topK, snap.topP, snap.temperature)
+            buildSession(snap.engine, snap.params)
         } catch (e: Exception) {
             Log.e(TAG, "Session reset failed: ${e.message}", e)
             return false
@@ -245,17 +243,13 @@ object SLM {
                 return false
             }
             inst.session = newSession
+            inst.lastParams = snap.params
         }
         return true
     }
 
     /**
      * Completely cleans up the model's engine and session and disposes resources.
-     *
-     * Behavior:
-     * - If busy, attempts to cancel generation and synthesize cleanup.
-     * - Clears any pending cleanup listener.
-     * - Closes session and engine and clears [Model.instance].
      */
     @Synchronized
     fun cleanUp(model: Model, onDone: () -> Unit) {
@@ -264,52 +258,43 @@ object SLM {
             return
         }
 
-        if (inst.state.get() != RunState.IDLE) {
-            inst.session.cancelGenerateResponseAsync()
-            inst.state.set(RunState.IDLE)
-            cleanUpListeners.remove(keyOf(model))?.invoke()
-        } else {
-            cleanUpListeners.remove(keyOf(model))?.invoke()
+        cleanUpListeners.remove(keyOf(model))?.invoke()
+
+        runCatching {
+            if (inst.state.get() != RunState.IDLE) {
+                inst.session.cancelGenerateResponseAsync()
+            }
         }
+
+        inst.state.set(RunState.IDLE)
 
         model.instance = null
         tryCloseQuietly(inst.session)
         safeClose(inst.engine)
+
         onDone()
     }
 
     /**
      * Attempts to cancel the current generation for [model].
-     *
-     * Behavior:
-     * - If the instance is busy, switches state to [RunState.CANCELLING],
-     *   calls cancel on the session, and then marks state idle.
-     * - Synthesizes an onClean callback via the stored cleanup listener.
      */
     @Synchronized
     fun cancel(model: Model) {
         val inst = model.instance ?: return
-        if (inst.state.get() != RunState.IDLE) {
-            inst.state.set(RunState.CANCELLING)
-            runCatching { inst.session.cancelGenerateResponseAsync() }
-                .onFailure { Log.w(TAG, "cancelGenerateResponseAsync failed: ${it.message}") }
-            inst.state.set(RunState.IDLE)
-            cleanUpListeners.remove(keyOf(model))?.invoke()
-        }
+        if (inst.state.get() == RunState.IDLE) return
+
+        inst.state.set(RunState.CANCELLING)
+
+        runCatching { inst.session.cancelGenerateResponseAsync() }
+            .onFailure { Log.w(TAG, "cancelGenerateResponseAsync failed: ${it.message}") }
+
+        inst.state.set(RunState.IDLE)
+
+        cleanUpListeners.remove(keyOf(model))?.invoke()
     }
 
     /**
      * Launches an asynchronous inference for [model] with [input].
-     *
-     * Contract:
-     * - [listener] receives zero or more partial results and a final callback with done=true.
-     * - [onClean] is invoked exactly once per call when the session is considered clean
-     *   for this inference (either normal completion or cancellation).
-     *
-     * Error handling:
-     * - If the model is not initialized, [listener] is called with an error and done=true.
-     * - If starting generation throws, [listener] is called once with an error and done=true,
-     *   and [onClean] is invoked via the cleanup listener.
      */
     fun runInference(
         model: Model,
@@ -317,32 +302,45 @@ object SLM {
         listener: ResultListener,
         onClean: CleanUpListener
     ) {
-        val inst = model.instance ?: run {
+        val key = keyOf(model)
+        val once = AtomicBoolean(false)
+
+        fun fireClean(tag: String) {
+            if (once.compareAndSet(false, true)) {
+                Log.d(TAG, "onClean fired: $tag (model='${model.name}')")
+                model.instance?.state?.set(RunState.IDLE)
+                onClean()
+            }
+        }
+
+        val inst = synchronized(this) {
+            model.instance
+        } ?: run {
             listener("Model not initialized.", true)
             return
         }
 
-        if (!inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)) {
+        val acquired = inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)
+        if (!acquired) {
             cancel(model)
-            inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)
+            if (!inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)) {
+                listener("Model '${model.name}' is busy.", true)
+                fireClean("busy-refused")
+                return
+            }
         }
 
-        Log.d(TAG, "runInference called with model='${model.name}', input.length=${input.length}")
-
-        cleanUpListeners[keyOf(model)] = {
-            inst.state.set(RunState.IDLE)
-            onClean()
-        }
+        cleanUpListeners[key] = { fireClean("cleanup-listener") }
 
         val text = input.trim()
         if (text.isNotEmpty()) {
-            runCatching { inst.session.addQueryChunk(text) }
-                .onFailure {
-                    Log.e(TAG, "addQueryChunk failed: ${it.message}", it)
-                    listener(cleanError(it.message), true)
-                    cleanUpListeners.remove(keyOf(model))?.invoke()
-                    return
-                }
+            val desired = paramsFromModel(model)
+            val ok = addQueryChunkWithOneRetry(model, inst, desired, text)
+            if (!ok) {
+                listener("Failed to add query chunk.", true)
+                cleanUpListeners.remove(key)?.invoke()
+                return
+            }
         }
 
         try {
@@ -353,19 +351,20 @@ object SLM {
                     } else {
                         partial
                     }
+
                 Log.d(TAG, "partial[len=${partial.length}, done=$done]: $preview")
 
                 if (!done) {
                     listener(partial, false)
                 } else {
                     listener(partial, true)
-                    cleanUpListeners.remove(keyOf(model))?.invoke()
+                    cleanUpListeners.remove(key)?.invoke()
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "generateResponseAsync failed: ${e.message}", e)
             listener(cleanError(e.message), true)
-            cleanUpListeners.remove(keyOf(model))?.invoke()
+            cleanUpListeners.remove(key)?.invoke()
         }
     }
 
@@ -373,31 +372,107 @@ object SLM {
     /* Internal helpers                                                      */
     /* --------------------------------------------------------------------- */
 
-    private fun buildSessionFromModel(
+    /**
+     * Derive session parameters from [Model.config] with sanitization.
+     */
+    private fun paramsFromModel(model: Model): SessionParams {
+        val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOP_K))
+        val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOP_P))
+        val temp = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
+        return SessionParams(topK = topK, topP = topP, temperature = temp)
+    }
+
+    /**
+     * Build a new session from [engine] and [params].
+     */
+    private fun buildSession(
         engine: LlmInference,
-        topK: Int,
-        topP: Float,
-        temp: Float
+        params: SessionParams
     ): LlmInferenceSession =
         LlmInferenceSession.createFromOptions(
             engine,
             LlmInferenceSession.LlmInferenceSessionOptions.builder()
-                .setTopK(topK)
-                .setTopP(topP)
-                .setTemperature(temp)
+                .setTopK(params.topK)
+                .setTopP(params.topP)
+                .setTemperature(params.temperature)
                 .build()
         )
 
+    /**
+     * Try addQueryChunk; if it fails, rebuild the session once and retry.
+     */
+    private fun addQueryChunkWithOneRetry(
+        model: Model,
+        inst: LlmModelInstance,
+        desired: SessionParams,
+        text: String
+    ): Boolean {
+        fun tryAdd(): Boolean =
+            runCatching {
+                inst.session.addQueryChunk(text)
+                true
+            }.getOrElse { e ->
+                Log.w(TAG, "addQueryChunk failed: ${e.message}")
+                false
+            }
+
+        if (tryAdd()) return true
+
+        val rebuilt = synchronized(this) {
+            val current = model.instance ?: return@synchronized false
+            if (current.engine != inst.engine) return@synchronized false
+
+            val old = current.session
+            val newSession = runCatching { buildSession(current.engine, desired) }
+                .getOrElse {
+                    Log.e(TAG, "Session rebuild failed: ${it.message}", it)
+                    return@synchronized false
+                }
+
+            current.session = newSession
+            current.lastParams = desired
+
+            tryCloseQuietly(old)
+            true
+        }
+
+        if (!rebuilt) return false
+
+        return runCatching {
+            inst.session.addQueryChunk(text)
+            true
+        }.getOrElse { e ->
+            Log.e(TAG, "addQueryChunk retry failed: ${e.message}", e)
+            false
+        }
+    }
+
+    /**
+     * Sanitize TopK - must be >= 1.
+     */
     private fun sanitizeTopK(k: Int): Int = k.coerceAtLeast(1)
 
+    /**
+     * Sanitize TopP - must be in [0, 1].
+     */
     private fun sanitizeTopP(p: Float): Float =
         p.takeIf { it in 0f..1f } ?: DEFAULT_TOP_P
 
+    /**
+     * Sanitize Temperature - typical safe band [0, 2].
+     */
     private fun sanitizeTemperature(t: Float): Float =
         t.takeIf { it in 0f..2f } ?: DEFAULT_TEMPERATURE
 
-    private fun keyOf(model: Model): String = "${model.name}#${System.identityHashCode(model)}"
+    /**
+     * Build a stable identity key for per-model listeners.
+     */
+    private fun keyOf(model: Model): String =
+        "${model.name}#${System.identityHashCode(model)}"
 
+    /**
+     * Clean and compress error messages for UI.
+     */
     private fun cleanError(msg: String?): String =
         msg
             ?.replace("INTERNAL:", "")
@@ -406,6 +481,9 @@ object SLM {
             ?.takeIf { it.isNotEmpty() }
             ?: "Unknown error"
 
+    /**
+     * Try to cancel and close a session quietly.
+     */
     private fun tryCloseQuietly(session: LlmInferenceSession?) {
         runCatching {
             session?.cancelGenerateResponseAsync()
@@ -415,6 +493,9 @@ object SLM {
         }
     }
 
+    /**
+     * Close an engine quietly.
+     */
     private fun safeClose(engine: LlmInference?) {
         runCatching { engine?.close() }
             .onFailure { Log.w(TAG, "Engine close failed: ${it.message}") }
@@ -423,8 +504,6 @@ object SLM {
     private data class Snap(
         val engine: LlmInference,
         val oldSession: LlmInferenceSession,
-        val topK: Int,
-        val topP: Float,
-        val temperature: Float
+        val params: SessionParams
     )
 }

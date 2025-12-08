@@ -33,10 +33,11 @@ import androidx.lifecycle.viewModelScope
 import com.negi.survey.BuildConfig
 import com.negi.survey.utils.HeavyInitializer
 import java.io.File
-import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /* ───────────────────────────── Download State ───────────────────────────── */
@@ -118,7 +119,15 @@ class AppViewModel(
     /**
      * Exposes the current download state for observers.
      */
-    val state: StateFlow<DlState> = _state
+    val state: StateFlow<DlState> = _state.asStateFlow()
+
+    /**
+     * Basic guard to avoid launching redundant orchestration coroutines.
+     *
+     * HeavyInitializer is assumed to be single-flight internally, but this
+     * ViewModel-level guard reduces noisy parallel attempts and state churn.
+     */
+    private val inFlight = AtomicBoolean(false)
 
     /**
      * Ensures that the model file is available on disk.
@@ -145,25 +154,13 @@ class AppViewModel(
     ) {
         val app = appContext.applicationContext
 
-        /**
-         * Fast-path: if we are already in Done state with a valid file and we are not
-         * forcing refresh, do nothing.
-         */
+        // Fast-path: already done and not forcing refresh.
         val currentState = _state.value
         if (!forceFresh && currentState is DlState.Done && currentState.file.exists()) {
             return
         }
 
-        /**
-         * Best-effort pre-check for an existing model file.
-         *
-         * This is defensive because the exact persistence directory can vary:
-         * - older versions of the initializer
-         * - different build flavors
-         * - refactors that introduce a dedicated "models" directory
-         *
-         * If this guess is wrong, the initializer will still handle the real state.
-         */
+        // Best-effort pre-check for an existing model file.
         if (!forceFresh) {
             val safeName = suggestFileName(modelUrl, fileName)
             findExistingModelFile(app, safeName)?.let { existing ->
@@ -172,69 +169,82 @@ class AppViewModel(
             }
         }
 
+        // Prevent redundant orchestration launches.
+        if (!forceFresh && !inFlight.compareAndSet(false, true)) {
+            return
+        }
+        if (forceFresh && !inFlight.compareAndSet(false, true)) {
+            // Even for force refresh, avoid parallel refresh attempts.
+            return
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
-            val nowState = _state.value
-            if (!forceFresh && (nowState is DlState.Downloading || nowState is DlState.Done)) {
-                return@launch
-            }
-
-            val safeName = suggestFileName(modelUrl, fileName)
-            val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
-
-            _state.value = DlState.Downloading(downloaded = 0L, total = null)
-
-            /**
-             * Throttling state for progress-to-UI updates.
-             *
-             * The bridge emits when any of these are true:
-             * - time since last commit >= [uiThrottleMs]
-             * - bytes since last commit >= [uiMinDeltaBytes]
-             * - the download reaches total size
-             *
-             * This keeps UI smooth and avoids saturating the main thread.
-             */
-            var lastEmitNs = 0L
-            var lastBytes = 0L
-
-            val progressBridge: (Long, Long?) -> Unit = { got, total ->
-                val now = System.nanoTime()
-                val elapsedMs = (now - lastEmitNs) / 1_000_000L
-                val deltaBytes = got - lastBytes
-
-                val shouldEmit =
-                    elapsedMs >= uiThrottleMs ||
-                            deltaBytes >= uiMinDeltaBytes ||
-                            (total != null && got >= total)
-
-                if (shouldEmit) {
-                    lastEmitNs = now
-                    lastBytes = got
-                    _state.value = DlState.Downloading(got, total)
+            try {
+                val nowState = _state.value
+                if (!forceFresh && (nowState is DlState.Downloading || nowState is DlState.Done)) {
+                    return@launch
                 }
-            }
 
-            /**
-             * Heavy initializer contract:
-             * - Returns Result<File> representing the final local model.
-             * - Collapses concurrent calls across the app process.
-             * - May perform resume/integrity verification internally.
-             */
-            val result = HeavyInitializer.ensureInitialized(
-                context = app,
-                modelUrl = modelUrl,
-                hfToken = token,
-                fileName = safeName,
-                timeoutMs = timeoutMs,
-                forceFresh = forceFresh,
-                onProgress = progressBridge
-            )
+                val safeName = suggestFileName(modelUrl, fileName)
+                val token = BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
 
-            _state.value = result.fold(
-                onSuccess = { file -> DlState.Done(file) },
-                onFailure = { error ->
-                    DlState.Error(error.message ?: "Download failed")
+                _state.value = DlState.Downloading(downloaded = 0L, total = null)
+
+                /**
+                 * Throttling state for progress-to-UI updates.
+                 *
+                 * The bridge emits when any of these are true:
+                 * - time since last commit >= [uiThrottleMs]
+                 * - bytes since last commit >= [uiMinDeltaBytes]
+                 * - the download reaches total size
+                 *
+                 * This keeps UI smooth and avoids saturating the main thread.
+                 */
+                var lastEmitNs = System.nanoTime()
+                var lastBytes = 0L
+
+                val progressBridge: (Long, Long?) -> Unit = { got, total ->
+                    val now = System.nanoTime()
+                    val elapsedMs = (now - lastEmitNs) / 1_000_000L
+                    val deltaBytes = got - lastBytes
+
+                    val shouldEmit =
+                        elapsedMs >= uiThrottleMs ||
+                                deltaBytes >= uiMinDeltaBytes ||
+                                (total != null && got >= total)
+
+                    if (shouldEmit) {
+                        lastEmitNs = now
+                        lastBytes = got
+                        _state.value = DlState.Downloading(got, total)
+                    }
                 }
-            )
+
+                /**
+                 * Heavy initializer contract:
+                 * - Returns Result<File> representing the final local model.
+                 * - Collapses concurrent calls across the app process.
+                 * - May perform resume/integrity verification internally.
+                 */
+                val result = HeavyInitializer.ensureInitialized(
+                    context = app,
+                    modelUrl = modelUrl,
+                    hfToken = token,
+                    fileName = safeName,
+                    timeoutMs = timeoutMs,
+                    forceFresh = forceFresh,
+                    onProgress = progressBridge
+                )
+
+                _state.value = result.fold(
+                    onSuccess = { file -> DlState.Done(file) },
+                    onFailure = { error ->
+                        DlState.Error(error.message ?: "Download failed")
+                    }
+                )
+            } finally {
+                inFlight.set(false)
+            }
         }
     }
 
@@ -250,6 +260,7 @@ class AppViewModel(
         viewModelScope.launch {
             HeavyInitializer.cancel()
             _state.value = DlState.Error("Canceled by user")
+            inFlight.set(false)
         }
     }
 
@@ -265,6 +276,7 @@ class AppViewModel(
     fun resetForDebug() {
         HeavyInitializer.resetForDebug()
         _state.value = DlState.Idle
+        inFlight.set(false)
     }
 
     companion object {
@@ -390,10 +402,9 @@ class AppViewModel(
  * the model file is available locally.
  *
  * Design notes:
- * - [DlState.Idle] is intentionally rendered using the same layout as
- *   [DlState.Downloading] to avoid UI flicker during the short pre-flight window.
- * - A more elaborate app could render a distinct "checking cache" state,
- *   but the current abstraction keeps the state model lean.
+ * - [DlState.Idle] is rendered using a similar layout to downloading states
+ *   to avoid UI flicker during short pre-flight checks.
+ * - The UI deliberately avoids binding to transport details.
  */
 @Composable
 fun DownloadGate(
@@ -402,15 +413,27 @@ fun DownloadGate(
     content: @Composable (modelFile: File) -> Unit
 ) {
     when (state) {
-        is DlState.Idle,
-        is DlState.Downloading -> {
-            val (got, total) = when (state) {
-                is DlState.Downloading -> state.downloaded to state.total
-                else -> 0L to null
+        is DlState.Idle -> {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text("Checking local model cache…")
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
+        }
+
+        is DlState.Downloading -> {
+            val got = state.downloaded
+            val total = state.total
 
             val pct: Int? = total?.let { t ->
-                if (t > 0L) ((got * 100.0) / t.toDouble()).toInt() else null
+                if (t > 0L) ((got * 100.0) / t.toDouble()).toInt().coerceIn(0, 100) else null
             }
 
             Column(
@@ -422,23 +445,19 @@ fun DownloadGate(
                 Text("Downloading the target SLM…")
                 Spacer(Modifier.height(12.dp))
 
-                if (pct != null) {
+                if (pct != null && total != null) {
                     LinearProgressIndicator(
-                        progress = { (pct / 100f).coerceIn(0f, 1f) },
+                        progress = (pct / 100f).coerceIn(0f, 1f),
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = "$pct%  ($got / $total bytes)"
-                    )
+                    Text("$pct%  ($got / $total bytes)")
                 } else {
                     LinearProgressIndicator(
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = "$got bytes"
-                    )
+                    Text("$got bytes")
                 }
             }
         }

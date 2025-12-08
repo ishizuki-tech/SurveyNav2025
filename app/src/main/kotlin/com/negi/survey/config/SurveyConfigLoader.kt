@@ -19,6 +19,7 @@
  *   • JSON/YAML auto-detection with BOM and newline normalization
  *   • Config-level graph/SLM/model-defaults validation
  *   • Backward-compatible type aliases for legacy call sites
+ *   • Convenience loader APIs that validate on load
  * =====================================================================
  */
 
@@ -77,7 +78,7 @@ data class SurveyConfig(
     @Serializable
     data class Graph(
         val startId: String,
-        val nodes: List<NodeDTO>
+        val nodes: List<NodeDTO> = emptyList()
     )
 
     // ---------------------------------------------------------------------
@@ -154,16 +155,11 @@ data class SurveyConfig(
     data class ModelDefaults(
         /**
          * Default model URL for the download UI.
-         *
-         * Example:
-         * "https://huggingface.co/CraneAILabs/swahili-gemma-1b-litert/resolve/main/..."
          */
         @SerialName("default_model_url") val defaultModelUrl: String? = null,
 
         /**
          * Default file name to use when saving the model locally.
-         *
-         * Example: "swahili-gemma-1b-fp16.task"
          */
         @SerialName("default_file_name") val defaultFileName: String? = null,
 
@@ -198,13 +194,26 @@ data class SurveyConfig(
     fun validate(): List<String> {
         val issues = mutableListOf<String>()
 
-        val ids = graph.nodes.map { it.id }
-        val idSet = ids.toSet()
-
-        // --- startId sanity checks ---
+        // --- graph basic sanity ---
         if (graph.startId.isBlank()) {
             issues += "graph.startId is blank"
-        } else if (graph.startId !in idSet) {
+        }
+        if (graph.nodes.isEmpty()) {
+            issues += "graph.nodes is empty"
+            return issues
+        }
+
+        // --- node id sanity ---
+        val ids = graph.nodes.map { it.id }
+        val blankIds = ids.filter { it.isBlank() }.distinct()
+        if (blankIds.isNotEmpty()) {
+            issues += "graph.nodes contains blank id entries"
+        }
+
+        val idSet = ids.filter { it.isNotBlank() }.toSet()
+
+        // --- startId existence ---
+        if (graph.startId.isNotBlank() && graph.startId !in idSet) {
             issues += "graph.startId='${graph.startId}' not found in node ids: ${
                 idSet.joinToString(",")
             }"
@@ -212,6 +221,7 @@ data class SurveyConfig(
 
         // --- duplicate node id check ---
         val duplicateIds = ids
+            .filter { it.isNotBlank() }
             .groupingBy { it }
             .eachCount()
             .filterValues { it > 1 }
@@ -220,10 +230,31 @@ data class SurveyConfig(
             issues += "duplicate node ids: ${duplicateIds.joinToString(",")}"
         }
 
+        // --- node type sanity ---
+        val unknownTypes = graph.nodes
+            .filter { it.nodeType() == NodeType.UNKNOWN }
+            .map { it.id }
+            .filter { it.isNotBlank() }
+        if (unknownTypes.isNotEmpty()) {
+            issues += "nodes with unknown type: ${unknownTypes.joinToString(",")}"
+        }
+
+        // --- START node semantics (soft rules) ---
+        val startNode = graph.nodes.firstOrNull { it.id == graph.startId }
+        if (startNode != null && startNode.nodeType() != NodeType.START) {
+            issues += "graph.startId points to a non-START node (id='${startNode.id}', type='${startNode.type}')"
+        }
+
+        val explicitStarts = graph.nodes.count { it.nodeType() == NodeType.START }
+        if (explicitStarts > 1) {
+            issues += "multiple START nodes detected (count=$explicitStarts)"
+        }
+
         // --- prompt target existence check ---
         val unknownPromptTargets = prompts
             .asSequence()
             .map { it.nodeId }
+            .filter { it.isNotBlank() }
             .filter { it !in idSet }
             .distinct()
             .toList()
@@ -235,6 +266,7 @@ data class SurveyConfig(
 
         // --- prompt target duplication check ---
         val duplicatePromptTargets = prompts
+            .filter { it.nodeId.isNotBlank() }
             .groupingBy { it.nodeId }
             .eachCount()
             .filterValues { it > 1 }
@@ -262,6 +294,18 @@ data class SurveyConfig(
             .filter { it.nodeType() == NodeType.AI && it.question.isBlank() }
             .forEach {
                 issues += "AI node '${it.id}' has empty question"
+            }
+
+        // --- Choice nodes should have non-empty options ---
+        graph.nodes
+            .asSequence()
+            .filter {
+                val t = it.nodeType()
+                t == NodeType.SINGLE_CHOICE || t == NodeType.MULTI_CHOICE
+            }
+            .filter { it.options.isEmpty() }
+            .forEach {
+                issues += "Choice node '${it.id}' has empty options"
             }
 
         // --- SLM param sanity (optional, only if given) ---
@@ -323,6 +367,16 @@ data class SurveyConfig(
     }
 
     /**
+     * Validate and throw an [IllegalArgumentException] if issues are found.
+     */
+    fun requireValid() {
+        val issues = validate()
+        require(issues.isEmpty()) {
+            "SurveyConfig validation failed:\n- " + issues.joinToString("\n- ")
+        }
+    }
+
+    /**
      * Export the prompt table as JSON Lines.
      *
      * Each list element is a single JSON-encoded [Prompt] record.
@@ -367,38 +421,27 @@ data class SurveyConfig(
      * This function is side-effect free and can be called repeatedly.
      */
     fun composeSystemPrompt(): String {
-        fun String?.addTo(sb: StringBuilder) {
-            if (!this.isNullOrBlank()) {
-                if (sb.isNotEmpty()) {
-                    sb.appendLine()
-                }
-                sb.append(this)
-            }
-        }
-        return buildString {
-            slm.preamble.addTo(this)
-            slm.key_contract.addTo(this)
-            slm.length_budget.addTo(this)
-            slm.scoring_rule.addTo(this)
-            slm.strict_output.addTo(this)
-            slm.empty_json_instruction.addTo(this)
-        }
+        val parts = listOf(
+            slm.preamble,
+            slm.key_contract,
+            slm.length_budget,
+            slm.scoring_rule,
+            slm.strict_output,
+            slm.empty_json_instruction
+        ).filterNot { it.isNullOrBlank() }
+            .map { it!!.trim() }
+
+        return parts.joinToString("\n")
     }
 }
 
 /**
  * Backward-compatible alias for [SurveyConfig.Prompt].
- *
- * This alias allows older call sites to keep referring to [PromptEntry]
- * without changing imports immediately.
  */
 typealias PromptEntry = SurveyConfig.Prompt
 
 /**
  * Backward-compatible alias for [SurveyConfig.Graph].
- *
- * This alias allows older call sites to keep referring to [GraphConfig]
- * while the new type name is [SurveyConfig.Graph].
  */
 typealias GraphConfig = SurveyConfig.Graph
 
@@ -445,20 +488,33 @@ enum class NodeType {
         /**
          * Convert a raw string into a [NodeType].
          *
-         * @param raw Raw string from config (case-insensitive, trimmed).
-         * @return Matching [NodeType] value or [UNKNOWN] if no match is found.
+         * This parser is intentionally tolerant of real-world config variance:
+         * - case-insensitive
+         * - accepts snake_case, kebab-case, and compact/camel-like forms
          */
-        fun from(raw: String?): NodeType =
-            when (raw?.trim()?.uppercase()) {
+        fun from(raw: String?): NodeType {
+            val norm = raw
+                ?.trim()
+                ?.replace(Regex("""[\s_\-]+"""), "_")
+                ?.uppercase()
+                ?: return UNKNOWN
+
+            return when (norm) {
                 "START" -> START
                 "TEXT" -> TEXT
-                "SINGLE_CHOICE" -> SINGLE_CHOICE
-                "MULTI_CHOICE" -> MULTI_CHOICE
-                "AI" -> AI
+
+                "SINGLE_CHOICE", "SINGLECHOICE", "SINGLE_OPTION", "RADIO" ->
+                    SINGLE_CHOICE
+
+                "MULTI_CHOICE", "MULTICHOICE", "MULTI_OPTION", "CHECKBOX" ->
+                    MULTI_CHOICE
+
+                "AI", "LLM", "SLM" -> AI
                 "REVIEW" -> REVIEW
-                "DONE" -> DONE
+                "DONE", "FINISH", "FINAL" -> DONE
                 else -> UNKNOWN
             }
+        }
     }
 }
 
@@ -498,9 +554,6 @@ object SurveyConfigLoader {
 
     /**
      * Pretty-printing JSON instance used for human-friendly output.
-     *
-     * This is mainly intended for debugging, logging, and configuration
-     * inspection rather than production data interchange.
      */
     internal val jsonPretty: Json = Json {
         ignoreUnknownKeys = true
@@ -512,26 +565,18 @@ object SurveyConfigLoader {
      * Create a YAML serializer with a given strictness.
      *
      * When [strict] is false, unknown fields are ignored and defaults are
-     * not encoded (encodeDefaults=false). Decoding in [fromString] always
-     * uses strict=false to maximize compatibility with existing configs.
+     * not encoded (encodeDefaults=false).
      */
     internal fun yaml(strict: Boolean = false): Yaml =
         Yaml(
             configuration = YamlConfiguration(
                 encodeDefaults = false,
-                // Decoding side always uses strict=false via fromString.
                 strictMode = strict
             )
         )
 
     /**
      * Load [SurveyConfig] from an asset file.
-     *
-     * @param context Android context used to access the asset manager.
-     * @param fileName File name inside the assets folder.
-     * @param charset Character set used to read the file.
-     * @param format Desired config format or [ConfigFormat.AUTO] to sniff.
-     * @throws IllegalArgumentException if loading or parsing fails.
      */
     fun fromAssets(
         context: Context,
@@ -556,12 +601,18 @@ object SurveyConfigLoader {
         }
 
     /**
+     * Load [SurveyConfig] from an asset file and validate immediately.
+     */
+    fun fromAssetsValidated(
+        context: Context,
+        fileName: String,
+        charset: Charset = Charsets.UTF_8,
+        format: ConfigFormat = ConfigFormat.AUTO
+    ): SurveyConfig =
+        fromAssets(context, fileName, charset, format).also { it.requireValid() }
+
+    /**
      * Load [SurveyConfig] from a regular file on disk.
-     *
-     * @param path Path to the config file.
-     * @param charset Character set used to read the file.
-     * @param format Desired config format or [ConfigFormat.AUTO] to sniff.
-     * @throws IllegalArgumentException if the file does not exist or parsing fails.
      */
     fun fromFile(
         path: String,
@@ -587,6 +638,16 @@ object SurveyConfigLoader {
         }
 
     /**
+     * Load [SurveyConfig] from a file and validate immediately.
+     */
+    fun fromFileValidated(
+        path: String,
+        charset: Charset = Charsets.UTF_8,
+        format: ConfigFormat = ConfigFormat.AUTO
+    ): SurveyConfig =
+        fromFile(path, charset, format).also { it.requireValid() }
+
+    /**
      * Parse [SurveyConfig] from a raw string.
      *
      * The string is normalized (BOM removed, line endings unified, trailing
@@ -594,11 +655,6 @@ object SurveyConfigLoader {
      *  - [format] if it is not [ConfigFormat.AUTO]
      *  - file name hint (extension)
      *  - or content sniffing.
-     *
-     * @param text Raw text content of the config file.
-     * @param format Desired config format or [ConfigFormat.AUTO] to sniff.
-     * @param fileNameHint Optional file name used for extension-based sniffing.
-     * @throws IllegalArgumentException if parsing fails for any reason.
      */
     fun fromString(
         text: String,
@@ -641,12 +697,18 @@ object SurveyConfigLoader {
     }
 
     /**
+     * Parse [SurveyConfig] from a string and validate immediately.
+     */
+    fun fromStringValidated(
+        text: String,
+        format: ConfigFormat = ConfigFormat.AUTO,
+        fileNameHint: String? = null
+    ): SurveyConfig =
+        fromString(text, format, fileNameHint).also { it.requireValid() }
+
+    /**
      * Decide which [ConfigFormat] to use, based on the desired format,
      * file name extension, and optionally the content.
-     *
-     * @param desired Explicitly requested format.
-     * @param fileName File name for extension-based sniffing.
-     * @param text Optional raw content for content-based sniffing.
      */
     private fun pickFormat(
         desired: ConfigFormat,
@@ -658,22 +720,17 @@ object SurveyConfigLoader {
         }
 
         val lower = fileName?.lowercase().orEmpty()
-        if (lower.endsWith(".json")) {
-            return ConfigFormat.JSON
-        }
-        if (lower.endsWith(".yaml") || lower.endsWith(".yml")) {
-            return ConfigFormat.YAML
-        }
+        if (lower.endsWith(".json")) return ConfigFormat.JSON
+        if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return ConfigFormat.YAML
 
-        val sniff = text?.let(::sniffFormat)
-        return sniff ?: ConfigFormat.JSON
+        return text?.let(::sniffFormat) ?: ConfigFormat.JSON
     }
 
     /**
      * Quickly infer the format from the first non-empty line and leading
      * characters.
      *
-     * The heuristic is intentionally simple:
+     * Heuristic:
      *  - Leading '{' or '[' -> JSON
      *  - Leading '---', '- ' or typical "key: value" -> YAML
      *  - Otherwise fall back to JSON.
@@ -690,15 +747,9 @@ object SurveyConfigLoader {
             ?.trim()
             ?: ""
 
-        if (firstNonEmpty.startsWith("---")) {
-            return ConfigFormat.YAML
-        }
-        if (firstNonEmpty.startsWith("- ")) {
-            return ConfigFormat.YAML
-        }
-        if (":" in firstNonEmpty && !firstNonEmpty.startsWith("{")) {
-            return ConfigFormat.YAML
-        }
+        if (firstNonEmpty.startsWith("---")) return ConfigFormat.YAML
+        if (firstNonEmpty.startsWith("- ")) return ConfigFormat.YAML
+        if (":" in firstNonEmpty && !firstNonEmpty.startsWith("{")) return ConfigFormat.YAML
 
         return ConfigFormat.JSON
     }
@@ -719,17 +770,12 @@ object SurveyConfigLoader {
     /**
      * Return a short preview string for error messages.
      *
-     * Line breaks are escaped and the string is truncated to [max] characters
-     * so that stack traces remain readable and compact.
+     * Line breaks are escaped and the string is truncated to [max] characters.
      */
     private fun String.safePreview(max: Int = 200): String =
         this.replace("\n", "\\n")
             .replace("\r", "\\r")
-            .let { text ->
-                if (text.length <= max) {
-                    text
-                } else {
-                    text.substring(0, max) + "..."
-                }
+            .let { t ->
+                if (t.length <= max) t else t.take(max) + "..."
             }
 }

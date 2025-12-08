@@ -97,15 +97,42 @@ class SlmDirectRepository(
             "Respond with an empty JSON object: {}"
 
         private const val DEF_PREAMBLE =
-            "You are a well-known English survey expert. Read the Question and the Answer."
+            "You are a well-known farmer survey expert. Read the Question and the Answer."
+
+        /**
+         * Default key contract aligned with the current UI pipeline:
+         * - AiScreen preview/score extraction expects "follow-up question".
+         */
         private const val DEF_KEY_CONTRACT =
-            "OUTPUT FORMAT:\n- In English.\n- Keys: \"analysis\", \"expected answer\", \"follow-up questions\" (Exactly 3 in an array), \"score\" (int 1–100)."
+            "OUTPUT FORMAT:\n" +
+                    "- In English.\n" +
+                    "- Keys:\n" +
+                    "  • \"analysis\": short string\n" +
+                    "  • \"expected answer\": short string\n" +
+                    "  • \"follow-up question\": a single short confirm/validate question\n" +
+                    "  • \"score\": integer 1–100\n" +
+                    "FOLLOW-UP INTENT:\n" +
+                    "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
+                    "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
+                    "- Keep it single-scope and answerable immediately."
+
         private const val DEF_LENGTH_BUDGET =
-            "LENGTH LIMITS:\n- analysis<=60 chars; each follow-up<=80; expected answer<=40."
+            "LENGTH LIMITS:\n" +
+                    "- analysis<=80 chars\n" +
+                    "- expected answer<=60 chars\n" +
+                    "- follow-up question<=90 chars"
+
         private const val DEF_SCORING_RULE =
-            "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+            "SCORING RULE:\n" +
+                    "- Judge ONLY content relevance/completeness/accuracy.\n" +
+                    "- Do NOT penalize style or formatting."
+
         private const val DEF_STRICT_OUTPUT =
-            "STRICT OUTPUT (NO MARKDOWN):\n- RAW JSON only, ONE LINE.\n- Use COMPACT JSON (no spaces around ':' and ',').\n- No extra text.\n- Entire output<=512 chars."
+            "STRICT OUTPUT (NO MARKDOWN):\n" +
+                    "- RAW JSON only.\n" +
+                    "- No extra text.\n" +
+                    "- Prefer compact JSON.\n" +
+                    "- Entire output should be short and machine-parseable."
 
         // ---------- Concurrency / lifecycle ----------
 
@@ -114,6 +141,7 @@ class SlmDirectRepository(
 
         private const val CLEAN_WAIT_MS = 5_000L
         private const val CLEAN_STEP_MS = 500L
+
         private const val FINISH_WATCHDOG_DEFAULT_MS = 3_000L
         private const val FINISH_WATCHDOG_STEP_MS = 100L
         private const val FINISH_IDLE_GRACE_DEFAULT_MS = 250L
@@ -149,15 +177,15 @@ class SlmDirectRepository(
     override fun buildPrompt(userPrompt: String): String {
         val slm = config.slm
 
-        val userTurn  = slm.user_turn_prefix       ?: DEF_USER_TURN_PREFIX
-        val modelTurn = slm.model_turn_prefix      ?: DEF_MODEL_TURN_PREFIX
-        val turnEnd   = slm.turn_end               ?: DEF_TURN_END
+        val userTurn = slm.user_turn_prefix ?: DEF_USER_TURN_PREFIX
+        val modelTurn = slm.model_turn_prefix ?: DEF_MODEL_TURN_PREFIX
+        val turnEnd = slm.turn_end ?: DEF_TURN_END
         val emptyJson = slm.empty_json_instruction ?: DEF_EMPTY_JSON_INSTRUCTION
 
-        val preamble     = slm.preamble      ?: DEF_PREAMBLE
-        val keyContract  = slm.key_contract  ?: DEF_KEY_CONTRACT
+        val preamble = slm.preamble ?: DEF_PREAMBLE
+        val keyContract = slm.key_contract ?: DEF_KEY_CONTRACT
         val lengthBudget = slm.length_budget ?: DEF_LENGTH_BUDGET
-        val scoringRule  = slm.scoring_rule  ?: DEF_SCORING_RULE
+        val scoringRule = slm.scoring_rule ?: DEF_SCORING_RULE
         val strictOutput = slm.strict_output ?: DEF_STRICT_OUTPUT
 
         // User prompt body (or explicit fallback for "no content").
@@ -206,9 +234,10 @@ class SlmDirectRepository(
                 val anchorScope = CoroutineScope(coroutineContext + SupervisorJob())
 
                 // State flags shared between listener, watchdog, and awaitClose.
-                val closed       = AtomicBoolean(false)
+                val closed = AtomicBoolean(false)
                 val seenFinished = AtomicBoolean(false)
-                val seenOnClean  = AtomicBoolean(false)
+                val seenOnClean = AtomicBoolean(false)
+                val finishWatchdogStarted = AtomicBoolean(false)
 
                 fun isBusyNow(): Boolean =
                     runCatching { SLM.isBusy(model) }
@@ -217,17 +246,22 @@ class SlmDirectRepository(
                         }
                         .getOrElse { true } // fall back to "busy" on failures
 
-                fun safeClose(reason: String? = null) {
+                fun safeClose(reason: String? = null, cause: Throwable? = null) {
                     if (closed.compareAndSet(false, true)) {
                         if (!reason.isNullOrBlank()) {
-                            Log.d(TAG, "safeClose: $reason")
+                            if (cause != null) {
+                                Log.w(TAG, "safeClose: $reason", cause)
+                            } else {
+                                Log.d(TAG, "safeClose: $reason")
+                            }
                         }
-                        out.close()
+                        out.close(cause)
                     }
                 }
 
                 try {
 
+                    // Defensive pre-run cleanup.
                     SLM.cancel(model)
                     SLM.resetSession(model)
 
@@ -248,6 +282,12 @@ class SlmDirectRepository(
 
                             if (finished) {
                                 seenFinished.set(true)
+
+                                // Ensure watchdog/idle-grace logic is started only once.
+                                if (!finishWatchdogStarted.compareAndSet(false, true)) {
+                                    return@runInference
+                                }
+
                                 Log.d(TAG, "SLM inference finished (model='${model.name}')")
 
                                 anchorScope.launch {
@@ -257,13 +297,13 @@ class SlmDirectRepository(
                                     //  (c) watchdog timeout is reached.
                                     val ok = withTimeoutOrNull(FINISH_WATCHDOG_MS) {
                                         var idleSince = -1L
+
                                         while (isActive &&
                                             !closed.get() &&
                                             !seenOnClean.get()
                                         ) {
                                             val busy = isBusyNow()
-                                            val now =
-                                                android.os.SystemClock.elapsedRealtime()
+                                            val now = android.os.SystemClock.elapsedRealtime()
 
                                             if (!busy) {
                                                 if (idleSince < 0) {
@@ -282,19 +322,15 @@ class SlmDirectRepository(
                                                 idleSince = -1L
                                             }
 
-                                            kotlinx.coroutines.delay(
-                                                FINISH_WATCHDOG_STEP_MS
-                                            )
+                                            kotlinx.coroutines.delay(FINISH_WATCHDOG_STEP_MS)
                                         }
                                         true
                                     } != null
 
                                     if (!closed.get() && !seenOnClean.get()) {
                                         if (ok) {
-                                            // Idle-grace path.
                                             safeClose("finished-idle-grace")
                                         } else {
-                                            // Watchdog timeout without onClean.
                                             Log.w(
                                                 TAG,
                                                 "finish watchdog: onClean not observed " +
@@ -315,14 +351,14 @@ class SlmDirectRepository(
                 } catch (t: Throwable) {
                     Log.e(TAG, "SLM.runInference threw: ${t.message}", t)
 
-                    // Close the producer side quickly so collectors can unblock.
-                    safeClose("exception")
+                    // Close producer with a cause so collectors can observe failure.
+                    safeClose("exception", t)
 
                     // Engine-level cleanup.
-                    SLM.cancel(model)
-                    SLM.resetSession(model)
+                    runCatching { SLM.cancel(model) }
+                    runCatching { SLM.resetSession(model) }
 
-                    // Propagate as cancellation upstream.
+                    // Cancel the producer coroutine to stop any further work.
                     cancel(CancellationException("SLM.runInference threw", t))
                 }
 
@@ -346,6 +382,7 @@ class SlmDirectRepository(
                             android.os.SystemClock.sleep(CLEAN_STEP_MS)
                             loops++
                         }
+
                         Log.d(
                             TAG,
                             "awaitClose: waitCleanOrIdle[$tag] done (loops=$loops, " +

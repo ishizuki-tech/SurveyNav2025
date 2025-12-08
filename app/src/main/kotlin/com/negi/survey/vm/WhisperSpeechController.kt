@@ -43,6 +43,7 @@ import com.negi.whispers.recorder.Recorder
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -208,10 +209,15 @@ class WhisperSpeechController(
     // ---------------------------------------------------------------------
 
     /**
+     * Raw language code passed from callers.
+     */
+    private val languageCodeRaw: String = languageCode
+
+    /**
      * Normalized language code for Whisper calls.
      */
     private val normalizedLanguage: String =
-        languageCode.trim().lowercase().ifBlank { DEFAULT_LANGUAGE }
+        languageCodeRaw.trim().lowercase(Locale.ROOT).ifBlank { DEFAULT_LANGUAGE }
 
     // ---------------------------------------------------------------------
     // Optional context setter
@@ -248,30 +254,19 @@ class WhisperSpeechController(
         _error.value = null
         _partialText.value = ""
 
-        /**
-         * Optimistically set state for immediate UI feedback.
-         */
         _isRecording.value = true
 
-        /**
-         * Cancel any in-flight worker (e.g., pending transcription).
-         */
         workerJob?.cancel()
+        workerJob = null
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
             recordingMutex.withLock {
                 try {
                     ensureActive()
 
-                    /**
-                     * Ensure the model is loaded once.
-                     */
                     ensureModelInitializedFromAssetsOnce()
                     ensureActive()
 
-                    /**
-                     * Prepare output WAV file.
-                     */
                     val dir = File(appContext.cacheDir, "whisper_rec")
                     if (!dir.exists() && !dir.mkdirs()) {
                         throw IllegalStateException("Failed to create cache dir: ${dir.path}")
@@ -312,24 +307,16 @@ class WhisperSpeechController(
 
         Log.d(TAG, "stopRecording: requested")
 
-        /**
-         * Flip state immediately for UI.
-         */
         _isRecording.value = false
 
-        /**
-         * Cancel any in-flight worker (e.g., start phase still running).
-         */
         workerJob?.cancel()
+        workerJob = null
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
             recordingMutex.withLock {
                 var localWav: File? = null
 
                 try {
-                    /**
-                     * Finalize WAV file.
-                     */
                     Log.d(TAG, "stopRecording: awaiting recorder.stopRecording()")
                     runCatching { recorder.stopRecording() }
                         .onFailure { e ->
@@ -340,10 +327,6 @@ class WhisperSpeechController(
                     outputFile = null
                     localWav = wav
 
-                    /**
-                     * If the user stops immediately after start, the WAV may not exist yet.
-                     * Treat this as a normal cancellation rather than an error.
-                     */
                     if (wav == null) {
                         Log.d(TAG, "stopRecording: no WAV yet (likely quick cancel)")
                         return@withLock
@@ -358,9 +341,6 @@ class WhisperSpeechController(
                         return@withLock
                     }
 
-                    /**
-                     * Export WAV for later upload (best-effort).
-                     */
                     val exported = exportRecordedVoiceSafely(wav)
                     if (exported != null) {
                         val checksum = runCatching { computeSha256(exported) }
@@ -388,9 +368,6 @@ class WhisperSpeechController(
                         Log.w(TAG, "stopRecording: export skipped or failed")
                     }
 
-                    /**
-                     * Run Whisper transcription.
-                     */
                     _isTranscribing.value = true
                     Log.d(TAG, "stopRecording: transcribing -> ${wav.path}")
 
@@ -424,9 +401,6 @@ class WhisperSpeechController(
                 } finally {
                     _isTranscribing.value = false
 
-                    /**
-                     * Best-effort cleanup of temporary cache WAV.
-                     */
                     runCatching {
                         localWav?.let { tmp ->
                             if (tmp.exists()) {
@@ -497,9 +471,6 @@ class WhisperSpeechController(
 
     /**
      * Export the recorded WAV to persistent storage.
-     *
-     * This method matches the current ExportUtils signature:
-     * `exportRecordedVoice(context, source, surveyId, questionId): File`
      */
     private suspend fun exportRecordedVoiceSafely(wav: File): File? =
         withContext(Dispatchers.IO) {
