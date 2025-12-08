@@ -25,22 +25,26 @@
  *  Notes:
  *   • JSON is built manually with a small escaper to keep dependencies light.
  *   • Newlines are not preprocessed; escapeJson() handles them correctly.
- *   • JSON payload now includes:
+ *   • JSON payload includes:
+ *       - "survey_id": UUID for the current survey run.
+ *       - "exported_at": local timestamp string.
  *       - "answers": question/answer pairs with optional "audio" array.
- *       - "voice_files": array with objects:
- *           {
- *             "file": "...wav",
- *             "survey_id": "...",
- *             "question_id": "...",
- *             "question": "...",
- *             "answer": "..."
- *           }
+ *       - "followups": follow-up question/answer pairs.
+ *       - "voice_files": flat array of audio mappings for ingestion pipelines.
+ *
+ *  Key design rule:
+ *   • JSON must be built from SurveyViewModel.recordedAudioRefs (logical manifest),
+ *     not from file system scans, so repeated JSON exports remain stable even if
+ *     WAV files were already uploaded and deleted.
  * =====================================================================
  */
+
+@file:Suppress("MemberVisibilityCanBePrivate", "unused")
 
 package com.negi.survey.screens
 
 import android.content.ContentValues
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -57,8 +61,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -72,6 +76,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -79,28 +84,33 @@ import androidx.compose.ui.unit.dp
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.utils.ExportUtils
+import com.negi.survey.utils.buildSurveyFileName
+import com.negi.survey.vm.Node
 import com.negi.survey.vm.SurveyViewModel
 import java.io.File
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
+
+private const val REMOTE_VOICE_DIR = "voice"
 
 /**
  * Final survey screen that summarizes all collected answers and follow-ups.
  *
  * Responsibilities:
- *  - Read the current questions, answers, and follow-ups from [SurveyViewModel].
- *  - Render a human-readable summary of the interview session.
- *  - Build a JSON export payload covering answers + follow-ups + voice files.
- *  - Provide optional GitHub upload and deferred upload via WorkManager.
- *  - Optionally auto-save the JSON to device storage on first composition.
- *  - Show and upload recorded voice WAV files exported via [ExportUtils].
+ * - Read the current questions, answers, follow-ups, and audio refs from [SurveyViewModel].
+ * - Render a human-readable summary of the interview session.
+ * - Build a JSON export payload covering answers + follow-ups + audio references.
+ * - Provide optional GitHub upload and deferred upload via WorkManager.
+ * - Optionally auto-save the JSON to device storage on first composition.
+ * - Upload WAV files that physically exist under exports/voice for this run.
  *
- * The screen is UI-only: it does not mutate the survey graph and only calls
- * back through [onRestart] when the user wants to restart the flow.
+ * The key design rule:
+ * - JSON must be built from the logical audio manifest in the ViewModel,
+ *   not from file system scans.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -114,52 +124,144 @@ fun DoneScreen(
     val answers by vm.answers.collectAsState(initial = emptyMap())
     val followups by vm.followups.collectAsState(initial = emptyMap())
 
+    /**
+     * Keep collecting this StateFlow so recomposition is triggered when
+     * logical audio refs change.
+     */
+    val recordedAudioRefs by vm.recordedAudioRefs.collectAsState(initial = emptyMap())
+
+    /** Stable UUID for the active survey run (single source of truth). */
+    val surveyUuid by vm.surveyUuid.collectAsState()
+
+    /**
+     * Stable export timestamp for this DoneScreen session.
+     *
+     * This prevents accidental "new file name per click" within the same
+     * completion screen.
+     */
+    val exportedAtStamp = remember(surveyUuid) {
+        val fmt = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
+        fmt.format(Date())
+    }
+
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    val uploading = remember { mutableStateOf(false) }
+    var uploading by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
     /**
-     * Snapshot of exported voice files and their metadata so the UI can show
-     * them and refresh the list after uploads.
+     * Audio refs that belong to the active survey run.
+     *
+     * The ViewModel is the logical source of truth for audio references.
      */
-    val voiceFilesState = remember { mutableStateOf<List<VoiceFileInfo>>(emptyList()) }
+    val audioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
+        vm.getAudioRefsForRun(surveyUuid)
+    }
 
-    // Scan voice files (and their meta JSON) once when the screen is first composed.
-    LaunchedEffect(Unit) {
+    /**
+     * Flattened audio refs for the active run.
+     *
+     * Keep the ordering stable and semantically meaningful.
+     * The ViewModel already sorts by createdAt; we preserve that ordering.
+     */
+    val flatAudioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
+        vm.getAudioRefsForRunFlat(surveyUuid)
+    }
+
+    /**
+     * File name set that should be present for this run.
+     *
+     * This is used to select physical WAV files for upload.
+     */
+    val expectedVoiceFileNames = remember(flatAudioRefsForRun) {
+        flatAudioRefsForRun.map { it.fileName }.toSet()
+    }
+
+    /**
+     * Physical WAV files currently present on the device for this run.
+     *
+     * We only include files that are referenced by the ViewModel manifest.
+     */
+    val voiceFilesState = remember(surveyUuid) {
+        mutableStateOf<List<File>>(emptyList())
+    }
+
+    LaunchedEffect(expectedVoiceFileNames, surveyUuid) {
         val files = withContext(Dispatchers.IO) {
-            scanVoiceFiles(context)
+            scanVoiceFilesByNames(context, expectedVoiceFileNames)
         }
         voiceFilesState.value = files
     }
 
-    val voiceFiles = voiceFilesState.value
+    val voiceFilesForRun = voiceFilesState.value
+
+    /**
+     * A lightweight snapshot of the runtime node map.
+     *
+     * This allows us to fall back to config-defined question texts
+     * when the questions StateFlow hasn't stored them.
+     */
+    val nodesSnapshot: Map<String, Node> = remember(vm) { vm.nodes }
+
+    /**
+     * Build the union of keys to avoid dropping answers/audio-only nodes.
+     */
+    val answerOwnerIds = remember(questions, answers, audioRefsForRun) {
+        val ids = linkedSetOf<String>()
+        ids.addAll(questions.keys)
+        ids.addAll(answers.keys)
+        ids.addAll(audioRefsForRun.keys)
+        ids.toList().sorted()
+    }
 
     /**
      * Build a compact JSON export representing:
+     *  - "survey_id": UUID for the current run.
+     *  - "exported_at": timestamp for this export.
      *  - "answers": per-node question/answer pairs (+ optional "audio" array).
      *  - "followups": per-node arrays of follow-up question/answer pairs.
-     *  - "voice_files": objects containing file + survey/question mapping.
+     *  - "voice_files": a flat array for ingestion pipelines.
+     *
+     * IMPORTANT:
+     *  - The audio lists are derived from ViewModel audio refs,
+     *    NOT from the file system.
      */
-    val jsonText = remember(questions, answers, followups, voiceFiles) {
-        // Pre-compute mapping from questionId to a list of voice files.
-        val voiceByQuestionId: Map<String, List<VoiceFileInfo>> =
-            voiceFiles
-                .mapNotNull { info ->
-                    val qId = info.questionId ?: return@mapNotNull null
-                    qId to info
-                }
-                .groupBy({ it.first }, { it.second })
+    val jsonText = remember(
+        questions,
+        answers,
+        followups,
+        audioRefsForRun,
+        flatAudioRefsForRun,
+        surveyUuid,
+        exportedAtStamp,
+        answerOwnerIds
+    ) {
+        val sortedFollowups = followups.toSortedMap()
 
         buildString {
             append("{\n")
 
+            // survey_id + exported_at
+            append("  \"survey_id\": \"")
+                .append(escapeJson(surveyUuid))
+                .append("\",\n")
+            append("  \"exported_at\": \"")
+                .append(escapeJson(exportedAtStamp))
+                .append("\",\n")
+
             // answers with optional audio array
             append("  \"answers\": {\n")
-            val qEntries = questions.entries.toList()
-            qEntries.forEachIndexed { idx, (id, q) ->
+            answerOwnerIds.forEachIndexed { idx, id ->
+                val q = questions[id]
+                    ?: nodesSnapshot[id]?.question
+                    ?: ""
                 val a = answers[id].orEmpty()
-                val audioList = voiceByQuestionId[id].orEmpty()
+
+                /**
+                 * Preserve ViewModel-provided ordering.
+                 * Do not re-sort locally to avoid contradicting VM intent.
+                 */
+                val audioList = audioRefsForRun[id].orEmpty()
 
                 append("    \"")
                     .append(escapeJson(id))
@@ -174,9 +276,9 @@ fun DoneScreen(
                 if (audioList.isNotEmpty()) {
                     append(",\n")
                     append("      \"audio\": [\n")
-                    audioList.forEachIndexed { j, info ->
+                    audioList.forEachIndexed { j, ref ->
                         append("        { \"file\": \"")
-                            .append(escapeJson(info.file.name))
+                            .append(escapeJson(ref.fileName))
                             .append("\" }")
                         if (j != audioList.lastIndex) append(",")
                         append("\n")
@@ -187,14 +289,14 @@ fun DoneScreen(
                 }
 
                 append("    }")
-                if (idx != qEntries.lastIndex) append(",")
+                if (idx != answerOwnerIds.lastIndex) append(",")
                 append("\n")
             }
             append("  },\n")
 
             // followups
             append("  \"followups\": {\n")
-            val fEntries = followups.entries.toList()
+            val fEntries = sortedFollowups.entries.toList()
             fEntries.forEachIndexed { i, (ownerId, list) ->
                 append("    \"").append(escapeJson(ownerId)).append("\": [\n")
                 list.forEachIndexed { j, fu ->
@@ -213,34 +315,25 @@ fun DoneScreen(
             }
             append("  },\n")
 
-            // voice_files with question/answer attached.
+            // voice_files flat list view for ingestion pipelines
             append("  \"voice_files\": [\n")
-            voiceFiles.forEachIndexed { idx, info ->
-                val qId = info.questionId
-                val questionText = qId?.let { questions[it] }.orEmpty()
-                val answerText = qId?.let { answers[it] }.orEmpty()
+            flatAudioRefsForRun.forEachIndexed { idx, ref ->
+                val qId = ref.questionId
+                val questionText = questions[qId]
+                    ?: nodesSnapshot[qId]?.question
+                    ?: ""
+                val answerText = answers[qId].orEmpty()
 
                 append("    {\n")
                 append("      \"file\": \"")
-                    .append(escapeJson(info.file.name))
+                    .append(escapeJson(ref.fileName))
                     .append("\",\n")
-
-                info.surveyId
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let {
-                        append("      \"survey_id\": \"")
-                            .append(escapeJson(it))
-                            .append("\",\n")
-                    }
-
-                qId
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let {
-                        append("      \"question_id\": \"")
-                            .append(escapeJson(it))
-                            .append("\",\n")
-                    }
-
+                append("      \"survey_id\": \"")
+                    .append(escapeJson(surveyUuid))
+                    .append("\",\n")
+                append("      \"question_id\": \"")
+                    .append(escapeJson(qId))
+                    .append("\",\n")
                 append("      \"question\": \"")
                     .append(escapeJson(questionText))
                     .append("\",\n")
@@ -248,7 +341,7 @@ fun DoneScreen(
                     .append(escapeJson(answerText))
                     .append("\"\n")
                 append("    }")
-                if (idx != voiceFiles.lastIndex) append(",")
+                if (idx != flatAudioRefsForRun.lastIndex) append(",")
                 append("\n")
             }
             append("  ]\n")
@@ -257,11 +350,18 @@ fun DoneScreen(
         }
     }
 
-    // Auto-save JSON once if requested.
-    val autoSavedOnce = remember { mutableStateOf(false) }
-    LaunchedEffect(autoSaveToDevice, jsonText) {
+    /**
+     * Auto-save JSON once per survey UUID if requested.
+     */
+    val autoSavedOnce = remember(surveyUuid) { mutableStateOf(false) }
+
+    LaunchedEffect(autoSaveToDevice, jsonText, surveyUuid) {
         if (autoSaveToDevice && !autoSavedOnce.value) {
-            val fileName = buildSurveyFileName()
+            val fileName = buildSurveyFileName(
+                surveyId = surveyUuid,
+                prefix = "survey",
+                stamp = exportedAtStamp
+            )
             runCatching {
                 val result = withContext(Dispatchers.IO) {
                     saveJsonAutomatically(
@@ -294,16 +394,28 @@ fun DoneScreen(
                 text = "Thanks! Here is your response summary.",
                 style = MaterialTheme.typography.bodyLarge
             )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Survey ID: $surveyUuid",
+                style = MaterialTheme.typography.labelLarge
+            )
+
             Spacer(Modifier.height(16.dp))
 
             // Answers section.
             Text("■ Answers", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            if (questions.isEmpty()) {
+
+            if (answerOwnerIds.isEmpty()) {
                 Text("No answers yet.", style = MaterialTheme.typography.bodyMedium)
             } else {
-                questions.forEach { (id, q) ->
+                answerOwnerIds.forEach { id ->
+                    val q = questions[id]
+                        ?: nodesSnapshot[id]?.question
+                        ?: "(unknown question)"
                     val a = answers[id].orEmpty()
+                    val audioCount = audioRefsForRun[id].orEmpty().size
+
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -315,8 +427,15 @@ fun DoneScreen(
                             text = "A: ${if (a.isBlank()) "(empty)" else a}",
                             style = MaterialTheme.typography.bodyLarge
                         )
+                        if (audioCount > 0) {
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text = "Audio: $audioCount file(s)",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
                     }
-                    Divider()
+                    HorizontalDivider()
                 }
             }
 
@@ -325,10 +444,11 @@ fun DoneScreen(
             // Follow-ups section.
             Text("■ Follow-ups", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
+
             if (followups.isEmpty()) {
                 Text("No follow-ups.", style = MaterialTheme.typography.bodyMedium)
             } else {
-                followups.forEach { (ownerId, list) ->
+                followups.toSortedMap().forEach { (ownerId, list) ->
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -355,38 +475,42 @@ fun DoneScreen(
                             Spacer(Modifier.height(6.dp))
                         }
                     }
-                    Divider()
+                    HorizontalDivider()
                 }
             }
 
             Spacer(Modifier.height(20.dp))
 
-            // Recorded voice section.
+            // Recorded voice section (logical + physical).
             Text("■ Recorded voice files", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            if (voiceFiles.isEmpty()) {
+
+            if (flatAudioRefsForRun.isEmpty()) {
                 Text(
-                    text = "No voice recordings exported.",
+                    text = "No voice recordings registered for this survey run.",
                     style = MaterialTheme.typography.bodyMedium
                 )
             } else {
                 Text(
-                    text = "${voiceFiles.size} file(s) in exports/voice (pending upload).",
+                    text = "Manifest: ${flatAudioRefsForRun.size} reference(s).",
                     style = MaterialTheme.typography.bodyMedium
                 )
-                Spacer(Modifier.height(4.dp))
-                voiceFiles.take(3).forEach { info ->
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "On device now: ${voiceFilesForRun.size} file(s).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+
+                Spacer(Modifier.height(6.dp))
+                flatAudioRefsForRun.take(8).forEach { ref ->
                     Text(
-                        text = "• ${info.file.name}",
+                        text = "• ${ref.fileName}  (q=${ref.questionId})",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
-                if (voiceFiles.size > 3) {
+                if (flatAudioRefsForRun.size > 8) {
                     Spacer(Modifier.height(2.dp))
-                    Text(
-                        text = "… and more",
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Text("… and more", style = MaterialTheme.typography.bodySmall)
                 }
             }
 
@@ -401,15 +525,19 @@ fun DoneScreen(
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
-                            if (uploading.value) return@Button
+                            if (uploading) return@Button
                             scope.launch {
-                                uploading.value = true
+                                uploading = true
                                 try {
                                     val cfg = gitHubConfig
 
                                     val (jsonResult, uploadedVoices) =
                                         withContext(Dispatchers.IO) {
-                                            val fileName = buildSurveyFileName()
+                                            val fileName = buildSurveyFileName(
+                                                surveyId = surveyUuid,
+                                                prefix = "survey",
+                                                stamp = exportedAtStamp
+                                            )
 
                                             // 1) Upload JSON summary.
                                             val jsonRes = GitHubUploader.uploadJson(
@@ -419,19 +547,25 @@ fun DoneScreen(
                                                 message = "Upload $fileName"
                                             )
 
-                                            // 2) Scan voice files again to get a fresh list.
-                                            val currentVoiceFiles = scanVoiceFiles(context)
+                                            // 2) Upload WAV files that are both:
+                                            //    - referenced by the VM manifest
+                                            //    - physically present on device
+                                            val currentVoiceFiles =
+                                                scanVoiceFilesByNames(context, expectedVoiceFileNames)
 
                                             var voiceCount = 0
-                                            currentVoiceFiles.forEach { info ->
-                                                val file = info.file
+                                            currentVoiceFiles.forEach { file ->
                                                 val bytes = file.readBytes()
+
+                                                // Keep remote structure aligned with local exports/voice.
                                                 GitHubUploader.uploadFile(
                                                     cfg = cfg,
-                                                    relativePath = file.name,
+                                                    relativePath = "$REMOTE_VOICE_DIR/${file.name}",
                                                     bytes = bytes,
                                                     message = "Upload ${file.name}"
                                                 )
+
+                                                runCatching { deleteVoiceSidecars(file) }
                                                 runCatching { file.delete() }
                                                 voiceCount++
                                             }
@@ -441,6 +575,7 @@ fun DoneScreen(
 
                                     val label =
                                         jsonResult.fileUrl ?: jsonResult.commitSha ?: "(no URL)"
+
                                     if (uploadedVoices > 0) {
                                         snackbar.showOnce(
                                             "Uploaded JSON + $uploadedVoices voice file(s): $label"
@@ -449,59 +584,72 @@ fun DoneScreen(
                                         snackbar.showOnce("Uploaded JSON: $label")
                                     }
 
-                                    // Refresh voice file list after deletion.
+                                    // Refresh physical list after deletion.
                                     val remaining = withContext(Dispatchers.IO) {
-                                        scanVoiceFiles(context)
+                                        scanVoiceFilesByNames(context, expectedVoiceFileNames)
                                     }
                                     voiceFilesState.value = remaining
                                 } catch (e: Exception) {
                                     snackbar.showOnce("Upload failed: ${e.message}")
                                 } finally {
-                                    uploading.value = false
+                                    uploading = false
                                 }
                             }
                         },
-                        enabled = !uploading.value
+                        enabled = !uploading
                     ) {
-                        Text(if (uploading.value) "Uploading..." else "Upload now")
+                        Text(if (uploading) "Uploading..." else "Upload now")
                     }
                 }
 
-                // Deferred GitHub upload for JSON via WorkManager.
+                // Deferred GitHub upload for JSON + voice via WorkManager.
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
-                            val fileName = buildSurveyFileName()
+                            val fileName = buildSurveyFileName(
+                                surveyId = surveyUuid,
+                                prefix = "survey",
+                                stamp = exportedAtStamp
+                            )
+
                             GitHubUploadWorker.enqueue(
                                 context = context,
                                 cfg = gitHubConfig,
                                 fileName = fileName,
                                 jsonContent = jsonText
                             )
+
                             scope.launch {
                                 snackbar.showOnce(
                                     "Upload scheduled (JSON, will run when online)."
                                 )
                             }
-                            if (voiceFiles.isEmpty()) {
+
+                            val wavsToSchedule = voiceFilesForRun
+                            if (wavsToSchedule.isEmpty()) {
                                 scope.launch {
-                                    snackbar.showOnce("No voice recordings to upload.")
+                                    snackbar.showOnce("No voice recordings on device to upload.")
                                 }
                             } else {
-                                voiceFiles.forEach { info ->
+                                /**
+                                 * We schedule only existing files that are referenced
+                                 * by the current run's logical manifest.
+                                 */
+                                wavsToSchedule.forEach { file ->
                                     GitHubUploadWorker.enqueueExistingPayload(
                                         context = context,
                                         cfg = gitHubConfig,
-                                        file = info.file
+                                        file = file
                                     )
                                 }
                                 scope.launch {
                                     snackbar.showOnce(
-                                        "Upload scheduled (${voiceFiles.size} voice file(s))."
+                                        "Upload scheduled (${wavsToSchedule.size} voice file(s))."
                                     )
                                 }
                             }
-                        }
+                        },
+                        enabled = !uploading
                     ) {
                         Text("Upload later")
                     }
@@ -516,103 +664,66 @@ fun DoneScreen(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Button(onClick = onRestart) {
+                Button(onClick = onRestart, enabled = !uploading) {
                     Text("Restart")
                 }
             }
-
-            Spacer(Modifier.height(12.dp))
-
-            LaunchedEffect(Unit) {
-                snackbar.showOnce("Thank you for your responses")
-            }
         }
+    }
+
+    /**
+     * Friendly completion snackbar for this run.
+     */
+    LaunchedEffect(surveyUuid) {
+        snackbar.showOnce("Thank you for your responses")
     }
 }
 
 /* ============================================================
- * File name helper
+ * Voice scan helpers (physical files)
  * ============================================================ */
 
 /**
- * Build a human-friendly survey file name such as:
- * "survey_2025-11-15_14-32-08.json".
- */
-private fun buildSurveyFileName(prefix: String = "survey"): String {
-    val now = LocalDateTime.now()
-    val stamp = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
-    return "${prefix}_${stamp}.json"
-}
-
-/* ============================================================
- * Voice scan helpers
- * ============================================================ */
-
-/**
- * UI-facing voice file description used by DoneScreen.
+ * Scan exported voice WAV files under exports/voice and return only files whose
+ * names are included in [expectedNames].
  *
- * - [file] is the actual WAV file under exports/voice.
- * - [surveyId] and [questionId] come from the sidecar meta JSON if present.
+ * This ensures we upload only files referenced by the ViewModel manifest,
+ * avoiding accidental uploads of leftovers from other runs.
  */
-private data class VoiceFileInfo(
-    val file: File,
-    val surveyId: String?,
-    val questionId: String?
-)
+private fun scanVoiceFilesByNames(
+    context: Context,
+    expectedNames: Set<String>
+): List<File> {
+    if (expectedNames.isEmpty()) return emptyList()
 
-/**
- * Internal representation of voice meta loaded from the sidecar JSON.
- */
-private data class VoiceMeta(
-    val surveyId: String?,
-    val questionId: String?
-)
-
-/**
- * Scan exported voice WAV files under exports/voice and attach metadata
- * from their sidecar .meta.json files when available.
- */
-private fun scanVoiceFiles(context: android.content.Context): List<VoiceFileInfo> {
     val voiceDir = ExportUtils.getVoiceExportDir(context)
     if (!voiceDir.exists() || !voiceDir.isDirectory) return emptyList()
 
     val wavFiles = voiceDir.listFiles { f ->
         f.isFile &&
                 !f.name.startsWith(".") &&
-                f.name.lowercase().endsWith(".wav")
+                f.name.lowercase().endsWith(".wav") &&
+                expectedNames.contains(f.name)
     } ?: return emptyList()
 
-    return wavFiles
-        .map { wav ->
-            val meta = loadVoiceMeta(voiceDir, wav)
-            VoiceFileInfo(
-                file = wav,
-                surveyId = meta?.surveyId,
-                questionId = meta?.questionId
-            )
-        }
-        .sortedByDescending { it.file.lastModified() }
+    return wavFiles.sortedByDescending { it.lastModified() }
 }
 
 /**
- * Load sidecar meta JSON for a WAV file, if present.
+ * Delete sidecar metadata files for a given WAV if they exist.
  *
- * Looks for:
- *   <baseName>.meta.json
- * in the same directory as the WAV file.
+ * Expected patterns:
+ *  - <baseName>.meta.json
+ *
+ * This is safe even if your current export pipeline no longer writes meta files.
  */
-private fun loadVoiceMeta(dir: File, wavFile: File): VoiceMeta? {
+private fun deleteVoiceSidecars(wavFile: File) {
+    val dir = wavFile.parentFile ?: return
     val base = wavFile.name.substringBeforeLast('.', wavFile.name)
-    val metaFile = File(dir, "$base.meta.json")
-    if (!metaFile.exists()) return null
-
-    return runCatching {
-        val text = metaFile.readText(Charsets.UTF_8)
-        val obj = JSONObject(text)
-        val surveyId = obj.optString("survey_id", "").ifBlank { null }
-        val questionId = obj.optString("question_id", "").ifBlank { null }
-        VoiceMeta(surveyId = surveyId, questionId = questionId)
-    }.getOrNull()
+    val meta = File(dir, "$base.meta.json")
+    if (meta.exists()) {
+        runCatching { meta.delete() }
+    }
 }
 
 /* ============================================================
@@ -625,8 +736,14 @@ private data class SaveResult(
     val location: String
 )
 
+/**
+ * Save JSON to a stable device location without user interaction.
+ *
+ * - API 29+: MediaStore Downloads/SurveyNav
+ * - API 28-: App-specific external Downloads/SurveyNav
+ */
 private fun saveJsonAutomatically(
-    context: android.content.Context,
+    context: Context,
     fileName: String,
     content: String
 ): SaveResult {
@@ -639,7 +756,7 @@ private fun saveJsonAutomatically(
 
 @RequiresApi(Build.VERSION_CODES.Q)
 private fun saveToDownloadsQPlus(
-    context: android.content.Context,
+    context: Context,
     fileName: String,
     content: String
 ): SaveResult {
@@ -652,16 +769,20 @@ private fun saveToDownloadsQPlus(
         )
         put(MediaStore.Downloads.IS_PENDING, 1)
     }
+
     val resolver = context.contentResolver
     val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
         ?: throw IllegalStateException("Failed to create download entry")
+
     try {
         resolver.openOutputStream(uri)?.use { out ->
             out.write(content.toByteArray(Charsets.UTF_8))
         } ?: throw IllegalStateException("Failed to open output stream")
+
         values.clear()
         values.put(MediaStore.Downloads.IS_PENDING, 0)
         resolver.update(uri, values, null, null)
+
         return SaveResult(
             uri = uri,
             file = null,
@@ -674,7 +795,7 @@ private fun saveToDownloadsQPlus(
 }
 
 private fun saveToAppExternalPreQ(
-    context: android.content.Context,
+    context: Context,
     fileName: String,
     content: String
 ): SaveResult {
@@ -683,6 +804,7 @@ private fun saveToAppExternalPreQ(
     val dir = File(base, "SurveyNav").apply { mkdirs() }
     val file = File(dir, fileName)
     file.writeText(content, Charsets.UTF_8)
+
     return SaveResult(
         uri = null,
         file = file,
@@ -694,11 +816,17 @@ private fun saveToAppExternalPreQ(
  * Snackbar + JSON utilities
  * ============================================================ */
 
+/**
+ * Show a snackbar message while ensuring only one active snackbar at a time.
+ */
 private suspend fun SnackbarHostState.showOnce(message: String) {
     currentSnackbarData?.dismiss()
     showSnackbar(message)
 }
 
+/**
+ * Minimal JSON string escaper for manual export.
+ */
 private fun escapeJson(s: String): String =
     buildString(s.length + 8) {
         s.forEach { ch ->

@@ -33,6 +33,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -132,6 +133,12 @@ fun IntroScreen(
 
 /* ──────────────────────────── Card & Typography ─────────────────────────── */
 
+/**
+ * Centered intro card for monotone survey selection.
+ *
+ * This card expects at least one option. If you want a softer failure mode,
+ * replace the require() with a simple empty-state UI.
+ */
 @Composable
 private fun IntroCardMono(
     title: String,
@@ -147,8 +154,20 @@ private fun IntroCardMono(
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
-    val initialId = defaultOptionId ?: options.first().id
-    var selectedId by remember(options, defaultOptionId) {
+    val optionIds = remember(options) { options.map { it.id } }
+
+    /**
+     * Resolve the initial selection safely.
+     *
+     * If the requested default ID does not exist in the current options,
+     * fall back to the first option to avoid an unselected initial UI.
+     */
+    val initialId = remember(optionIds, defaultOptionId) {
+        val def = defaultOptionId?.takeIf { it.isNotBlank() }
+        if (def != null && optionIds.contains(def)) def else options.first().id
+    }
+
+    var selectedId by remember(optionIds, defaultOptionId) {
         mutableStateOf(initialId)
     }
 
@@ -169,7 +188,7 @@ private fun IntroCardMono(
                 )
                 drawRoundRect(
                     brush = sweep,
-                    style = Stroke(width = 1f),
+                    style = Stroke(width = 1.dp.toPx()),
                     cornerRadius = CornerRadius(corner.toPx(), corner.toPx())
                 )
             }
@@ -251,6 +270,9 @@ private fun IntroCardMono(
     }
 }
 
+/**
+ * Monotone headline with a subtle vertical gradient.
+ */
 @Composable
 private fun GradientHeadlineMono(text: String) {
     val brush = Brush.verticalGradient(
@@ -302,7 +324,11 @@ private fun MonoConfigOptionChip(
             .clip(RoundedCornerShape(14.dp))
             .background(background)
             .border(BorderStroke(1.dp, borderColor), RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onClick
+            )
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -347,6 +373,9 @@ private fun MonoConfigOptionChip(
 
 /* ────────────────────────── Background (monotone) ───────────────────────── */
 
+/**
+ * Animated monotone background brush for the intro screen.
+ */
 @Composable
 private fun animatedMonotoneBackground(): Brush {
     val t = rememberInfiniteTransition(label = "mono-bg")

@@ -7,6 +7,24 @@
  *  License: MIT License
  *  © 2025 IshizukiTech LLC. All rights reserved.
  * =====================================================================
+ *
+ *  Summary:
+ *  ---------------------------------------------------------------------
+ *  ViewModel-based SpeechController implementation backed by Whisper.cpp.
+ *
+ *  Responsibilities:
+ *   • Manage recording lifecycle using Recorder.
+ *   • Ensure Whisper model initialization via WhisperEngine.
+ *   • Run transcription and publish the final text to partialText.
+ *   • Export recorded WAV files to a persistent "exports" folder.
+ *   • Emit an optional export callback so callers can register
+ *     a logical audio manifest in SurveyViewModel.
+ *
+ *  Notes:
+ *   • Uses a Mutex to serialize start/stop operations.
+ *   • Uses a second Mutex to avoid repeated model initialization.
+ *   • Computes optional SHA-256 checksum for exported WAV.
+ * =====================================================================
  */
 
 @file:Suppress("MemberVisibilityCanBePrivate", "unused")
@@ -23,35 +41,34 @@ import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.WhisperEngine
 import com.negi.whispers.recorder.Recorder
 import java.io.File
+import java.io.FileInputStream
+import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
  * ViewModel-based [SpeechController] implementation backed by Whisper.cpp.
  *
- * Responsibilities:
- * - Manage recording lifecycle using [Recorder].
- * - Ensure Whisper model initialization via [WhisperEngine].
- * - Run transcription and publish the final text to [partialText].
- * - Export recorded WAV files to a persistent "exports" folder
- *   using [ExportUtils.exportRecordedVoice] so another layer
- *   (e.g., GitHubUploadWorker) can upload them later.
- *
  * UI contract:
  * - [isRecording] is true while audio capture is active.
  * - [isTranscribing] is true while transcription is running.
  * - When recording stops and transcription succeeds, [partialText] is updated
- *   with the final recognized text (AiScreen already commits it to answers).
+ *   with the final recognized text.
  */
 class WhisperSpeechController(
     private val appContext: Context,
     private val assetModelPath: String = DEFAULT_ASSET_MODEL,
-    private val languageCode: String = DEFAULT_LANGUAGE
+    languageCode: String = DEFAULT_LANGUAGE,
+    private val onVoiceExported: ((ExportedVoice) -> Unit)? = null
 ) : ViewModel(), SpeechController {
 
     companion object {
@@ -79,24 +96,12 @@ class WhisperSpeechController(
 
         /**
          * Factory for use with Compose `viewModel(factory = ...)`.
-         *
-         * Example usage inside a @Composable:
-         *
-         * ```kotlin
-         * val ctx = LocalContext.current.applicationContext
-         * val speechVm: WhisperSpeechController = viewModel(
-         *     factory = WhisperSpeechController.provideFactory(
-         *         appContext = ctx,
-         *         assetModelPath = "models/ggml-model-q4_0.bin",
-         *         languageCode = "auto"
-         *     )
-         * )
-         * ```
          */
         fun provideFactory(
             appContext: Context,
             assetModelPath: String = DEFAULT_ASSET_MODEL,
-            languageCode: String = DEFAULT_LANGUAGE
+            languageCode: String = DEFAULT_LANGUAGE,
+            onVoiceExported: ((ExportedVoice) -> Unit)? = null
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -107,11 +112,36 @@ class WhisperSpeechController(
                     return WhisperSpeechController(
                         appContext = appContext.applicationContext,
                         assetModelPath = assetModelPath,
-                        languageCode = languageCode
+                        languageCode = languageCode,
+                        onVoiceExported = onVoiceExported
                     ) as T
                 }
             }
     }
+
+    // ---------------------------------------------------------------------
+    // Models
+    // ---------------------------------------------------------------------
+
+    /**
+     * Minimal export event payload.
+     *
+     * This is intentionally file-system neutral so callers can decide
+     * how to record the logical manifest.
+     *
+     * @property surveyId Optional survey UUID used in exported naming.
+     * @property questionId Optional node ID used in exported naming.
+     * @property fileName Exported WAV file name (no path).
+     * @property byteSize Byte size at export time.
+     * @property checksum Optional SHA-256 checksum for idempotent ingestion.
+     */
+    data class ExportedVoice(
+        val surveyId: String?,
+        val questionId: String?,
+        val fileName: String,
+        val byteSize: Long,
+        val checksum: String? = null
+    )
 
     // ---------------------------------------------------------------------
     // Dependencies
@@ -126,6 +156,8 @@ class WhisperSpeechController(
         Log.e(TAG, "Recorder error", e)
         _error.value = e.message ?: "Recording error"
         _isRecording.value = false
+        _isTranscribing.value = false
+        outputFile = null
     }
 
     /**
@@ -137,20 +169,25 @@ class WhisperSpeechController(
 
     /**
      * Background job used for model init / recording / transcription.
-     *
-     * A single [workerJob] is reused; it is cancelled before starting a new
-     * operation (start or stop).
      */
     private var workerJob: Job? = null
 
     /**
      * Optional context for naming exported voice files.
-     *
-     * When set, exported file names look like:
-     *   voice_<surveyId>_<questionId>_YYYYMMDD_HHmmss.wav
      */
     private var currentSurveyId: String? = null
     private var currentQuestionId: String? = null
+
+    /**
+     * Serialize start/stop to avoid state races on rapid taps.
+     */
+    private val recordingMutex = Mutex()
+
+    /**
+     * Prevent repeated model initialization across multiple recordings.
+     */
+    private val modelInitMutex = Mutex()
+    private var modelInitialized = false
 
     // ---------------------------------------------------------------------
     // State exposed to the UI
@@ -167,6 +204,16 @@ class WhisperSpeechController(
     override val errorMessage: StateFlow<String?> = _error
 
     // ---------------------------------------------------------------------
+    // Config
+    // ---------------------------------------------------------------------
+
+    /**
+     * Normalized language code for Whisper calls.
+     */
+    private val normalizedLanguage: String =
+        languageCode.trim().lowercase().ifBlank { DEFAULT_LANGUAGE }
+
+    // ---------------------------------------------------------------------
     // Optional context setter
     // ---------------------------------------------------------------------
 
@@ -175,7 +222,7 @@ class WhisperSpeechController(
      *
      * This is used only for file naming; can be null.
      */
-    fun updateContext(
+    override fun updateContext(
         surveyId: String?,
         questionId: String?
     ) {
@@ -190,66 +237,72 @@ class WhisperSpeechController(
 
     /**
      * Start capturing audio and begin recognition.
-     *
-     * Flow:
-     * 1. Ensure Whisper model is initialized from assets.
-     * 2. Create a temporary WAV file under cache/whisper_rec.
-     * 3. Start [Recorder] to write audio into that file.
      */
     override fun startRecording() {
         if (_isRecording.value || _isTranscribing.value) {
-            Log.d(TAG, "startRecording: busy (recording or transcribing), ignoring")
+            Log.d(TAG, "startRecording: busy, ignoring")
             return
         }
 
-        Log.d(TAG, "startRecording: begin")
+        Log.d(TAG, "startRecording: requested")
         _error.value = null
         _partialText.value = ""
+
+        /**
+         * Optimistically set state for immediate UI feedback.
+         */
         _isRecording.value = true
 
-        // Cancel any previous worker (e.g., pending transcription).
+        /**
+         * Cancel any in-flight worker (e.g., pending transcription).
+         */
         workerJob?.cancel()
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // 1) Ensure Whisper model is loaded from assets.
-                ensureModelInitializedFromAssets()
+            recordingMutex.withLock {
+                try {
+                    ensureActive()
 
-                // 2) Prepare output WAV file.
-                val dir = File(appContext.cacheDir, "whisper_rec")
-                if (!dir.exists() && !dir.mkdirs()) {
-                    throw IllegalStateException("Failed to create cache dir: ${dir.path}")
+                    /**
+                     * Ensure the model is loaded once.
+                     */
+                    ensureModelInitializedFromAssetsOnce()
+                    ensureActive()
+
+                    /**
+                     * Prepare output WAV file.
+                     */
+                    val dir = File(appContext.cacheDir, "whisper_rec")
+                    if (!dir.exists() && !dir.mkdirs()) {
+                        throw IllegalStateException("Failed to create cache dir: ${dir.path}")
+                    }
+
+                    val wav = File.createTempFile("survey_input_", ".wav", dir)
+                    outputFile = wav
+
+                    Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
+                    recorder.startRecording(
+                        output = wav,
+                        rates = intArrayOf(16_000, 48_000, 44_100)
+                    )
+
+                    Log.d(TAG, "startRecording: started")
+                } catch (ce: CancellationException) {
+                    Log.d(TAG, "startRecording: cancelled")
+                    _isRecording.value = false
+                    outputFile = null
+                } catch (t: Throwable) {
+                    Log.e(TAG, "startRecording: failed", t)
+                    _error.value = t.message ?: "Speech recognition start failed"
+                    _isRecording.value = false
+                    outputFile = null
                 }
-
-                val wav = File.createTempFile("survey_input_", ".wav", dir)
-                outputFile = wav
-
-                Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
-                recorder.startRecording(
-                    output = wav,
-                    rates = intArrayOf(16_000, 48_000, 44_100)
-                )
-            } catch (t: Throwable) {
-                Log.e(TAG, "startRecording: failed", t)
-                _error.value = t.message ?: "Speech recognition start failed"
-                _isRecording.value = false
-                outputFile = null
             }
         }
     }
 
     /**
      * Stop capturing audio and finalize the current utterance.
-     *
-     * Flow:
-     * 1. Stop [Recorder] and finalize the WAV header.
-     * 2. Validate that the file exists and is not empty.
-     * 3. Export WAV to a persistent "exports" folder for upload.
-     * 4. Pass WAV file to [WhisperEngine.transcribeWaveFile].
-     * 5. Publish the recognized text via [updatePartialText].
-     *
-     * The temporary cache WAV is deleted after export and transcription
-     * to avoid unbounded cache growth.
      */
     override fun stopRecording() {
         if (!_isRecording.value) {
@@ -258,93 +311,131 @@ class WhisperSpeechController(
         }
 
         Log.d(TAG, "stopRecording: requested")
+
+        /**
+         * Flip state immediately for UI.
+         */
         _isRecording.value = false
 
-        // Cancel any previous worker just in case.
+        /**
+         * Cancel any in-flight worker (e.g., start phase still running).
+         */
         workerJob?.cancel()
 
         workerJob = viewModelScope.launch(Dispatchers.IO) {
-            var localWav: File? = null
+            recordingMutex.withLock {
+                var localWav: File? = null
 
-            try {
-                // 1) Finalize WAV file.
-                Log.d(TAG, "stopRecording: awaiting recorder.stopRecording()")
-                recorder.stopRecording()
+                try {
+                    /**
+                     * Finalize WAV file.
+                     */
+                    Log.d(TAG, "stopRecording: awaiting recorder.stopRecording()")
+                    runCatching { recorder.stopRecording() }
+                        .onFailure { e ->
+                            Log.w(TAG, "recorder.stopRecording failed", e)
+                        }
 
-                val wav = outputFile
-                outputFile = null
-                localWav = wav
+                    val wav = outputFile
+                    outputFile = null
+                    localWav = wav
 
-                if (wav == null || !wav.exists()) {
-                    Log.w(TAG, "stopRecording: WAV file missing")
-                    _error.value = "Recording file not found"
-                    return@launch
-                }
-                if (wav.length() <= 44L) {
-                    Log.w(TAG, "stopRecording: WAV too short or silent (${wav.length()} bytes)")
-                    _error.value = "Recording too short or empty"
-                    return@launch
-                }
+                    /**
+                     * If the user stops immediately after start, the WAV may not exist yet.
+                     * Treat this as a normal cancellation rather than an error.
+                     */
+                    if (wav == null) {
+                        Log.d(TAG, "stopRecording: no WAV yet (likely quick cancel)")
+                        return@withLock
+                    }
+                    if (!wav.exists()) {
+                        Log.d(TAG, "stopRecording: WAV missing (likely quick cancel) -> ${wav.path}")
+                        return@withLock
+                    }
+                    if (wav.length() <= 44L) {
+                        Log.d(TAG, "stopRecording: WAV too short (likely no speech) (${wav.length()} bytes)")
+                        _error.value = "Recording too short or empty"
+                        return@withLock
+                    }
 
-                val frames = (wav.length() - 44L) / 2L    // 16-bit mono, 2 bytes/frame
-                val msApprox = frames * 1000.0 / 16_000.0
+                    /**
+                     * Export WAV for later upload (best-effort).
+                     */
+                    val exported = exportRecordedVoiceSafely(wav)
+                    if (exported != null) {
+                        val checksum = runCatching { computeSha256(exported) }
+                            .onFailure { e -> Log.w(TAG, "computeSha256 failed", e) }
+                            .getOrNull()
 
-                Log.d(
-                    TAG,
-                    "stopRecording: ready to export + transcribe ${wav.path} " +
-                            "(bytes=${wav.length()}, frames=$frames, ~${"%.1f".format(msApprox)} ms)"
-                )
-
-                // 2) Export WAV for later upload (e.g., SurveyExports).
-                exportRecordedVoice(wav)
-
-                // 3) Run Whisper transcription.
-                _isTranscribing.value = true
-                val result = WhisperEngine.transcribeWaveFile(
-                    file = wav,
-                    lang = languageCode,
-                    translate = false,
-                    printTimestamp = false,
-                    targetSampleRate = 16_000
-                )
-
-                // 4) Handle result.
-                result
-                    .onSuccess { text ->
-                        val trimmed = text.trim()
-                        if (trimmed.isEmpty()) {
-                            Log.w(
-                                TAG,
-                                "Transcription produced empty text. " +
-                                        "Possible causes: silence, very low volume, or segments=0."
+                        onVoiceExported?.invoke(
+                            ExportedVoice(
+                                surveyId = currentSurveyId,
+                                questionId = currentQuestionId,
+                                fileName = exported.name,
+                                byteSize = exported.length(),
+                                checksum = checksum
                             )
-                        } else {
-                            Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
-                        }
-                        updatePartialText(trimmed)
-                    }
-                    .onFailure { e ->
-                        Log.e(TAG, "Transcription failed", e)
-                        _error.value = e.message ?: "Transcription failed"
-                    }
-            } catch (t: Throwable) {
-                Log.e(TAG, "stopRecording: failed", t)
-                _error.value = t.message ?: "Speech recognition failed"
-            } finally {
-                _isTranscribing.value = false
+                        )
 
-                // Clean up the temporary cache WAV if it still exists.
-                localWav?.let { file ->
-                    if (file.exists()) {
-                        runCatching {
-                            if (file.delete()) {
-                                Log.d(TAG, "stopRecording: deleted cache wav ${file.path}")
+                        Log.d(
+                            TAG,
+                            "onVoiceExported -> file=${exported.name}, " +
+                                    "bytes=${exported.length()}, " +
+                                    "qid=$currentQuestionId, sid=$currentSurveyId, " +
+                                    "checksum=${checksum?.take(12)}..."
+                        )
+                    } else {
+                        Log.w(TAG, "stopRecording: export skipped or failed")
+                    }
+
+                    /**
+                     * Run Whisper transcription.
+                     */
+                    _isTranscribing.value = true
+                    Log.d(TAG, "stopRecording: transcribing -> ${wav.path}")
+
+                    val result = WhisperEngine.transcribeWaveFile(
+                        file = wav,
+                        lang = normalizedLanguage,
+                        translate = false,
+                        printTimestamp = false,
+                        targetSampleRate = 16_000
+                    )
+
+                    result
+                        .onSuccess { text ->
+                            val trimmed = text.trim()
+                            if (trimmed.isEmpty()) {
+                                Log.w(TAG, "Transcription produced empty text")
                             } else {
-                                Log.d(TAG, "stopRecording: failed to delete cache wav ${file.path}")
+                                Log.d(TAG, "Transcription success: ${trimmed.take(80)}")
                             }
-                        }.onFailure { e ->
-                            Log.w(TAG, "stopRecording: exception while deleting cache wav", e)
+                            updatePartialText(trimmed)
                         }
+                        .onFailure { e ->
+                            Log.e(TAG, "Transcription failed", e)
+                            _error.value = e.message ?: "Transcription failed"
+                        }
+                } catch (ce: CancellationException) {
+                    Log.d(TAG, "stopRecording: cancelled")
+                } catch (t: Throwable) {
+                    Log.e(TAG, "stopRecording: failed", t)
+                    _error.value = t.message ?: "Speech recognition failed"
+                } finally {
+                    _isTranscribing.value = false
+
+                    /**
+                     * Best-effort cleanup of temporary cache WAV.
+                     */
+                    runCatching {
+                        localWav?.let { tmp ->
+                            if (tmp.exists()) {
+                                val ok = tmp.delete()
+                                Log.d(TAG, "stopRecording: temp delete=$ok -> ${tmp.path}")
+                            }
+                        }
+                    }.onFailure { e ->
+                        Log.w(TAG, "stopRecording: temp WAV delete failed", e)
                     }
                 }
             }
@@ -355,11 +446,7 @@ class WhisperSpeechController(
      * Convenience toggle used by the UI microphone button.
      */
     override fun toggleRecording() {
-        if (_isRecording.value) {
-            stopRecording()
-        } else {
-            startRecording()
-        }
+        if (_isRecording.value) stopRecording() else startRecording()
     }
 
     // ---------------------------------------------------------------------
@@ -368,80 +455,92 @@ class WhisperSpeechController(
 
     /**
      * Update the current partial or final transcript text.
-     *
-     * Typically invoked after Whisper finishes transcription.
      */
     fun updatePartialText(text: String) {
-        Log.d(TAG, "updatePartialText: \"$text\"")
         _partialText.value = text
+        Log.d(TAG, "updatePartialText: len=${text.length}")
     }
 
     /**
      * Clear any previously reported error.
-     *
-     * Can be called from the UI layer when the user dismisses an error message.
      */
     fun clearError() {
         _error.value = null
     }
 
     /**
-     * Ensure Whisper model is initialized via [WhisperEngine] using assets.
+     * Ensure Whisper model is initialized via [WhisperEngine] using assets once.
      */
-    private suspend fun ensureModelInitializedFromAssets() {
-        val result = WhisperEngine.ensureInitializedFromAsset(
-            context = appContext,
-            assetPath = assetModelPath
-        )
-        result.onFailure { e ->
-            Log.e(
-                TAG,
-                "ensureModelInitializedFromAssets: failed for assets/$assetModelPath",
-                e
+    private suspend fun ensureModelInitializedFromAssetsOnce() {
+        if (modelInitialized) return
+
+        modelInitMutex.withLock {
+            if (modelInitialized) return
+
+            val result = WhisperEngine.ensureInitializedFromAsset(
+                context = appContext,
+                assetPath = assetModelPath
             )
-            throw IllegalStateException(
-                "Failed to initialize Whisper model from assets/$assetModelPath",
-                e
-            )
+
+            result.onFailure { e ->
+                Log.e(TAG, "ensureModelInitializedFromAssetsOnce failed: assets/$assetModelPath", e)
+                throw IllegalStateException(
+                    "Failed to initialize Whisper model from assets/$assetModelPath",
+                    e
+                )
+            }
+
+            modelInitialized = true
+            Log.d(TAG, "Whisper model initialized: assets/$assetModelPath")
         }
     }
 
     /**
-     * Export the recorded WAV into the shared "exports" directory
-     * using [ExportUtils.exportRecordedVoice].
+     * Export the recorded WAV to persistent storage.
      *
-     * Any failure is logged but considered non-fatal for transcription.
+     * This method matches the current ExportUtils signature:
+     * `exportRecordedVoice(context, source, surveyId, questionId): File`
      */
-    private fun exportRecordedVoice(wav: File) {
-        Log.d(
-            TAG,
-            "exportRecordedVoice: delegating to ExportUtils " +
-                    "(source=${wav.path}, surveyId=$currentSurveyId, questionId=$currentQuestionId)"
-        )
-
-        runCatching {
-            val exported = ExportUtils.exportRecordedVoice(
-                context = appContext,
-                source = wav,
-                surveyId = currentSurveyId,
-                questionId = currentQuestionId
-            )
-            Log.d(TAG, "exportRecordedVoice: exported to ${exported.absolutePath}")
-        }.onFailure { e ->
-            Log.w(TAG, "exportRecordedVoice: failed, ignoring", e)
+    private suspend fun exportRecordedVoiceSafely(wav: File): File? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                ExportUtils.exportRecordedVoice(
+                    context = appContext,
+                    source = wav,
+                    surveyId = currentSurveyId,
+                    questionId = currentQuestionId
+                )
+            }.onFailure { e ->
+                Log.w(TAG, "exportRecordedVoice failed", e)
+            }.getOrNull()
         }
+
+    /**
+     * Compute SHA-256 checksum for the given file.
+     */
+    private fun computeSha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { fis ->
+            val buffer = ByteArray(1024 * 32)
+            while (true) {
+                val read = fis.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     // ---------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------
-
     override fun onCleared() {
         super.onCleared()
-        viewModelScope.launch(Dispatchers.Main.immediate) {
-            workerJob?.cancel()
-            workerJob = null
 
+        workerJob?.cancel()
+        workerJob = null
+
+        viewModelScope.launch(Dispatchers.Main.immediate) {
             withContext(NonCancellable) {
                 runCatching { WhisperEngine.release() }
                     .onFailure { e -> Log.w(TAG, "WhisperEngine.release failed", e) }

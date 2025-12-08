@@ -18,6 +18,7 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 /**
  * Helper for exporting survey JSON and recorded voice into a common
@@ -29,27 +30,66 @@ import java.util.Locale
  *     └─ voice/
  *          ├─ voice_<...>_YYYYMMDD_HHmmss.wav
  *          └─ voice_<...>_YYYYMMDD_HHmmss.meta.json
+ *
+ * Design goals:
+ * - Prefer app-scoped external storage when available (no runtime permission).
+ * - Keep file naming deterministic and safe across file systems.
+ * - Avoid partially-written artifacts with best-effort atomic writes.
+ * - Provide a tiny sidecar metadata file to support later lookup and upload.
  */
 object ExportUtils {
 
     private const val TAG = "ExportUtils"
+
     private const val EXPORT_DIR_NAME = "exports"
     private const val VOICE_SUBDIR_NAME = "voice"
     private const val META_SUFFIX = ".meta.json"
 
     /**
+     * WAV files smaller than this size are treated as empty recordings.
+     *
+     * Standard PCM WAV header is 44 bytes.
+     */
+    private const val WAV_HEADER_BYTES = 44L
+
+    /**
+     * Maximum length for each ID segment used in file naming.
+     *
+     * This prevents extremely long survey/question IDs from producing
+     * file names that exceed filesystem limits.
+     */
+    private const val MAX_SEGMENT_LEN = 48
+
+    /**
+     * Time format for file naming.
+     *
+     * We use UTC to make exported names stable across devices and locales.
+     */
+    private val FILE_TS_FORMAT = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+
+    /**
+     * Time format for meta JSON.
+     */
+    private val META_TS_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+
+    /**
      * Returns the base directory for export files.
      *
+     * Storage resolution:
      * - Uses app-specific external files dir when available.
-     * - On device, this lives under:
+     * - Falls back to internal files dir otherwise.
+     *
+     * Example location:
      *   Android/data/<package>/files/exports
      */
     fun getExportBaseDir(context: Context): File {
         val base = context.getExternalFilesDir(null) ?: context.filesDir
         val exportDir = File(base, EXPORT_DIR_NAME)
-        if (!exportDir.exists() && !exportDir.mkdirs()) {
-            Log.w(TAG, "getExportBaseDir: failed to mkdirs() for ${exportDir.absolutePath}")
-        }
+        ensureDir(exportDir, "getExportBaseDir")
         return exportDir
     }
 
@@ -61,9 +101,7 @@ object ExportUtils {
     fun getVoiceExportDir(context: Context): File {
         val base = getExportBaseDir(context)
         val voiceDir = File(base, VOICE_SUBDIR_NAME)
-        if (!voiceDir.exists() && !voiceDir.mkdirs()) {
-            Log.w(TAG, "getVoiceExportDir: failed to mkdirs() for ${voiceDir.absolutePath}")
-        }
+        ensureDir(voiceDir, "getVoiceExportDir")
         return voiceDir
     }
 
@@ -71,15 +109,25 @@ object ExportUtils {
      * Copy the recorded voice file into the export voice directory and
      * return the new [File].
      *
-     * Flow:
-     * - Validate that [source] exists.
-     * - Build a timestamped file name:
-     *   voice_<surveyId>_<questionId>_YYYYMMDD_HHmmss.wav
-     *   (segments are sanitized for file-system safety).
-     * - Copy [source] into "exports/voice".
-     * - Emit a sidecar JSON:
-     *   voice_<...>_YYYYMMDD_HHmmss.meta.json
-     *   with survey/question IDs for later lookup.
+     * Validation:
+     * - [source] must exist and be a file.
+     * - [source] must be larger than a minimal WAV header size.
+     *
+     * Naming:
+     * - Base pattern:
+     *     voice_<surveyId>_<questionId>_YYYYMMDD_HHmmss.wav
+     * - Each optional ID segment is sanitized and length-capped.
+     * - A uniqueness suffix is added if a collision occurs.
+     *
+     * Atomicity:
+     * - The copy is performed into a temporary ".part" file first.
+     * - The final file is then created via rename when possible.
+     *
+     * Sidecar:
+     * - A best-effort meta JSON is emitted next to the WAV.
+     * - Keys "survey_id" and "question_id" are omitted when null/blank.
+     *
+     * @throws IOException When validation fails or the copy cannot be completed.
      */
     @Throws(IOException::class)
     fun exportRecordedVoice(
@@ -88,46 +136,60 @@ object ExportUtils {
         surveyId: String? = null,
         questionId: String? = null
     ): File {
-        if (!source.exists()) {
+        if (!source.exists() || !source.isFile) {
             val msg = "Source audio file does not exist: ${source.absolutePath}"
+            Log.e(TAG, msg)
+            throw IOException(msg)
+        }
+
+        val len = source.length()
+        if (len <= WAV_HEADER_BYTES) {
+            val msg = "Source audio file is too small or empty: ${source.absolutePath} (size=$len)"
             Log.e(TAG, msg)
             throw IOException(msg)
         }
 
         val voiceDir = getVoiceExportDir(context)
 
-        val time = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val time = FILE_TS_FORMAT.format(Date())
+
+        val safeSurvey = surveyId
+            ?.takeIf { it.isNotBlank() }
+            ?.sanitizeSegment()
+
+        val safeQuestion = questionId
+            ?.takeIf { it.isNotBlank() }
+            ?.sanitizeSegment()
 
         val rawPrefix = buildString {
             append("voice")
-            if (!surveyId.isNullOrBlank()) append("_$surveyId")
-            if (!questionId.isNullOrBlank()) append("_$questionId")
+            if (safeSurvey != null) append("_").append(safeSurvey)
+            if (safeQuestion != null) append("_").append(safeQuestion)
         }
+
         val safePrefix = rawPrefix.sanitizeForFileName().ifBlank { "voice" }
 
-        // Always export as .wav for consistency with DoneScreen scan.
-        val targetName = "${safePrefix}_$time.wav"
-        val target = File(voiceDir, targetName)
+        val baseName = "${safePrefix}_$time"
+        val target = makeUniqueFile(voiceDir, baseName, "wav")
 
         Log.d(
             TAG,
             "exportRecordedVoice: copying ${source.absolutePath} -> ${target.absolutePath}"
         )
 
-        try {
-            source.inputStream().use { input ->
-                target.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            }
-        } catch (e: IOException) {
-            Log.e(TAG, "exportRecordedVoice: copy failed", e)
-            throw e
+        // Copy with best-effort atomic semantics.
+        copyFileAtomic(source, target)
+
+        val outSize = target.length()
+        if (outSize <= WAV_HEADER_BYTES) {
+            val msg = "exportRecordedVoice: exported file is unexpectedly small: ${target.absolutePath} (size=$outSize)"
+            Log.e(TAG, msg)
+            throw IOException(msg)
         }
 
-        Log.d(TAG, "exportRecordedVoice: done, size=${target.length()} bytes")
+        Log.d(TAG, "exportRecordedVoice: done, size=$outSize bytes")
 
-        // Write sidecar meta JSON for later lookup in DoneScreen.
+        // Best-effort sidecar meta JSON.
         writeVoiceMeta(
             dir = voiceDir,
             wavName = target.name,
@@ -146,10 +208,13 @@ object ExportUtils {
      * Payload shape:
      * {
      *   "file_name": "voice_....wav",
-     *   "survey_id": "...",
-     *   "question_id": "...",
+     *   "survey_id": "...",        // omitted when null/blank
+     *   "question_id": "...",      // omitted when null/blank
      *   "created_at": "2025-11-25T10:20:30Z"
      * }
+     *
+     * Failure policy:
+     * - This method is best-effort. Failures are logged and ignored.
      */
     private fun writeVoiceMeta(
         dir: File,
@@ -160,14 +225,14 @@ object ExportUtils {
         val base = wavName.substringBeforeLast('.', wavName)
         val metaFile = File(dir, base + META_SUFFIX)
 
-        val createdAt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-            .format(Date())
+        val createdAt = META_TS_FORMAT.format(Date())
 
         val json = buildString {
             append("{\n")
             append("  \"file_name\": \"")
                 .append(wavName.escapeJson())
                 .append("\",\n")
+
             if (!surveyId.isNullOrBlank()) {
                 append("  \"survey_id\": \"")
                     .append(surveyId.escapeJson())
@@ -178,6 +243,7 @@ object ExportUtils {
                     .append(questionId.escapeJson())
                     .append("\",\n")
             }
+
             append("  \"created_at\": \"")
                 .append(createdAt.escapeJson())
                 .append("\"\n")
@@ -185,11 +251,125 @@ object ExportUtils {
         }
 
         runCatching {
-            metaFile.writeText(json, Charsets.UTF_8)
+            writeTextAtomic(metaFile, json)
             Log.d(TAG, "writeVoiceMeta: wrote ${metaFile.absolutePath}")
         }.onFailure { e ->
             Log.w(TAG, "writeVoiceMeta: failed, ignoring", e)
         }
+    }
+
+    /**
+     * Ensure the directory exists, logging a warning on failure.
+     */
+    private fun ensureDir(dir: File, caller: String) {
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.w(TAG, "$caller: failed to mkdirs() for ${dir.absolutePath}")
+        }
+    }
+
+    /**
+     * Create a unique file under [dir] using [baseName] and [ext].
+     *
+     * If "baseName.ext" already exists, it will attempt:
+     * - baseName-2.ext
+     * - baseName-3.ext
+     * ...
+     */
+    private fun makeUniqueFile(dir: File, baseName: String, ext: String): File {
+        var candidate = File(dir, "$baseName.$ext")
+        if (!candidate.exists()) return candidate
+
+        var index = 2
+        while (true) {
+            candidate = File(dir, "$baseName-$index.$ext")
+            if (!candidate.exists()) return candidate
+            index++
+        }
+    }
+
+    /**
+     * Copy a file using a best-effort atomic strategy:
+     * - Write into "<target>.part"
+     * - Rename to the final target
+     *
+     * If rename fails (rare on some filesystems), falls back to
+     * a direct stream copy into the target.
+     */
+    @Throws(IOException::class)
+    private fun copyFileAtomic(source: File, target: File) {
+        val parent = target.parentFile
+        if (parent != null) ensureDir(parent, "copyFileAtomic")
+
+        val part = File(parent, target.name + ".part")
+
+        // Clean up any stale partial file.
+        runCatching { if (part.exists()) part.delete() }
+
+        try {
+            source.inputStream().use { input ->
+                part.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "copyFileAtomic: copy-to-part failed", e)
+            runCatching { part.delete() }
+            throw e
+        }
+
+        // Replace existing target if needed.
+        if (target.exists() && !target.delete()) {
+            Log.w(TAG, "copyFileAtomic: failed to delete existing ${target.absolutePath}")
+        }
+
+        // Try atomic-ish rename.
+        if (!part.renameTo(target)) {
+            Log.w(TAG, "copyFileAtomic: rename failed, falling back to direct copy")
+
+            try {
+                source.inputStream().use { input ->
+                    target.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            } catch (e: IOException) {
+                Log.e(TAG, "copyFileAtomic: direct copy failed", e)
+                throw e
+            } finally {
+                runCatching { part.delete() }
+            }
+        }
+    }
+
+    /**
+     * Write text atomically to reduce the risk of partial/corrupt files.
+     */
+    private fun writeTextAtomic(target: File, text: String) {
+        val tmp = File(target.parentFile, target.name + ".tmp")
+
+        // Best-effort cleanup of stale temp file.
+        runCatching { if (tmp.exists()) tmp.delete() }
+
+        tmp.writeText(text, Charsets.UTF_8)
+
+        if (target.exists() && !target.delete()) {
+            Log.w(TAG, "writeTextAtomic: failed to delete existing ${target.absolutePath}")
+        }
+
+        if (!tmp.renameTo(target)) {
+            // Fallback to non-atomic write if rename fails for any reason.
+            Log.w(TAG, "writeTextAtomic: rename failed, falling back to direct write")
+            target.writeText(text, Charsets.UTF_8)
+            runCatching { tmp.delete() }
+        }
+    }
+
+    /**
+     * Convert an ID segment into a file-name-safe representation with a length cap.
+     */
+    private fun String.sanitizeSegment(): String {
+        val safe = sanitizeForFileName()
+        return if (safe.length <= MAX_SEGMENT_LEN) safe else safe.take(MAX_SEGMENT_LEN)
     }
 
     /**

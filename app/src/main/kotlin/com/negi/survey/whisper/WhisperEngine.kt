@@ -18,51 +18,58 @@ import android.util.Log
 import com.negi.whispers.media.decodeWaveFile
 import com.whispercpp.whisper.WhisperContext
 import java.io.File
+import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlin.math.sqrt
+import kotlinx.coroutines.withContext
 
 private const val LOG_TAG = "WhisperEngine"
 
 /**
  * Thin facade for integrating Whisper.cpp into the SurveyNav app.
  *
- * This object wraps [WhisperContext] and [decodeWaveFile] to offer a simple,
+ * This object wraps [WhisperContext] and [decodeWaveFile] to provide a small,
  * suspend-friendly API:
  *
- * - [ensureInitializedFromFile] — load a Whisper model from a local file.
- * - [ensureInitializedFromAsset] — load a Whisper model from app assets.
- * - [transcribeWaveFile] — decode a WAV file to mono PCM and run transcription.
- * - [release] — free native resources and reset the engine.
+ * - [ensureInitializedFromFile]  Loads a Whisper model from a local file.
+ * - [ensureInitializedFromAsset] Loads a Whisper model from app assets.
+ * - [transcribeWaveFile]         Decodes a WAV file and runs transcription.
+ * - [release]                    Frees native resources and resets the engine.
  *
- * All heavy work is dispatched onto [Dispatchers.Default]. The underlying
- * [WhisperContext] already runs JNI calls on its own single-threaded
- * dispatcher, so this facade only coordinates model switching and error
- * handling.
+ * Thread-safety:
+ * - All operations that touch the underlying [WhisperContext] are serialized
+ *   through [engineMutex]. This prevents a dangerous race where:
+ *   - one coroutine is transcribing while
+ *   - another coroutine releases or swaps the model.
+ *
+ * Performance note:
+ * - WAV decoding is performed outside the mutex to minimize lock time.
+ * - The actual Whisper JNI call is protected by the mutex.
  */
 object WhisperEngine {
 
     /**
-     * Current active Whisper context. Access must be guarded by [initMutex].
+     * Current active Whisper context.
+     *
+     * Access must be guarded by [engineMutex].
      */
     @Volatile
     private var context: WhisperContext? = null
 
     /**
-     * Identifier of the model that [context] was created from.
+     * Identifier of the model used to create [context].
      *
-     * For file-based models it is the absolute file path.
-     * For asset-based models it uses a synthetic key "asset:<path>".
+     * - For file-based models: absolute file path.
+     * - For asset-based models: synthetic key "asset:<path>".
      */
     @Volatile
     private var modelKey: String? = null
 
     /**
-     * Mutex to serialize initialization and model switching.
+     * Single mutex to serialize init / transcribe / release.
      */
-    private val initMutex = Mutex()
+    private val engineMutex = Mutex()
 
     // ---------------------------------------------------------------------
     // Initialization
@@ -71,17 +78,20 @@ object WhisperEngine {
     /**
      * Ensure that a Whisper model is loaded from [modelFile].
      *
-     * If the engine is already initialized with the same file path, this
-     * function returns immediately with [Result.success]. If a different
-     * model is active, the old context is released before creating a new one.
+     * Behavior:
+     * - If the engine is already initialized with the same file path, this
+     *   returns immediately with [Result.success].
+     * - If a different model is active, the old context is released before
+     *   creating a new one.
      *
-     * @param context Android [Context], kept for future extension.
+     * @param context Android [Context]. Stored for future extension.
      * @param modelFile Local Whisper model file (GGML/GGUF). Must exist.
      */
     suspend fun ensureInitializedFromFile(
         context: Context,
         modelFile: File
     ): Result<Unit> = withContext(Dispatchers.Default) {
+
         if (!modelFile.exists() || !modelFile.isFile) {
             return@withContext Result.failure(
                 IllegalArgumentException(
@@ -90,11 +100,11 @@ object WhisperEngine {
             )
         }
 
-        initMutex.withLock {
+        engineMutex.withLock {
             val key = modelFile.absolutePath
+            val current = this@WhisperEngine.context
 
             // Fast path: already initialized with the same model file.
-            val current = this@WhisperEngine.context
             if (current != null && modelKey == key) {
                 Log.d(LOG_TAG, "Already initialized with model file=$key")
                 return@withLock Result.success(Unit)
@@ -113,15 +123,18 @@ object WhisperEngine {
             this@WhisperEngine.context = null
             this@WhisperEngine.modelKey = null
 
-            // Create a new context from model file.
-            val created = runCatching {
+            val createdResult = runCatching {
                 Log.i(LOG_TAG, "Creating WhisperContext from file=$key")
                 WhisperContext.createContextFromFile(key)
             }.onFailure { e ->
                 Log.e(LOG_TAG, "Failed to create WhisperContext from $key", e)
-            }.getOrElse { error ->
-                return@withLock Result.failure(error)
             }
+
+            if (createdResult.isFailure) {
+                return@withLock Result.failure(createdResult.exceptionOrNull()!!)
+            }
+
+            val created = createdResult.getOrThrow()
 
             this@WhisperEngine.context = created
             this@WhisperEngine.modelKey = key
@@ -137,19 +150,19 @@ object WhisperEngine {
      * Example:
      * - assetPath = "models/ggml-small-q5_1.bin"
      *
-     * This behaves similarly to [ensureInitializedFromFile], but uses
-     * [WhisperContext.createContextFromAsset] under the hood and stores
-     * a synthetic "asset:<path>" key in [modelKey].
+     * Behavior mirrors [ensureInitializedFromFile] but uses
+     * [WhisperContext.createContextFromAsset].
      */
     suspend fun ensureInitializedFromAsset(
         context: Context,
         assetPath: String
     ): Result<Unit> = withContext(Dispatchers.Default) {
-        initMutex.withLock {
+
+        engineMutex.withLock {
             val key = "asset:$assetPath"
+            val current = this@WhisperEngine.context
 
             // Fast path: already initialized with the same asset model.
-            val current = this@WhisperEngine.context
             if (current != null && modelKey == key) {
                 Log.d(LOG_TAG, "Already initialized with asset model=$assetPath")
                 return@withLock Result.success(Unit)
@@ -168,15 +181,18 @@ object WhisperEngine {
             this@WhisperEngine.context = null
             this@WhisperEngine.modelKey = null
 
-            // Create a new context from assets.
-            val created = runCatching {
+            val createdResult = runCatching {
                 Log.i(LOG_TAG, "Creating WhisperContext from assets/$assetPath")
                 WhisperContext.createContextFromAsset(context.assets, assetPath)
             }.onFailure { e ->
                 Log.e(LOG_TAG, "Failed to create WhisperContext from assets/$assetPath", e)
-            }.getOrElse { error ->
-                return@withLock Result.failure(error)
             }
+
+            if (createdResult.isFailure) {
+                return@withLock Result.failure(createdResult.exceptionOrNull()!!)
+            }
+
+            val created = createdResult.getOrThrow()
 
             this@WhisperEngine.context = created
             this@WhisperEngine.modelKey = key
@@ -193,22 +209,27 @@ object WhisperEngine {
     /**
      * Transcribe the given WAV [file] and return plain-text output.
      *
-     * This function:
-     * 1. Decodes the WAV file to a mono float buffer via [decodeWaveFile].
-     * 2. Logs basic PCM statistics (size, min, max, RMS) for debugging.
-     * 3. Calls [WhisperContext.transcribeData] on one or more languages:
-     *    - If [lang] == "auto", it tries "auto" first, then "en", "ja", "sw".
-     *    - Otherwise, it only tries the specified [lang].
+     * Steps:
+     * 1) Decode WAV to mono float PCM via [decodeWaveFile].
+     * 2) Log basic PCM statistics (size, min, max, RMS).
+     * 3) Call [WhisperContext.transcribeData] for one or more languages:
+     *    - If [lang] == "auto", tries "auto" then "en", "ja", "sw".
+     *    - Otherwise, tries only the specified [lang].
      *
-     * The first non-empty trimmed transcript is returned as success.
-     * If all attempts produce empty text but no exception, the last attempt's
-     * (possibly empty) text is returned as success so that callers can decide
-     * how to handle the "no speech" case.
+     * Return policy:
+     * - The first non-empty trimmed transcript is returned as success.
+     * - If all attempts produce empty text without throwing, the last empty
+     *   trimmed result is returned as success. This allows callers to decide
+     *   how to handle "no speech" or near-silence cases.
+     *
+     * Thread-safety:
+     * - The Whisper JNI call is protected by [engineMutex] to prevent concurrent
+     *   release/model swap.
      *
      * @param file Input WAV file (PCM16 or Float32). Must exist.
-     * @param lang Language code ("en", "ja", "sw", or "auto" for auto-detect).
+     * @param lang Language code ("en", "ja", "sw", or "auto").
      * @param translate If true, runs Whisper in translation-to-English mode.
-     * @param printTimestamp If true, append `[t0 - t1]` to each line.
+     * @param printTimestamp If true, appends timestamps to each output line.
      * @param targetSampleRate Target sample rate for decoding, default 16 kHz.
      */
     suspend fun transcribeWaveFile(
@@ -218,13 +239,6 @@ object WhisperEngine {
         printTimestamp: Boolean = false,
         targetSampleRate: Int = 16_000
     ): Result<String> = withContext(Dispatchers.Default) {
-        val ctx = context
-            ?: return@withContext Result.failure(
-                IllegalStateException(
-                    "WhisperEngine is not initialized. " +
-                            "Call ensureInitializedFromFile() or ensureInitializedFromAsset() first."
-                )
-            )
 
         if (!file.exists() || !file.isFile) {
             return@withContext Result.failure(
@@ -232,17 +246,21 @@ object WhisperEngine {
             )
         }
 
-        // Decode WAV into normalized mono float PCM and log statistics.
-        val pcm: FloatArray = runCatching {
+        // Decode WAV into normalized mono float PCM outside the mutex.
+        val pcmResult = runCatching {
             decodeWaveFile(
                 file = file,
                 targetSampleRate = targetSampleRate
             )
         }.onFailure { e ->
             Log.e(LOG_TAG, "Failed to decode WAV file=${file.path}", e)
-        }.getOrElse { error ->
-            return@withContext Result.failure(error)
         }
+
+        if (pcmResult.isFailure) {
+            return@withContext Result.failure(pcmResult.exceptionOrNull()!!)
+        }
+
+        val pcm = pcmResult.getOrThrow()
 
         if (pcm.isEmpty()) {
             Log.w(LOG_TAG, "Decoded PCM buffer is empty for file: ${file.name}")
@@ -259,9 +277,6 @@ object WhisperEngine {
                     "samples=${pcm.size}, min=${stats.min}, max=${stats.max}, rms=${stats.rms}"
         )
 
-        // Language attempts:
-        // - If lang == "auto", try "auto" first, then common fixed languages.
-        // - Otherwise, use only the explicitly requested language.
         val languageAttempts: List<String> =
             if (lang.lowercase() == "auto") {
                 listOf("auto", "en", "ja", "sw")
@@ -269,58 +284,75 @@ object WhisperEngine {
                 listOf(lang)
             }
 
-        var lastResult: Result<String>? = null
+        // Protect the WhisperContext usage from concurrent release/swap.
+        engineMutex.withLock {
 
-        for (code in languageAttempts) {
-            val result = runCatching {
-                Log.i(
-                    LOG_TAG,
-                    "Transcribing with lang=$code translate=$translate " +
-                            "printTimestamp=$printTimestamp samples=${pcm.size}"
+            val ctx = context
+                ?: return@withLock Result.failure(
+                    IllegalStateException(
+                        "WhisperEngine is not initialized. " +
+                                "Call ensureInitializedFromFile() or ensureInitializedFromAsset() first."
+                    )
                 )
-                ctx.transcribeData(
-                    data = pcm,
-                    lang = code,
-                    translate = translate,
-                    printTimestamp = printTimestamp
-                )
-            }.onFailure { e ->
-                Log.e(
-                    LOG_TAG,
-                    "Whisper transcription failed for file=${file.path} lang=$code",
-                    e
-                )
-            }
 
-            lastResult = result
+            var lastEmptySuccess: String? = null
+            var lastFailure: Throwable? = null
 
-            result.onSuccess { raw ->
-                val trimmed = raw.trim()
+            for (code in languageAttempts) {
+                val result = runCatching {
+                    Log.i(
+                        LOG_TAG,
+                        "Transcribing with lang=$code translate=$translate " +
+                                "printTimestamp=$printTimestamp samples=${pcm.size}"
+                    )
+                    ctx.transcribeData(
+                        data = pcm,
+                        lang = code,
+                        translate = translate,
+                        printTimestamp = printTimestamp
+                    )
+                }.onFailure { e ->
+                    Log.e(
+                        LOG_TAG,
+                        "Whisper transcription failed for file=${file.path} lang=$code",
+                        e
+                    )
+                }
+
+                if (result.isFailure) {
+                    lastFailure = result.exceptionOrNull()
+                    continue
+                }
+
+                val trimmed = result.getOrThrow().trim()
+
                 Log.d(
                     LOG_TAG,
                     "Whisper result for lang=$code: length=${trimmed.length}, " +
                             "preview=\"${trimmed.take(80)}\""
                 )
+
                 if (trimmed.isNotEmpty()) {
-                    // First non-empty transcript → use it.
-                    return@withContext Result.success(trimmed)
-                } else {
-                    Log.w(
-                        LOG_TAG,
-                        "Empty transcript for lang=$code; " +
-                                "will try next language (if any)."
-                    )
+                    return@withLock Result.success(trimmed)
                 }
+
+                // Keep the last empty success so we can return it if all attempts are empty.
+                lastEmptySuccess = trimmed
+                Log.w(
+                    LOG_TAG,
+                    "Empty transcript for lang=$code; will try next language (if any)."
+                )
             }
 
-            // If result is failure, loop continues to the next language.
+            // All attempts either failed or were empty.
+            when {
+                lastEmptySuccess != null -> Result.success(lastEmptySuccess!!)
+                lastFailure != null -> Result.failure(lastFailure!!)
+                else -> Result.failure(
+                    IllegalStateException("Transcription produced no usable result.")
+                )
+            }
         }
-
-        // All attempts failed or produced empty text.
-        // Return the last result (success or failure) so callers can inspect it.
-        lastResult ?: Result.failure(
-            IllegalStateException("Transcription did not run: no language attempts?")
-        )
     }
 
     // ---------------------------------------------------------------------
@@ -330,12 +362,12 @@ object WhisperEngine {
     /**
      * Release the active Whisper context, if any, and reset the engine.
      *
-     * This is safe to call multiple times; extra calls are ignored.
+     * This is safe to call multiple times.
      * After calling [release], you must call one of the ensureInitialized*
      * methods again before using [transcribeWaveFile].
      */
     suspend fun release() {
-        initMutex.withLock {
+        engineMutex.withLock {
             val ctx = context
             if (ctx == null) {
                 modelKey = null
@@ -344,7 +376,7 @@ object WhisperEngine {
 
             this@WhisperEngine.context = null
             val oldKey = modelKey
-            modelKey = null
+            this@WhisperEngine.modelKey = null
 
             runCatching {
                 Log.i(LOG_TAG, "Releasing WhisperContext for $oldKey")
@@ -360,9 +392,9 @@ object WhisperEngine {
     // ---------------------------------------------------------------------
 
     /**
-     * Simple statistics helper for PCM buffers.
+     * Simple statistics container for PCM buffers.
      *
-     * Used only for logging / debugging.
+     * This is used for logging only.
      */
     private data class PcmStats(
         val min: Float,
@@ -385,6 +417,7 @@ object WhisperEngine {
         }
 
         val rms = if (pcm.isNotEmpty()) sqrt(sumSq / pcm.size) else 0.0
+
         return PcmStats(
             min = if (min.isFinite()) min else 0f,
             max = if (max.isFinite()) max else 0f,

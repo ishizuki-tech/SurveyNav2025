@@ -21,10 +21,10 @@ import androidx.lifecycle.asFlow
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.negi.survey.net.GitHubUploadWorker
+import java.util.Locale
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
-import java.util.Locale
 
 /* ───────────────────────────── UI Model ───────────────────────────── */
 
@@ -57,6 +57,11 @@ data class UploadItemUi(
  * - Observes all work with [GitHubUploadWorker.TAG].
  * - Maps [WorkInfo] into [UploadItemUi] with stable sorting.
  * - Uses a lightweight equality check to avoid unnecessary recompositions.
+ * - Provides an optional HUD visibility flow for global overlays.
+ *
+ * Design note:
+ * - WorkInfo does NOT expose inputData in many WorkManager versions.
+ *   Therefore filename inference must rely on progress/output/tags.
  */
 class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -85,8 +90,20 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
                             .thenBy(String.CASE_INSENSITIVE_ORDER) { it.fileName }
                     )
             }
-            // Emit only when something that affects rendering actually changed.
+            /**
+             * Emit only when something that affects rendering actually changed.
+             */
             .distinctUntilChanged { old, new -> listsRenderEqual(old, new) }
+
+    /**
+     * Convenience flow for deciding whether a global upload HUD should be visible.
+     *
+     * Visible when there is any active or pending work.
+     */
+    val hudVisibleFlow: Flow<Boolean> =
+        itemsFlow
+            .map { list -> list.any { it.state.isActiveOrPending() } }
+            .distinctUntilChanged()
 
     /* ─────────────────────── Mapping helpers ─────────────────────── */
 
@@ -145,9 +162,13 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      * Resolution order:
      *  1. `progress[PROGRESS_FILE]` during upload.
      *  2. `outputData[OUT_FILE_NAME]` after success/failure.
-     *  3. A tag formatted as `"GitHubUpload:file:<name>"`.
-     *  4. `input_file` from progress or output key-value maps.
+     *  3. A tag formatted as `"${GitHubUploadWorker.TAG}:file:<name>"`.
+     *  4. `input_file` from progress or output.
      *  5. Fallback `"upload-<4chars>.json"` using work ID prefix.
+     *
+     * Note:
+     * - WorkInfo does not reliably expose inputData, so we cannot read
+     *   the original WorkRequest input here.
      */
     private fun extractFileName(wi: WorkInfo): String {
         progressName(wi)?.let { return it }
@@ -167,14 +188,38 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
             .getString(GitHubUploadWorker.OUT_FILE_NAME)
             ?.takeIf { it.isNotBlank() }
 
-    private fun inputName(wi: WorkInfo): String? =
-        wi.progress.keyValueMap["input_file"] as? String
-            ?: wi.outputData.keyValueMap["input_file"] as? String
-
-    private fun tagName(wi: WorkInfo): String? =
-        wi.tags.firstOrNull { it.startsWith("${GitHubUploadWorker.TAG}:file:") }
-            ?.substringAfter(":file:")
+    /**
+     * Best-effort name inference from progress/output.
+     *
+     * This assumes the worker echoes the input file name into progress
+     * early and into output on completion.
+     */
+    private fun inputName(wi: WorkInfo): String? {
+        wi.progress
+            .getString(KEY_INPUT_FILE)
             ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        wi.outputData
+            .getString(KEY_INPUT_FILE)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        return null
+    }
+
+    /**
+     * Extract filename from a structured tag.
+     *
+     * Expected tag format:
+     *  - "${GitHubUploadWorker.TAG}:file:<name>"
+     */
+    private fun tagName(wi: WorkInfo): String? {
+        val prefix = "${GitHubUploadWorker.TAG}:file:"
+        val tag = wi.tags.firstOrNull { it.startsWith(prefix) } ?: return null
+        val name = tag.removePrefix(prefix)
+        return name.takeIf { it.isNotBlank() }
+    }
 
     /**
      * Compute UI priority for an upload item.
@@ -194,7 +239,7 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      * Lightweight deep equality for the fields that affect rendering.
      *
      * This intentionally ignores [UploadItemUi.message], because it is
-     * always derived from [UploadItemUi.state].
+     * derived from [UploadItemUi.state].
      */
     private fun listsRenderEqual(
         a: List<UploadItemUi>,
@@ -213,7 +258,21 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
+    /**
+     * True when a work state should keep the HUD visible.
+     */
+    private fun WorkInfo.State.isActiveOrPending(): Boolean = when (this) {
+        WorkInfo.State.RUNNING,
+        WorkInfo.State.ENQUEUED,
+        WorkInfo.State.BLOCKED -> true
+        WorkInfo.State.SUCCEEDED,
+        WorkInfo.State.FAILED,
+        WorkInfo.State.CANCELLED -> false
+    }
+
     companion object {
+        private const val KEY_INPUT_FILE = "input_file"
+
         /**
          * Compose-friendly factory.
          *

@@ -40,15 +40,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -69,7 +69,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -120,15 +119,29 @@ fun UploadProgressOverlay(
 ) {
     val items by vm.itemsFlow.collectAsState(initial = emptyList())
 
-    // Derived visibility based on the aggregated item states.
-    val visible by remember(items) {
-        derivedStateOf {
-            items.any {
-                it.state == WorkInfo.State.RUNNING ||
-                        it.state == WorkInfo.State.ENQUEUED ||
-                        it.state == WorkInfo.State.BLOCKED
-            }
-        }
+    /**
+     * Visibility should be derived directly from the latest collected list.
+     *
+     * Using derivedStateOf here would not provide value because [items] is a
+     * plain List after delegation; the calculation is cheap and stable.
+     */
+    val visible = items.any {
+        it.state == WorkInfo.State.RUNNING ||
+                it.state == WorkInfo.State.ENQUEUED ||
+                it.state == WorkInfo.State.BLOCKED
+    }
+
+    /**
+     * Keep a stable display order to reduce HUD jitter.
+     */
+    val displayItems = remember(items) {
+        val rank = stateRankMap()
+        items.sortedWith(
+            compareBy<UploadItemUi>(
+                { rank[it.state] ?: 99 },
+                { it.fileName.lowercase() }
+            )
+        )
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -155,7 +168,7 @@ fun UploadProgressOverlay(
             enter = fadeIn(),
             exit = fadeOut()
         ) {
-            // Outer “rim” for a subtle neon-glass effect.
+            // Outer rim for a subtle glass-like lift.
             val rimShape = RoundedCornerShape(20.dp)
             val primary = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
             val tertiary = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.65f)
@@ -164,11 +177,11 @@ fun UploadProgressOverlay(
                 modifier = Modifier
                     .widthIn(max = 560.dp)
                     .drawBehind {
-                        val strokeWidth = 8f
+                        val strokeWidth = 2.dp.toPx()
                         drawRoundRect(
                             brush = Brush.linearGradient(listOf(primary, tertiary)),
                             size = size,
-                            cornerRadius = CornerRadius(24f, 24f),
+                            cornerRadius = CornerRadius(24.dp.toPx(), 24.dp.toPx()),
                             style = Stroke(width = strokeWidth)
                         )
                     }
@@ -177,7 +190,6 @@ fun UploadProgressOverlay(
                 ElevatedCard(
                     shape = rimShape,
                     colors = CardDefaults.elevatedCardColors(
-                        // Slight tint to lift the card above background/scrim.
                         containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
                     ),
                     elevation = CardDefaults.elevatedCardElevation(defaultElevation = 10.dp)
@@ -199,8 +211,11 @@ fun UploadProgressOverlay(
                             modifier = Modifier.heightIn(max = 280.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            // Use stable keys; prefer work id, fall back to fileName.
-                            items(items, key = { it.id }) { item ->
+                            // Use stable keys whenever possible.
+                            items(
+                                items = displayItems,
+                                key = { it.id.ifBlank { it.fileName } }
+                            ) { item ->
                                 UploadRowFancy(item)
                             }
                         }
@@ -234,19 +249,19 @@ private fun UploadRowFancy(u: UploadItemUi) {
     // Map WorkManager state to accent color, icon, and short label.
     val (accent, icon, label) = styleFor(u.state)
 
-    // Target progress in [0f, 1f] where null means indeterminate.
-    val target = u.percent
+    /**
+     * Determine a normalized progress target.
+     *
+     * - When percent is available, we animate deterministically.
+     * - When percent is missing and state is RUNNING, we fall back to
+     *   indeterminate progress to avoid showing a misleading 0% bar.
+     */
+    val percent01 = u.percent
         ?.coerceIn(0, 100)
         ?.div(100f)
-        ?: when (u.state) {
-            WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED -> null
-            WorkInfo.State.RUNNING -> 0f
-            WorkInfo.State.SUCCEEDED -> 1f
-            WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> 0f
-        }
 
     val animProgress by animateFloatAsState(
-        targetValue = target ?: 0f,
+        targetValue = percent01 ?: 0f,
         label = "upload_progress"
     )
 
@@ -281,12 +296,16 @@ private fun UploadRowFancy(u: UploadItemUi) {
             }
             AssistChip(
                 onClick = { /* decorative status only */ },
+                enabled = false,
                 label = { Text(label) },
                 leadingIcon = { Icon(imageVector = icon, contentDescription = null) },
                 colors = AssistChipDefaults.assistChipColors(
                     containerColor = accent.copy(alpha = 0.15f),
                     labelColor = MaterialTheme.colorScheme.onSurface,
-                    leadingIconContentColor = accent
+                    leadingIconContentColor = accent,
+                    disabledContainerColor = accent.copy(alpha = 0.15f),
+                    disabledLabelColor = MaterialTheme.colorScheme.onSurface,
+                    disabledLeadingIconContentColor = accent
                 )
             )
         }
@@ -316,12 +335,17 @@ private fun UploadRowFancy(u: UploadItemUi) {
             }
 
             WorkInfo.State.RUNNING -> {
-                LinearProgressIndicator(
-                    progress = { animProgress },
-                    modifier = Modifier.fillMaxWidth(),
-                    color = accent
-                )
-                if (u.percent != null) {
+                if (percent01 == null) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = accent
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        progress = { animProgress },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = accent
+                    )
                     Spacer(Modifier.height(4.dp))
                     Text(
                         text = "${(animProgress * 100).roundToInt()}%",
@@ -363,7 +387,6 @@ private fun UploadRowFancy(u: UploadItemUi) {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error
                 )
-                // If needed, retry or details actions can be wired here.
             }
 
             WorkInfo.State.CANCELLED -> {
@@ -419,3 +442,17 @@ private fun styleFor(state: WorkInfo.State): Triple<Color, ImageVector, String> 
             Triple(c.error, Icons.Outlined.ErrorOutline, "Cancelled")
     }
 }
+
+/**
+ * Provide a stable ordering rank for WorkManager states.
+ *
+ * Lower values appear earlier in the HUD.
+ */
+private fun stateRankMap(): Map<WorkInfo.State, Int> = mapOf(
+    WorkInfo.State.RUNNING to 0,
+    WorkInfo.State.ENQUEUED to 1,
+    WorkInfo.State.BLOCKED to 2,
+    WorkInfo.State.FAILED to 3,
+    WorkInfo.State.CANCELLED to 4,
+    WorkInfo.State.SUCCEEDED to 5
+)

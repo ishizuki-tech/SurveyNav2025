@@ -20,6 +20,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -45,6 +46,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -57,9 +61,6 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -76,12 +77,15 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -137,7 +141,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Prefer modern edge-to-edge API. Fall back gracefully on older devices.
+        /**
+         * Prefer modern edge-to-edge API. Fall back gracefully on older devices.
+         */
         try {
             enableEdgeToEdge(
                 statusBarStyle = SystemBarStyle.dark("#000000".toColorInt()),
@@ -251,7 +257,9 @@ fun InitGate(
         }
     }
 
-    // Run initialization once when the given [key] enters composition.
+    /**
+     * Run initialization once when the given [key] enters composition.
+     */
     LaunchedEffect(key) {
         kick()
     }
@@ -260,7 +268,6 @@ fun InitGate(
 
     when {
         isLoading -> {
-            // Loading state: full-screen dark background + centered card.
             Box(
                 modifier
                     .fillMaxSize()
@@ -287,7 +294,6 @@ fun InitGate(
                         )
                         Spacer(Modifier.height(14.dp))
 
-                        // Soft alpha pulsing for the headline to avoid a static feel.
                         val pulse = rememberInfiniteTransition(label = "init_gate_pulse")
                         val alpha by pulse.animateFloat(
                             initialValue = 0.35f,
@@ -316,7 +322,6 @@ fun InitGate(
         }
 
         error != null -> {
-            // Error state: same layout, but with error styling and Retry.
             Box(
                 modifier
                     .fillMaxSize()
@@ -355,7 +360,6 @@ fun InitGate(
         }
 
         else -> {
-            // Success state: hand over control to the main content.
             content()
         }
     }
@@ -370,8 +374,10 @@ fun InitGate(
  * - If the permission is granted, renders [content] immediately.
  * - If not, shows a small card explaining why the microphone is needed
  *   and offers a button to request permission.
- * - When the user denies permanently, shows a "Settings" action that
- *   opens the app settings page.
+ * - When the user denies, shows a snackbar with a quick Settings action.
+ *
+ * The permission state is re-checked on ON_RESUME so returning from
+ * the system settings updates the gate correctly.
  */
 @Composable
 fun AudioPermissionGate(
@@ -379,6 +385,7 @@ fun AudioPermissionGate(
     content: @Composable () -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -389,6 +396,21 @@ fun AudioPermissionGate(
             ContextCompat.checkSelfPermission(context, permission) ==
                     PackageManager.PERMISSION_GRANTED
         )
+    }
+
+    /**
+     * Re-check permission when the app returns from Settings.
+     */
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasPermission =
+                    ContextCompat.checkSelfPermission(context, permission) ==
+                            PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val launcher = rememberLauncherForActivityResult(
@@ -415,23 +437,8 @@ fun AudioPermissionGate(
     }
 
     if (hasPermission) {
-//        Box(
-//            modifier = modifier.fillMaxSize()
-//        ) {
-            // Main content keeps its own layout.
-            content()
-
-            // Snackbar overlays at the bottom without affecting main layout.
-//            SnackbarHost(
-//                hostState = snackbarHostState,
-//                modifier = Modifier
-//                    .align(Alignment.BottomCenter)
-//                    .fillMaxWidth()
-//                    .padding(horizontal = 16.dp, vertical = 24.dp)
-//            )
-//        }
+        content()
     } else {
-        // Permission not granted → show a simple gate.
         val backplate = animatedBackplate()
 
         Box(
@@ -515,36 +522,29 @@ fun AudioPermissionGate(
  * Top-level navigation host for the SurveyNav app.
  *
  * Stages:
- *  1) Intro/config selector:
- *     - Uses [IntroScreen] to let the user pick which YAML asset to load.
- *  2) Config load:
- *     - Loads [SurveyConfig] from the chosen asset with
- *       [SurveyConfigLoader.fromAssets].
- *  3) Model download:
- *     - Uses [AppViewModel] and [DownloadGate] to download the SLM model
- *       file using defaults from `modelDefaults`.
- *  4) SLM initialization:
- *     - Initializes the SLM runtime via [InitGate].
- *  5) Survey navigation:
- *     - Hosts the survey flow in [SurveyNavHost].
+ *  1) Intro/config selector.
+ *  2) Config load from assets.
+ *  3) Model download gate.
+ *  4) SLM initialization gate.
+ *  5) Survey navigation host.
  */
 @Composable
 fun AppNav() {
     val appContext = LocalContext.current.applicationContext
 
-    // Configuration options surfaced on the intro screen.
-    // Automatically discover survey_config*.yaml under assets.
+    /**
+     * Configuration options surfaced on the intro screen.
+     *
+     * Automatically discover survey_config*.yaml under assets.
+     */
     val options = remember(appContext) {
         val assetManager = appContext.assets
-
-        // List asset files and pick only survey_config*.yaml
         val files = assetManager.list("")?.toList().orEmpty()
 
         val yamlFiles = files
             .filter { it.startsWith("survey_config") && it.endsWith(".yaml") }
             .sorted()
 
-        // Map each file to a ConfigOptionUi.
         val mapped = yamlFiles.map { fileName ->
             val base = fileName.removeSuffix(".yaml")
 
@@ -577,7 +577,6 @@ fun AppNav() {
             )
         }
 
-        // Fallback in case nothing matched (defensive, should rarely happen).
         mapped.ifEmpty {
             listOf(
                 ConfigOptionUi(
@@ -594,7 +593,9 @@ fun AppNav() {
     var configLoading by remember { mutableStateOf(false) }
     var configError by remember { mutableStateOf<String?>(null) }
 
-    // Stage 1: no config chosen yet → show intro/config selector.
+    /**
+     * Stage 1: No config chosen yet.
+     */
     if (chosen == null) {
         IntroScreen(
             options = options,
@@ -606,7 +607,9 @@ fun AppNav() {
         return
     }
 
-    // Stage 2: load the chosen configuration once per selection.
+    /**
+     * Stage 2: Load the chosen configuration once per selection.
+     */
     LaunchedEffect(chosen!!.id) {
         configLoading = true
         configError = null
@@ -627,7 +630,6 @@ fun AppNav() {
 
     when {
         configLoading || (config == null && configError == null) -> {
-            // Config loading in progress.
             Box(
                 Modifier
                     .fillMaxSize()
@@ -670,7 +672,6 @@ fun AppNav() {
         }
 
         configError != null -> {
-            // Config load failed → show error and allow going back to selector.
             Box(
                 Modifier
                     .fillMaxSize()
@@ -702,7 +703,6 @@ fun AppNav() {
                         Spacer(Modifier.height(12.dp))
                         OutlinedButton(
                             onClick = {
-                                // Go back to the selector so the user can pick again.
                                 chosen = null
                                 config = null
                                 configError = null
@@ -717,10 +717,11 @@ fun AppNav() {
         }
     }
 
-    // At this point the configuration is successfully loaded.
+    /**
+     * Stage 3+: Config is successfully loaded.
+     */
     val cfg = config!!
 
-    // 3) Build AppViewModel with overrides injected from YAML model_defaults.
     val appVm: AppViewModel = viewModel(
         factory = AppViewModel.factoryFromOverrides(
             modelUrlOverride = cfg.modelDefaults.defaultModelUrl,
@@ -733,7 +734,9 @@ fun AppNav() {
 
     val state by appVm.state.collectAsState()
 
-    // Start model download once when entering Idle state.
+    /**
+     * Start model download once when entering Idle state.
+     */
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
             appVm.ensureModelDownloaded(appContext)
@@ -745,10 +748,8 @@ fun AppNav() {
         onRetry = { appVm.ensureModelDownloaded(appContext) }
     ) { modelFile ->
 
-        // 4) Build SLM model configuration map from YAML metadata.
         val modelConfig = remember(cfg) { buildModelConfig(cfg.slm) }
 
-        // 5) Create a concrete SLM model descriptor.
         val slmModel = remember(modelFile.absolutePath, modelConfig) {
             val modelName = cfg.modelDefaults.defaultFileName
                 ?.substringBeforeLast('.')
@@ -762,7 +763,6 @@ fun AppNav() {
             )
         }
 
-        // 5) Initialize SLM instance under InitGate.
         InitGate(
             key = slmModel,
             progressText = "Initializing Small Language Model…",
@@ -782,7 +782,6 @@ fun AppNav() {
                 }
             }
         ) {
-            // Ensure SLM resources are released when the composition is disposed.
             DisposableEffect(slmModel) {
                 onDispose {
                     runCatching {
@@ -793,12 +792,10 @@ fun AppNav() {
 
             val backStack = rememberNavBackStack(FlowHome)
 
-            // Repository used by AI ViewModel to talk to SLM.
             val repo: Repository = remember(appContext, slmModel, cfg) {
                 SlmDirectRepository(slmModel, cfg)
             }
 
-            // Survey ViewModel: holds graph position, answers, and follow-ups.
             val vmSurvey: SurveyViewModel = viewModel(
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
@@ -807,7 +804,6 @@ fun AppNav() {
                 }
             )
 
-            // AI ViewModel: wraps SLM calls and exposes responses to the UI.
             val vmAI: AiViewModel = viewModel(
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
@@ -816,8 +812,20 @@ fun AppNav() {
                 }
             )
 
+            val resetToSelector: () -> Unit = {
+                chosen = null
+                config = null
+                configError = null
+                configLoading = false
+            }
+
             AudioPermissionGate {
-                SurveyNavHost(vmSurvey, vmAI, backStack)
+                SurveyNavHost(
+                    vmSurvey = vmSurvey,
+                    vmAI = vmAI,
+                    backStack = backStack,
+                    onResetToSelector = resetToSelector
+                )
             }
         }
     }
@@ -829,35 +837,64 @@ fun AppNav() {
  * Host composable for the survey navigation flow.
  *
  * - Places [UploadProgressOverlay] at the root so upload HUD is always visible.
- * - Wires each navigation flow key (FlowHome / FlowText / FlowAI / FlowReview /
- *   FlowDone) to its corresponding screen.
- * - Manages back navigation via [BackHandler], delegating to [SurveyViewModel]
- *   and [AiViewModel] where appropriate.
+ * - Wires each navigation flow key to its corresponding screen.
+ * - Manages back navigation via [BackHandler].
  *
  * Restart behavior:
  * - When [DoneScreen] calls `onRestart`, this function:
  *   1) Resets AI and survey state.
- *   2) Shrinks [backStack] to a single FlowHome entry.
- *   3) Causes [NavDisplay] to render IntroScreen again.
+ *   2) Requests a full return to the config selector via [onResetToSelector].
  */
 @Composable
 fun SurveyNavHost(
     vmSurvey: SurveyViewModel,
     vmAI: AiViewModel,
-    backStack: NavBackStack<NavKey>
+    backStack: NavBackStack<NavKey>,
+    onResetToSelector: () -> Unit = {}
 ) {
-    // Global background upload HUD — always attached at the window root.
     UploadProgressOverlay()
 
     val appContext = LocalContext.current.applicationContext
 
-    // Single Whisper-based SpeechController shared across text/AI flows.
-    // Model path is interpreted as src/main/assets/models/...
+    val latestNode by vmSurvey.currentNode.collectAsState()
+    val latestNodeId = latestNode.id
+
+    /**
+     * Single Whisper-based SpeechController shared across text/AI flows.
+     *
+     * Keying by SurveyViewModel identity prevents the controller from
+     * accidentally holding a stale manifest callback across config reloads.
+     */
     val speechVm: WhisperSpeechController = viewModel(
+        key = "WhisperSpeechController_${vmSurvey.hashCode()}",
         factory = WhisperSpeechController.provideFactory(
             appContext = appContext,
             assetModelPath = "models/ggml-small-q5_1.bin",
-            languageCode = "en"      // or "en", "ja", "sw"
+            languageCode = "en",
+            onVoiceExported = onVoiceExported@{ voice ->
+                val resolvedQid = voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
+
+                if (resolvedQid.isBlank()) {
+                    Log.w(
+                        "MainActivity",
+                        "onVoiceExported: missing questionId and fallback failed. file=${voice.fileName}"
+                    )
+                    return@onVoiceExported
+                }
+
+                Log.d(
+                    "MainActivity",
+                    "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
+                )
+
+                vmSurvey.onVoiceExported(
+                    questionId = resolvedQid,
+                    fileName = voice.fileName,
+                    byteSize = voice.byteSize,
+                    checksum = voice.checksum,
+                    replace = false
+                )
+            }
         )
     )
 
@@ -871,11 +908,9 @@ fun SurveyNavHost(
             rememberViewModelStoreNavEntryDecorator()
         ),
         entryProvider = entryProvider {
-            // Home screen shown after SLM is initialized and config is loaded.
             entry<FlowHome> {
                 HomeScreen(
                     onStart = {
-                        // Reset internal state and advance to the first node.
                         vmSurvey.resetToStart()
                         vmAI.resetAll(keepError = false)
                         vmSurvey.advanceToNext()
@@ -883,7 +918,6 @@ fun SurveyNavHost(
                 )
             }
 
-            // Plain text question screen.
             entry<FlowText> {
                 val node by vmSurvey.currentNode.collectAsState()
                 AiScreen(
@@ -896,7 +930,6 @@ fun SurveyNavHost(
                 )
             }
 
-            // AI-driven question/answer screen (same UI, different node type).
             entry<FlowAI> {
                 val node by vmSurvey.currentNode.collectAsState()
                 AiScreen(
@@ -909,7 +942,6 @@ fun SurveyNavHost(
                 )
             }
 
-            // Review screen before finalization.
             entry<FlowReview> {
                 ReviewScreen(
                     vm = vmSurvey,
@@ -918,7 +950,6 @@ fun SurveyNavHost(
                 )
             }
 
-            // Final summary + export / upload screen.
             entry<FlowDone> {
                 val gh = if (BuildConfig.GH_TOKEN.isNotEmpty()) {
                     GitHubUploader.GitHubConfig(
@@ -935,17 +966,9 @@ fun SurveyNavHost(
                 DoneScreen(
                     vm = vmSurvey,
                     onRestart = {
-                        // 1) Reset AI and survey internal state for a fresh run.
                         vmAI.resetStates()
                         vmSurvey.resetToStart()
-
-                        // 2) Reset navigation backstack so only FlowHome remains.
-                        //    This assumes FlowHome is the start destination and
-                        //    is present as the first entry.
-                        while (backStack.size > 1) {
-                            backStack.removeLastOrNull()
-                        }
-                        // After this, NavDisplay will render FlowHome again.
+                        onResetToSelector()
                     },
                     gitHubConfig = gh
                 )
@@ -953,9 +976,6 @@ fun SurveyNavHost(
         }
     )
 
-    // Only intercept system back when there is something to pop inside
-    // the survey flow. On the root (FlowHome only), let the system handle
-    // back (e.g., finish the activity).
     BackHandler(enabled = canGoBack) {
         vmAI.resetStates()
         vmSurvey.backToPrevious()
@@ -967,8 +987,7 @@ fun SurveyNavHost(
  *
  * This screen intentionally keeps the visual language similar to the
  * loading/error gates so that the transition into the survey feels
- * continuous, while all config selection work has already been done
- * in [AppNav]'s intro stage.
+ * continuous.
  */
 @Composable
 private fun HomeScreen(
@@ -1058,10 +1077,18 @@ private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
 /**
  * Clamp sampling parameters to safe ranges before passing them to the engine.
  *
+ * - MAX_TOKENS is clamped to [1, +∞).
+ * - TOP_K is clamped to [1, +∞).
  * - TOP_P is clamped to [0.0, 1.0].
  * - TEMPERATURE is clamped to [0.0, +∞).
  */
 private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
+    val maxTokens = (m[ConfigKey.MAX_TOKENS] as Number)
+        .toInt()
+        .coerceAtLeast(1)
+    val topK = (m[ConfigKey.TOP_K] as Number)
+        .toInt()
+        .coerceAtLeast(1)
     val topP = (m[ConfigKey.TOP_P] as Number)
         .toDouble()
         .coerceIn(0.0, 1.0)
@@ -1069,6 +1096,8 @@ private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
         .toDouble()
         .coerceAtLeast(0.0)
 
+    m[ConfigKey.MAX_TOKENS] = maxTokens
+    m[ConfigKey.TOP_K] = topK
     m[ConfigKey.TOP_P] = topP
     m[ConfigKey.TEMPERATURE] = temp
 }

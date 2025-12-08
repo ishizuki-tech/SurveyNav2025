@@ -7,7 +7,27 @@
  *  License: MIT License
  *  © 2025 IshizukiTech LLC. All rights reserved.
  * =====================================================================
+ *
+ *  Summary:
+ *  ---------------------------------------------------------------------
+ *  Main ViewModel responsible for managing survey navigation and state.
+ *
+ *  Key upgrade points in this version:
+ *   • Adds a logical audio manifest (recordedAudioRefs) as a stable
+ *     source of truth for JSON export across repeated uploads.
+ *   • Provides helper APIs for run-scoped retrieval, per-file removal,
+ *     and replace semantics to support re-record flows.
+ *   • Strengthens thread-safety around audio ref mutation.
+ *   • Avoids double-pushing FlowHome when NavBackStack is pre-seeded
+ *     by rememberNavBackStack(FlowHome).
+ *   • Removes reliance on NavBackStack.clear() for broader compatibility.
+ *
+ *  This ViewModel intentionally does not depend on file-system scans.
+ *  Physical WAV discovery remains an Export/Repository responsibility.
+ * =====================================================================
  */
+
+@file:Suppress("MemberVisibilityCanBePrivate", "unused")
 
 package com.negi.survey.vm
 
@@ -16,6 +36,7 @@ import androidx.lifecycle.ViewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import com.negi.survey.config.SurveyConfig
+import java.util.UUID
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -127,7 +148,9 @@ sealed interface UiEvent {
  * - Tracks the current node and navigation history.
  * - Keeps questions and answers per node.
  * - Manages AI follow-up questions and answers.
+ * - Tracks recorded audio references per node (logical manifest).
  * - Exposes navigation helpers (advance, back, reset).
+ * - Provides a stable UUID per survey run for export correlation.
  *
  * @property nav Navigation back-stack.
  * @property config Survey configuration loaded from JSON/YAML.
@@ -144,9 +167,6 @@ open class SurveyViewModel(
 
     /**
      * Read-only view of the runtime survey graph, keyed by node ID.
-     *
-     * This can be used by review / summary screens to access titles and
-     * question text for each node without exposing the mutable internals.
      */
     val nodes: Map<String, Node>
         get() = graph
@@ -173,6 +193,19 @@ open class SurveyViewModel(
     val sessionId: StateFlow<Long> = _sessionId.asStateFlow()
 
     /**
+     * Stable UUID for the active survey run.
+     */
+    private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
+    val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
+
+    /**
+     * Regenerate the survey UUID for a brand-new run.
+     */
+    private fun regenerateSurveyUuid() {
+        _surveyUuid.value = UUID.randomUUID().toString()
+    }
+
+    /**
      * StateFlow representing the currently active [Node].
      */
     private val _currentNode = MutableStateFlow(
@@ -181,9 +214,13 @@ open class SurveyViewModel(
     val currentNode: StateFlow<Node> = _currentNode.asStateFlow()
 
     /**
+     * Convenience accessor for the current node ID.
+     */
+    val currentNodeId: String
+        get() = _currentNode.value.id
+
+    /**
      * Whether backwards navigation is currently possible.
-     *
-     * True when the internal navigation history contains more than one node.
      */
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
@@ -195,10 +232,21 @@ open class SurveyViewModel(
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
 
     /**
-     * Node ID to question text map, kept for the duration of the flow.
-     *
-     * This allows the UI to re-use original questions even after navigation.
+     * Emit a snackbar-like UI event.
      */
+    fun emitSnack(message: String) {
+        _events.tryEmit(UiEvent.Snack(message))
+    }
+
+    /**
+     * Emit a dialog UI event.
+     */
+    fun emitDialog(title: String, message: String) {
+        _events.tryEmit(UiEvent.Dialog(title, message))
+    }
+
+    /* ───────────────────────────── Questions ───────────────────────────── */
+
     private val _questions =
         MutableStateFlow<Map<String, String>>(LinkedHashMap())
     val questions: StateFlow<Map<String, String>> = _questions.asStateFlow()
@@ -226,9 +274,8 @@ open class SurveyViewModel(
         _questions.value = LinkedHashMap()
     }
 
-    /**
-     * Node ID to answer text map.
-     */
+    /* ───────────────────────────── Answers ───────────────────────────── */
+
     private val _answers =
         MutableStateFlow<Map<String, String>>(LinkedHashMap())
     val answers: StateFlow<Map<String, String>> = _answers.asStateFlow()
@@ -267,9 +314,8 @@ open class SurveyViewModel(
         _answers.value = LinkedHashMap()
     }
 
-    /**
-     * Single-choice selection for the current node.
-     */
+    /* ───────────────────────────── Choice Selections ───────────────────────────── */
+
     private val _single = MutableStateFlow<String?>(null)
     val single: StateFlow<String?> = _single.asStateFlow()
 
@@ -280,16 +326,11 @@ open class SurveyViewModel(
         _single.value = opt
     }
 
-    /**
-     * Multi-choice selection set for the current node.
-     */
     private val _multi = MutableStateFlow<Set<String>>(emptySet())
     val multi: StateFlow<Set<String>> = _multi.asStateFlow()
 
     /**
      * Toggle the presence of a multi-choice option in the selection set.
-     *
-     * If the option is not present, it is added; otherwise it is removed.
      */
     fun toggleMultiChoice(opt: String) {
         _multi.update { cur ->
@@ -309,13 +350,10 @@ open class SurveyViewModel(
         _multi.value = emptySet()
     }
 
+    /* ───────────────────────────── Follow-ups ───────────────────────────── */
+
     /**
      * Follow-up entry used to track AI-generated questions and answers.
-     *
-     * @property question Text of the follow-up question.
-     * @property answer Optional answer text (null if not yet answered).
-     * @property askedAt Timestamp when the follow-up was generated.
-     * @property answeredAt Timestamp when the follow-up was answered, or null.
      */
     data class FollowupEntry(
         val question: String,
@@ -324,9 +362,6 @@ open class SurveyViewModel(
         val answeredAt: Long? = null
     )
 
-    /**
-     * Map from node ID to a list of follow-up entries.
-     */
     private val _followups =
         MutableStateFlow<Map<String, List<FollowupEntry>>>(LinkedHashMap())
     val followups: StateFlow<Map<String, List<FollowupEntry>>> =
@@ -334,11 +369,6 @@ open class SurveyViewModel(
 
     /**
      * Add a follow-up question for a given node ID.
-     *
-     * @param nodeId Owner node ID.
-     * @param question Follow-up question text.
-     * @param dedupAdjacent When true, ignores the new question if it is
-     * the same as the last question for that node.
      */
     fun addFollowupQuestion(
         nodeId: String,
@@ -346,7 +376,7 @@ open class SurveyViewModel(
         dedupAdjacent: Boolean = true
     ) {
         _followups.update { old ->
-            val mutable = old.mutableLinkedLists()
+            val mutable = old.mutableLinkedLists<FollowupEntry>()
             val list = mutable.getOrPut(nodeId) { mutableListOf() }
             val last = list.lastOrNull()
             if (!(dedupAdjacent && last?.question == question)) {
@@ -358,15 +388,13 @@ open class SurveyViewModel(
 
     /**
      * Answer the last unanswered follow-up for the given node ID.
-     *
-     * If all follow-ups already have answers, this method is a no-op.
      */
     fun answerLastFollowup(
         nodeId: String,
         answer: String
     ) {
         _followups.update { old ->
-            val mutable = old.mutableLinkedLists()
+            val mutable = old.mutableLinkedLists<FollowupEntry>()
             val list = mutable[nodeId] ?: return@update old
             val idx = list.indexOfLast { it.answer == null }
             if (idx < 0) {
@@ -382,8 +410,6 @@ open class SurveyViewModel(
 
     /**
      * Answer a follow-up at a specific index for the given node ID.
-     *
-     * If the index is out of range, this method is a no-op.
      */
     fun answerFollowupAt(
         nodeId: String,
@@ -391,7 +417,7 @@ open class SurveyViewModel(
         answer: String
     ) {
         _followups.update { old ->
-            val mutable = old.mutableLinkedLists()
+            val mutable = old.mutableLinkedLists<FollowupEntry>()
             val list = mutable[nodeId] ?: return@update old
             if (index !in list.indices) {
                 return@update old
@@ -409,7 +435,7 @@ open class SurveyViewModel(
      */
     fun clearFollowups(nodeId: String) {
         _followups.update { old ->
-            val mutable = old.mutableLinkedLists()
+            val mutable = old.mutableLinkedLists<FollowupEntry>()
             mutable.remove(nodeId)
             mutable.toImmutableLists()
         }
@@ -422,13 +448,210 @@ open class SurveyViewModel(
         _followups.value = LinkedHashMap()
     }
 
+    /* ───────────────────────────── Recorded Audio Refs ───────────────────────────── */
+
+    /**
+     * Audio reference metadata recorded during a survey run.
+     */
+    data class AudioRef(
+        val surveyId: String,
+        val questionId: String,
+        val fileName: String,
+        val createdAt: Long = System.currentTimeMillis(),
+        val byteSize: Long? = null,
+        val checksum: String? = null
+    )
+
+    private val _recordedAudioRefs =
+        MutableStateFlow<Map<String, List<AudioRef>>>(LinkedHashMap())
+    val recordedAudioRefs: StateFlow<Map<String, List<AudioRef>>> =
+        _recordedAudioRefs.asStateFlow()
+
+    /**
+     * Register a new audio reference for the active survey UUID.
+     */
+    @Synchronized
+    fun addAudioRef(
+        questionId: String,
+        fileName: String,
+        byteSize: Long? = null,
+        checksum: String? = null,
+        dedupByFileName: Boolean = true
+    ) {
+        val sid = surveyUuid.value
+
+        _recordedAudioRefs.update { old ->
+            val mutable = old.mutableLinkedLists<AudioRef>()
+            val list = mutable.getOrPut(questionId) { mutableListOf() }
+
+            val existsSameRun = list.any { it.fileName == fileName && it.surveyId == sid }
+            if (!dedupByFileName || !existsSameRun) {
+                list.add(
+                    AudioRef(
+                        surveyId = sid,
+                        questionId = questionId,
+                        fileName = fileName,
+                        byteSize = byteSize,
+                        checksum = checksum
+                    )
+                )
+            }
+
+            mutable.toImmutableLists()
+        }
+
+        Log.d(TAG, "addAudioRef -> q=$questionId, file=$fileName, sid=$sid")
+    }
+
+    /**
+     * Replace audio refs for a specific question with a single new file.
+     */
+    @Synchronized
+    fun replaceAudioRef(
+        questionId: String,
+        fileName: String,
+        byteSize: Long? = null,
+        checksum: String? = null
+    ) {
+        val sid = surveyUuid.value
+
+        _recordedAudioRefs.update { old ->
+            val mutable = old.mutableLinkedLists<AudioRef>()
+            mutable[questionId] = mutableListOf(
+                AudioRef(
+                    surveyId = sid,
+                    questionId = questionId,
+                    fileName = fileName,
+                    byteSize = byteSize,
+                    checksum = checksum
+                )
+            )
+            mutable.toImmutableLists()
+        }
+
+        Log.d(TAG, "replaceAudioRef -> q=$questionId, file=$fileName, sid=$sid")
+    }
+
+    /**
+     * Remove a specific audio reference by file name.
+     */
+    @Synchronized
+    fun removeAudioRef(
+        questionId: String,
+        fileName: String
+    ) {
+        _recordedAudioRefs.update { old ->
+            val mutable = old.mutableLinkedLists<AudioRef>()
+            val list = mutable[questionId] ?: return@update old
+
+            list.removeAll { it.fileName == fileName }
+
+            if (list.isEmpty()) {
+                mutable.remove(questionId)
+            }
+
+            mutable.toImmutableLists()
+        }
+
+        Log.d(TAG, "removeAudioRef -> q=$questionId, file=$fileName")
+    }
+
+    /**
+     * Clear audio refs for a specific question.
+     */
+    @Synchronized
+    fun clearAudioRefs(questionId: String) {
+        _recordedAudioRefs.update { old ->
+            val mutable = old.mutableLinkedLists<AudioRef>()
+            mutable.remove(questionId)
+            mutable.toImmutableLists()
+        }
+
+        Log.d(TAG, "clearAudioRefs -> q=$questionId")
+    }
+
+    /**
+     * Clear all recorded audio refs for the current run.
+     */
+    @Synchronized
+    fun resetAudioRefs() {
+        _recordedAudioRefs.value = LinkedHashMap()
+        Log.d(TAG, "resetAudioRefs -> cleared")
+    }
+
+    /**
+     * Read-only accessor for UI/JSON builders.
+     */
+    fun getAudioRefs(questionId: String): List<AudioRef> =
+        recordedAudioRefs.value[questionId].orEmpty()
+
+    /**
+     * Return audio refs that belong to the given survey run.
+     */
+    fun getAudioRefsForRun(
+        surveyId: String = surveyUuid.value
+    ): Map<String, List<AudioRef>> {
+        return recordedAudioRefs.value
+            .mapValues { (_, list) -> list.filter { it.surveyId == surveyId } }
+            .filterValues { it.isNotEmpty() }
+    }
+
+    /**
+     * Return a flattened list of audio refs for the given survey run.
+     */
+    fun getAudioRefsForRunFlat(
+        surveyId: String = surveyUuid.value
+    ): List<AudioRef> {
+        return getAudioRefsForRun(surveyId)
+            .values
+            .flatten()
+            .sortedBy { it.createdAt }
+    }
+
+    /**
+     * Returns true if at least one audio ref exists for the question
+     * in the given survey run.
+     */
+    fun hasAudioRef(
+        questionId: String,
+        surveyId: String = surveyUuid.value
+    ): Boolean {
+        return getAudioRefs(questionId).any { it.surveyId == surveyId }
+    }
+
+    /**
+     * High-level helper to register an exported voice artifact.
+     */
+    fun onVoiceExported(
+        questionId: String,
+        fileName: String,
+        byteSize: Long? = null,
+        checksum: String? = null,
+        replace: Boolean = false
+    ) {
+        if (replace) {
+            replaceAudioRef(
+                questionId = questionId,
+                fileName = fileName,
+                byteSize = byteSize,
+                checksum = checksum
+            )
+        } else {
+            addAudioRef(
+                questionId = questionId,
+                fileName = fileName,
+                byteSize = byteSize,
+                checksum = checksum,
+                dedupByFileName = true
+            )
+        }
+        Log.d(TAG, "onVoiceExported -> q=$questionId, file=$fileName, replace=$replace")
+    }
+
+    /* ───────────────────────────── Prompt Helpers ───────────────────────────── */
+
     /**
      * Build a rendered prompt string for the given node and answer.
-     *
-     * The template is looked up from [SurveyConfig.prompts] by node ID and
-     * uses placeholders like `{{QUESTION}}`, `{{ANSWER}}`, and `{{NODE_ID}}`.
-     *
-     * @throws IllegalArgumentException if no prompt is defined for the node.
      */
     fun getPrompt(
         nodeId: String,
@@ -454,9 +677,6 @@ open class SurveyViewModel(
 
     /**
      * Replace placeholders in a template using the format `{{KEY}}`.
-     *
-     * @param template Template text containing placeholders.
-     * @param vars Map of placeholder keys to replacement values.
      */
     private fun renderTemplate(
         template: String,
@@ -469,6 +689,8 @@ open class SurveyViewModel(
         }
         return out
     }
+
+    /* ───────────────────────────── Navigation ───────────────────────────── */
 
     /**
      * Map a [Node.type] to a [NavKey] destination.
@@ -493,9 +715,14 @@ open class SurveyViewModel(
     private fun push(node: Node) {
         _currentNode.value = node
         nodeStack.addLast(node.id)
+
+        // Clear ephemeral per-node selection state on forward navigation.
+        clearSelections()
+
         nav.add(navKeyFor(node))
         updateCanGoBack()
-        Log.d(TAG, "push -> ${node.id}")
+
+        Log.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
     }
 
     /**
@@ -511,13 +738,6 @@ open class SurveyViewModel(
     }
 
     /**
-     * Hook for UI to clear transient selections when the node changes.
-     */
-    fun onNodeChangedResetSelections() {
-        clearSelections()
-    }
-
-    /**
      * Navigate to the node with the given ID and push it onto the history.
      */
     @Synchronized
@@ -529,9 +749,6 @@ open class SurveyViewModel(
 
     /**
      * Replace the current node with another node without stacking.
-     *
-     * This is effectively a "jump" that pops the current node and then
-     * pushes the new node.
      */
     @Synchronized
     fun replaceTo(nodeId: String) {
@@ -548,35 +765,60 @@ open class SurveyViewModel(
     }
 
     /**
-     * Reset the navigation stack and move to the start node, clearing
-     * all survey answers, questions, follow-ups, and selections.
+     * Reset navigation back-stack to a single start destination.
      *
-     * Call this when starting a brand-new survey session.
+     * This intentionally avoids NavBackStack.clear() to reduce API coupling.
+     */
+    @Synchronized
+    private fun resetNavToStart(start: Node) {
+        val startKey = navKeyFor(start)
+
+        while (nav.size > 0) {
+            nav.removeLastOrNull()
+        }
+        nav.add(startKey)
+
+        Log.d(TAG, "resetNavToStart -> key=$startKey, navSize=${nav.size}")
+    }
+
+    /**
+     * Reset the navigation stack and move to the start node, clearing
+     * all survey answers, questions, follow-ups, audio refs, and selections.
      */
     @Synchronized
     fun resetToStart() {
-        // Clear navigation history.
-        nav.clear()
-        nodeStack.clear()
+        // Regenerate UUID first to mark a clean run boundary.
+        regenerateSurveyUuid()
 
         // Clear all survey state so previous session does not leak.
         resetQuestions()
         resetAnswers()
         resetFollowups()
+        resetAudioRefs()
         clearSelections()
 
-        // Re-initialize at the start node.
+        // Reset internal history.
+        nodeStack.clear()
+
         val start = nodeOf(startId)
         ensureQuestion(start.id)
+
         _currentNode.value = start
         nodeStack.addLast(start.id)
-        nav.add(navKeyFor(start))
+
+        // Reset NavBackStack to a single start key.
+        resetNavToStart(start)
+
         updateCanGoBack()
 
         // Bump session id so UI can treat this as a fresh run.
         _sessionId.update { it + 1 }
 
-        Log.d(TAG, "resetToStart() -> ${start.id}, session=${_sessionId.value}")
+        Log.d(
+            TAG,
+            "resetToStart -> ${start.id}, " +
+                    "session=${_sessionId.value}, uuid=${_surveyUuid.value}"
+        )
     }
 
     /**
@@ -595,6 +837,9 @@ open class SurveyViewModel(
         val prevId = nodeStack.last()
         _currentNode.value = nodeOf(prevId)
         updateCanGoBack()
+
+        // Clear ephemeral selections on back to avoid UI reusing stale state.
+        clearSelections()
 
         Log.d(TAG, "backToPrevious -> $prevId")
     }
@@ -635,6 +880,8 @@ open class SurveyViewModel(
         _canGoBack.value = nodeStack.size > 1
     }
 
+    /* ───────────────────────────── Map Helpers ───────────────────────────── */
+
     /**
      * Convert a generic immutable [Map] to a mutable [LinkedHashMap] copy.
      */
@@ -661,6 +908,8 @@ open class SurveyViewModel(
             Map<String, List<T>> =
         this.mapValues { (_, list) -> list.toList() }
 
+    /* ───────────────────────────── Initialization ───────────────────────────── */
+
     /**
      * Initialization block that builds the graph from config and moves
      * the navigation state to the start node.
@@ -671,14 +920,25 @@ open class SurveyViewModel(
             .associateBy { it.id }
             .mapValues { (_, dto) -> dto.toVmNode() }
 
-        // Initialize navigation at the start node.
         val start = nodeOf(startId)
         ensureQuestion(start.id)
+
         _currentNode.value = start
+        nodeStack.clear()
         nodeStack.addLast(start.id)
-        nav.add(navKeyFor(start))
+
+        // IMPORTANT:
+        // rememberNavBackStack(FlowHome) may already seed the back stack.
+        // Only add a start key when the stack is empty.
+        if (nav.size == 0) {
+            nav.add(navKeyFor(start))
+        }
+
         updateCanGoBack()
 
-        Log.d(TAG, "init -> ${start.id}, session=${_sessionId.value}")
+        Log.d(
+            TAG,
+            "init -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, navSize=${nav.size}"
+        )
     }
 }
