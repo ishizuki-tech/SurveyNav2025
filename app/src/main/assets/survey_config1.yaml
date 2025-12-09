@@ -3,58 +3,66 @@ graph:
   nodes:
     - id: Start
       type: START
-      title: Start
-      question: Start
+      title: Anza
+      question: Anza
       nextId: Q1
+
     - id: Q1
       type: AI
-      title: FAW Yield Loss (3 Seasons)
+      title: Hasara ya Mavuno kutokana na Funza wa Jeshi Vamizi (Misimu 3)
       question: >-
-        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
+        Unapoteza mavuno kiasi gani kutokana na funza wa jeshi vamizi (FAW)? Tafadhali fikiria misimu mitatu iliyopita. (Asilimia au magunia kwa ekari ni sawa.)
       nextId: Q2
+
     - id: Q2
       type: AI
-      title: Trade-off for 10-Day Earlier Harvest
+      title: Ubadilishanaji kwa Kuvuna Mapema kwa Siku 10
       question: >-
-        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
+        Ikiwa ungeweza kuvuna siku 10 mapema, ungekuwa tayari kupunguza mavuno kiasi gani? (Asilimia au magunia kwa ekari.)
       nextId: Q3
+
     - id: Q3
       type: AI
-      title: Damage Threshold to Switch Variety
+      title: Kizingiti cha Uharibifu cha Kubadili Aina ya Mahindi
       question: >-
-        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
+        Ni kiwango gani cha uharibifu wa wadudu au magonjwa kingekufanya uache kutumia aina yako ya sasa ya mahindi na ubadilishe kwenda aina mpya? (Toa kigezo wazi, kwa mfano: asilimia ya mimea au masikio yaliyoharibika, au kiwango cha ukali.)
       nextId: Q4
+
     - id: Q4
       type: AI
-      title: Expectations for Replacement Variety
+      title: Matarajio ya Aina Mpya ya Kuchukua Nafasi
       question: >-
-        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+        Ungetarajia nini kutoka kwa aina mpya ya mahindi ili kuchukua nafasi ya ile unayolima sasa? Tafadhali toa maelezo kwa undani kadiri inavyowezekana (kwa mfano, muda wa kukomaa (DTM), uvumilivu wa FAW, uvumilivu wa ukame katika hatua fulani, mavuno ya kawaida).
       nextId: Q5
+
     - id: Q5
       type: AI
-      title: Minimum Acceptable Harvest in Bad Year
+      title: Mavuno ya Chini Yanayokubalika Katika Mwaka Mbaya
       question: >-
-        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
+        Katika mwaka mbaya, ni mavuno madogo kiasi gani ambayo ungeyakubali na bado ukapande mahindi haya tena msimu unaofuata? (Asilimia ya mavuno ya kawaida au magunia kwa ekari.)
       nextId: Q6
+
     - id: Q6
       type: AI
-      title: Most Damaging Drought Timing
+      title: Wakati wa Ukame Unaoharibu Zaidi
       question: >-
-        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+        Ni kipindi gani katika msimu ambapo ukame unaathiri mazao yako kwa kiwango kikubwa zaidi? Ni wakati gani wa ukame ambao ni mgumu zaidi kwako? (Kwa mfano, kabla ya kutoa maua, wakati wa kutoa maua/kuchanua, kujaza punje, kabla ya kuvuna.)
       nextId: Review
+
     - id: Review
       type: REVIEW
-      title: Review
+      title: Kagua
       question: ''
       nextId: Done
+
     - id: Done
       type: DONE
-      title: Done
+      title: Imekamilika
       question: ''
 
 slm:
   accelerator: "GPU"
-  max_tokens: 4096
+  max_tokens: 1024
   top_k: 10
   top_p: 0.2
   temperature: 0.5
@@ -65,7 +73,7 @@ slm:
   preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
   key_contract: |
     OUTPUT FORMAT:
-    - In English.
+    - All Values in Swahili.
     - Keys:
       • "analysis": short string
       • "expected answer": short string
