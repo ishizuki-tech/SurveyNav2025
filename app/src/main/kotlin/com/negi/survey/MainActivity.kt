@@ -105,6 +105,7 @@ import com.negi.survey.screens.ConfigOptionUi
 import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.ReviewScreen
+import com.negi.survey.screens.SpeechController
 import com.negi.survey.screens.UploadProgressOverlay
 import com.negi.survey.slm.ConfigKey
 import com.negi.survey.slm.Model
@@ -123,6 +124,8 @@ import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -217,11 +220,6 @@ private fun Modifier.neonEdgeThin(
  * - On failure, shows an error card with a "Retry" action.
  * - Once [init] succeeds, renders [content] and never shows the gate again
  *   for the same [key].
- *
- * Typical usage:
- *  - Wrapping SLM model initialization.
- *  - Wrapping heavy one-time setup logic that must complete before the
- *    main UI becomes interactive.
  */
 @Composable
 fun InitGate(
@@ -239,9 +237,6 @@ fun InitGate(
 
     /**
      * Starts or restarts the initialization coroutine.
-     *
-     * This helper is used both on first composition and when the user taps
-     * the retry button after an error.
      */
     fun kick() {
         isLoading = true
@@ -518,6 +513,9 @@ fun AudioPermissionGate(
 
 /* ───────────────────────────── App Nav Root ───────────────────────────── */
 
+private const val DEFAULT_WHISPER_ASSET_MODEL = "models/ggml-small-q5_1.bin"
+private const val DEFAULT_WHISPER_LANGUAGE = "auto"
+
 /**
  * Top-level navigation host for the SurveyNav app.
  *
@@ -615,7 +613,7 @@ fun AppNav() {
         configError = null
         try {
             val loaded = withContext(Dispatchers.IO) {
-                SurveyConfigLoader.fromAssets(appContext, chosen!!.id)
+                SurveyConfigLoader.fromAssetsValidated(appContext, chosen!!.id)
             }
             config = loaded
         } catch (t: Throwable) {
@@ -661,7 +659,7 @@ fun AppNav() {
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            text = "Parsing YAML graph and SLM metadata",
+                            text = "Parsing YAML graph and SLM/Whisper metadata",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -750,7 +748,7 @@ fun AppNav() {
 
         val modelConfig = remember(cfg) { buildModelConfig(cfg.slm) }
 
-        val slmModel = remember(modelFile.absolutePath, modelConfig) {
+        val slmModel = remember(modelFile.absolutePath, modelConfig, cfg.modelDefaults.defaultFileName) {
             val modelName = cfg.modelDefaults.defaultFileName
                 ?.substringBeforeLast('.')
                 ?.ifBlank { null }
@@ -771,7 +769,7 @@ fun AppNav() {
             init = {
                 withContext(Dispatchers.Default) {
                     suspendCancellableCoroutine { cont ->
-                        SLM.initialize(appContext, slmModel) { err ->
+                        SLM.ensureInitialized(appContext, slmModel) { err ->
                             if (err.isEmpty()) {
                                 cont.resume(Unit)
                             } else {
@@ -782,13 +780,14 @@ fun AppNav() {
                 }
             }
         ) {
-            DisposableEffect(slmModel) {
-                onDispose {
-                    runCatching {
-                        SLM.cleanUp(slmModel) { }
-                    }
-                }
-            }
+            /**
+             * IMPORTANT:
+             * Do not call SLM.release() here.
+             *
+             * Releasing on dispose tends to trigger repeated init loops
+             * during config reloads or composition changes.
+             * The runtime should own the lifecycle of the model instance.
+             */
 
             val backStack = rememberNavBackStack(FlowHome)
 
@@ -819,12 +818,25 @@ fun AppNav() {
                 configLoading = false
             }
 
-            AudioPermissionGate {
+            val voiceEnabled = remember(cfg) { cfg.whisper.enabled ?: true }
+
+            if (voiceEnabled) {
+                AudioPermissionGate {
+                    SurveyNavHost(
+                        vmSurvey = vmSurvey,
+                        vmAI = vmAI,
+                        backStack = backStack,
+                        onResetToSelector = resetToSelector,
+                        whisperMeta = cfg.whisper
+                    )
+                }
+            } else {
                 SurveyNavHost(
                     vmSurvey = vmSurvey,
                     vmAI = vmAI,
                     backStack = backStack,
-                    onResetToSelector = resetToSelector
+                    onResetToSelector = resetToSelector,
+                    whisperMeta = cfg.whisper
                 )
             }
         }
@@ -850,7 +862,8 @@ fun SurveyNavHost(
     vmSurvey: SurveyViewModel,
     vmAI: AiViewModel,
     backStack: NavBackStack<NavKey>,
-    onResetToSelector: () -> Unit = {}
+    onResetToSelector: () -> Unit = {},
+    whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta()
 ) {
     UploadProgressOverlay()
 
@@ -859,44 +872,51 @@ fun SurveyNavHost(
     val latestNode by vmSurvey.currentNode.collectAsState()
     val latestNodeId = latestNode.id
 
-    /**
-     * Single Whisper-based SpeechController shared across text/AI flows.
-     *
-     * Keying by SurveyViewModel identity prevents the controller from
-     * accidentally holding a stale manifest callback across config reloads.
-     */
-    val speechVm: WhisperSpeechController = viewModel(
-        key = "WhisperSpeechController_${vmSurvey.hashCode()}",
-        factory = WhisperSpeechController.provideFactory(
-            appContext = appContext,
-            assetModelPath = "models/ggml-small-q5_1.bin",
-            languageCode = "en",
-            onVoiceExported = onVoiceExported@{ voice ->
-                val resolvedQid = voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
+    val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
 
-                if (resolvedQid.isBlank()) {
-                    Log.w(
+    val speechController: SpeechController = if (voiceEnabled) {
+        val assetPath = remember(whisperMeta.assetModelPath) {
+            whisperMeta.assetModelPath?.ifBlank { null } ?: DEFAULT_WHISPER_ASSET_MODEL
+        }
+        val lang = remember(whisperMeta.language) {
+            whisperMeta.language?.trim()?.lowercase()?.ifBlank { null } ?: DEFAULT_WHISPER_LANGUAGE
+        }
+
+        viewModel(
+            key = "WhisperSpeechController_${vmSurvey.hashCode()}_${assetPath}_$lang",
+            factory = WhisperSpeechController.provideFactory(
+                appContext = appContext,
+                assetModelPath = assetPath,
+                languageCode = lang,
+                onVoiceExported = onVoiceExported@{ voice ->
+                    val resolvedQid = voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
+
+                    if (resolvedQid.isBlank()) {
+                        Log.w(
+                            "MainActivity",
+                            "onVoiceExported: missing questionId and fallback failed. file=${voice.fileName}"
+                        )
+                        return@onVoiceExported
+                    }
+
+                    Log.d(
                         "MainActivity",
-                        "onVoiceExported: missing questionId and fallback failed. file=${voice.fileName}"
+                        "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
                     )
-                    return@onVoiceExported
+
+                    vmSurvey.onVoiceExported(
+                        questionId = resolvedQid,
+                        fileName = voice.fileName,
+                        byteSize = voice.byteSize,
+                        checksum = voice.checksum,
+                        replace = false
+                    )
                 }
-
-                Log.d(
-                    "MainActivity",
-                    "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
-                )
-
-                vmSurvey.onVoiceExported(
-                    questionId = resolvedQid,
-                    fileName = voice.fileName,
-                    byteSize = voice.byteSize,
-                    checksum = voice.checksum,
-                    replace = false
-                )
-            }
+            )
         )
-    )
+    } else {
+        remember { NoOpSpeechController() }
+    }
 
     val canGoBack by vmSurvey.canGoBack.collectAsState()
 
@@ -926,7 +946,7 @@ fun SurveyNavHost(
                     vmAI = vmAI,
                     onNext = { vmSurvey.advanceToNext() },
                     onBack = { vmSurvey.backToPrevious() },
-                    speechController = speechVm
+                    speechController = speechController
                 )
             }
 
@@ -938,7 +958,7 @@ fun SurveyNavHost(
                     vmAI = vmAI,
                     onNext = { vmSurvey.advanceToNext() },
                     onBack = { vmSurvey.backToPrevious() },
-                    speechController = speechVm
+                    speechController = speechController
                 )
             }
 
@@ -981,6 +1001,8 @@ fun SurveyNavHost(
         vmSurvey.backToPrevious()
     }
 }
+
+/* ───────────────────────────── Home Screen ───────────────────────────── */
 
 /**
  * Simple home screen shown after model initialization.
@@ -1100,4 +1122,40 @@ private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
     m[ConfigKey.TOP_K] = topK
     m[ConfigKey.TOP_P] = topP
     m[ConfigKey.TEMPERATURE] = temp
+}
+
+/* ───────────────────────────── No-op Speech ───────────────────────────── */
+
+/**
+ * No-op speech controller for configs that disable Whisper.
+ *
+ * This preserves the UI contract without requiring conditional screen code.
+ */
+private class NoOpSpeechController : SpeechController {
+
+    private val _isRecording = MutableStateFlow(false)
+    private val _isTranscribing = MutableStateFlow(false)
+    private val _partialText = MutableStateFlow("")
+    private val _error = MutableStateFlow<String?>(null)
+
+    override val isRecording: StateFlow<Boolean> = _isRecording
+    override val isTranscribing: StateFlow<Boolean> = _isTranscribing
+    override val partialText: StateFlow<String> = _partialText
+    override val errorMessage: StateFlow<String?> = _error
+
+    override fun updateContext(surveyId: String?, questionId: String?) {
+        // No-op
+    }
+
+    override fun startRecording() {
+        _error.value = "Voice input is disabled by configuration."
+    }
+
+    override fun stopRecording() {
+        // No-op
+    }
+
+    override fun toggleRecording() {
+        startRecording()
+    }
 }

@@ -12,12 +12,12 @@
  *  ---------------------------------------------------------------------
  *  Strongly-typed survey configuration model and loader.
  *  Supports JSON and YAML formats, SLM metadata, model defaults,
- *  and structural validation for graph-based survey flows.
+ *  Whisper metadata, and structural validation for graph-based survey flows.
  *
  *  Features:
- *   • Typed prompts, graph, SLM runtime metadata, and model defaults
+ *   • Typed prompts, graph, SLM runtime metadata, Whisper metadata, and model defaults
  *   • JSON/YAML auto-detection with BOM and newline normalization
- *   • Config-level graph/SLM/model-defaults validation
+ *   • Config-level graph/SLM/Whisper/model-defaults validation
  *   • Backward-compatible type aliases for legacy call sites
  *   • Convenience loader APIs that validate on load
  * =====================================================================
@@ -33,19 +33,22 @@ import java.nio.charset.Charset
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 /**
  * Top-level configuration model for a survey.
  *
- * Aggregates the prompt table, graph structure, SLM metadata, and model
- * defaults that describe how a survey should be executed at runtime.
+ * Aggregates the prompt table, graph structure, SLM metadata, Whisper metadata,
+ * and model defaults that describe how a survey should be executed at runtime.
  */
 @Serializable
 data class SurveyConfig(
     val prompts: List<Prompt> = emptyList(),
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
+    val whisper: WhisperMeta = WhisperMeta(),
     @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
 
@@ -139,6 +142,43 @@ data class SurveyConfig(
 
         /** Extra constraints to enforce strict output formats. */
         @SerialName("strict_output") val strict_output: String? = null
+    )
+
+    // ---------------------------------------------------------------------
+    // Whisper metadata
+    // ---------------------------------------------------------------------
+
+    /**
+     * Whisper runtime parameters used by on-device speech input.
+     *
+     * These values are optional overrides for the client-side defaults.
+     * When omitted, the app should fall back to stable defaults.
+     */
+    @Serializable
+    data class WhisperMeta(
+        /** Enable or disable Whisper voice features at runtime. */
+        @SerialName("enabled") val enabled: Boolean? = null,
+
+        /** Asset path like "models/ggml-small-q5_1.bin". */
+        @SerialName("asset_model_path") val assetModelPath: String? = null,
+
+        /** "auto", "en", "ja", "sw". */
+        @SerialName("language") val language: String? = null,
+
+        /** If true, run Whisper in translation-to-English mode. */
+        @SerialName("translate") val translate: Boolean? = null,
+
+        /** If true, include timestamps in transcription output. */
+        @SerialName("print_timestamp") val printTimestamp: Boolean? = null,
+
+        /** Decoder target sample rate (e.g., 16000). */
+        @SerialName("target_sample_rate") val targetSampleRate: Int? = null,
+
+        /** Recorder preferred sample rates. */
+        @SerialName("record_sample_rates") val recordSampleRates: List<Int>? = null,
+
+        /** Whether to compute SHA-256 for exported WAV. */
+        @SerialName("compute_checksum") val computeChecksum: Boolean? = null
     )
 
     // ---------------------------------------------------------------------
@@ -333,6 +373,35 @@ data class SurveyConfig(
         slm.temperature?.let {
             if (it < 0.0) {
                 issues += "slm.temperature must be >= 0.0 (got $it)"
+            }
+        }
+
+        // --- Whisper param sanity (optional, only if given) ---
+        whisper.assetModelPath?.let { p ->
+            if (p.isBlank()) {
+                issues += "whisper.asset_model_path is blank"
+            }
+        }
+        whisper.language?.let { lang ->
+            val norm = lang.trim().lowercase()
+            val ok = norm in setOf("auto", "en", "ja", "sw")
+            if (!ok) {
+                issues += "whisper.language should be one of 'auto','en','ja','sw' (got '$lang')"
+            }
+        }
+        whisper.targetSampleRate?.let { sr ->
+            if (sr <= 0) {
+                issues += "whisper.target_sample_rate must be > 0 (got $sr)"
+            }
+        }
+        whisper.recordSampleRates?.let { rs ->
+            if (rs.isEmpty()) {
+                issues += "whisper.record_sample_rates is empty"
+            } else {
+                val bad = rs.filter { it <= 0 }.distinct()
+                if (bad.isNotEmpty()) {
+                    issues += "whisper.record_sample_rates contains non-positive entries: ${bad.joinToString(",")}"
+                }
             }
         }
 

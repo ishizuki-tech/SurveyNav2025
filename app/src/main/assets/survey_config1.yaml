@@ -62,10 +62,10 @@ graph:
 
 slm:
   accelerator: "GPU"
-  max_tokens: 1024
+  max_tokens: 4096
   top_k: 10
   top_p: 0.2
-  temperature: 0.5
+  temperature: 0.3
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
   turn_end: "<end_of_turn>"
@@ -93,6 +93,16 @@ slm:
     - RAW JSON only, ONE LINE.
     - Use COMPACT JSON (no spaces around ':' and ',').
     - No extra text.
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-model-q4_0.bin"
+  language: "sw" # "auto", "en", "ja", "sw"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true
 
 prompts:
   - nodeId: Q1

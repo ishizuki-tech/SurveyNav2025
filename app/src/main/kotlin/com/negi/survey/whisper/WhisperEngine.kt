@@ -19,46 +19,47 @@ import com.negi.whispers.media.decodeWaveFile
 import com.whispercpp.whisper.WhisperContext
 import java.io.File
 import kotlin.math.sqrt
+import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val LOG_TAG = "WhisperEngine"
+private const val DEFAULT_TARGET_SAMPLE_RATE = 16_000
+private const val ASSET_KEY_PREFIX = "asset:"
 
 /**
  * Thin facade for integrating Whisper.cpp into the SurveyNav app.
  *
  * This object wraps [WhisperContext] and [decodeWaveFile] to provide a small,
- * suspend-friendly API:
+ * suspend-friendly API.
  *
- * - [ensureInitializedFromFile]  Loads a Whisper model from a local file.
- * - [ensureInitializedFromAsset] Loads a Whisper model from app assets.
- * - [transcribeWaveFile]         Decodes a WAV file and runs transcription.
- * - [release]                    Frees native resources and resets the engine.
+ * Key design:
+ * - The engine is a process-wide singleton.
+ * - Initialization is idempotent per model key.
+ * - All operations touching the underlying [WhisperContext] are serialized
+ *   through a single [engineMutex].
  *
- * Thread-safety:
- * - All operations that touch the underlying [WhisperContext] are serialized
- *   through [engineMutex]. This prevents a dangerous race where:
- *   - one coroutine is transcribing while
- *   - another coroutine releases or swaps the model.
+ * Two-level cleanup:
+ * - [detach] is a soft UI-level detach that keeps the native context alive.
+ * - [release] is a hard cleanup that closes native resources.
  *
- * Performance note:
- * - WAV decoding is performed outside the mutex to minimize lock time.
- * - The actual Whisper JNI call is protected by the mutex.
+ * This split prevents unnecessary re-initialization when Compose screens
+ * are disposed and recreated during navigation or "restart" flows.
  */
 object WhisperEngine {
 
     /**
      * Current active Whisper context.
      *
-     * Access must be guarded by [engineMutex].
+     * Access must be guarded by [engineMutex] for mutation.
      */
     @Volatile
-    private var context: WhisperContext? = null
+    private var whisperContext: WhisperContext? = null
 
     /**
-     * Identifier of the model used to create [context].
+     * Identifier of the model used to create [whisperContext].
      *
      * - For file-based models: absolute file path.
      * - For asset-based models: synthetic key "asset:<path>".
@@ -71,20 +72,38 @@ object WhisperEngine {
      */
     private val engineMutex = Mutex()
 
-    // ---------------------------------------------------------------------
-    // Initialization
-    // ---------------------------------------------------------------------
+    /**
+     * Returns the currently bound model key, if any.
+     */
+    fun currentModelKey(): String? = modelKey
+
+    /**
+     * Returns true if a Whisper context is currently alive.
+     */
+    fun isInitialized(): Boolean = whisperContext != null
+
+    /**
+     * Returns true if initialized with the given file path.
+     */
+    fun isInitializedForFile(modelFile: File): Boolean =
+        whisperContext != null && modelKey == modelFile.absolutePath
+
+    /**
+     * Returns true if initialized with the given asset path.
+     */
+    fun isInitializedForAsset(assetPath: String): Boolean =
+        whisperContext != null && modelKey == ASSET_KEY_PREFIX + assetPath
 
     /**
      * Ensure that a Whisper model is loaded from [modelFile].
      *
      * Behavior:
-     * - If the engine is already initialized with the same file path, this
+     * - If the engine is already initialized with the same file path,
      *   returns immediately with [Result.success].
      * - If a different model is active, the old context is released before
      *   creating a new one.
      *
-     * @param context Android [Context]. Stored for future extension.
+     * @param context Android [Context]. Currently used for parity with asset init.
      * @param modelFile Local Whisper model file (GGML/GGUF). Must exist.
      */
     suspend fun ensureInitializedFromFile(
@@ -100,17 +119,30 @@ object WhisperEngine {
             )
         }
 
-        engineMutex.withLock {
-            val key = modelFile.absolutePath
-            val current = this@WhisperEngine.context
+        val key = modelFile.absolutePath
 
-            // Fast path: already initialized with the same model file.
+        /**
+         * Fast path without locking.
+         */
+        if (whisperContext != null && modelKey == key) {
+            Log.d(LOG_TAG, "Already initialized with model file=$key")
+            return@withContext Result.success(Unit)
+        }
+
+        engineMutex.withLock {
+            val current = whisperContext
+
+            /**
+             * Double-check inside the lock.
+             */
             if (current != null && modelKey == key) {
-                Log.d(LOG_TAG, "Already initialized with model file=$key")
+                Log.d(LOG_TAG, "Already initialized with model file=$key (locked)")
                 return@withLock Result.success(Unit)
             }
 
-            // Release any previous context before switching models.
+            /**
+             * Release any previous context before switching models.
+             */
             if (current != null) {
                 runCatching {
                     Log.i(LOG_TAG, "Releasing previous WhisperContext for $modelKey")
@@ -120,26 +152,29 @@ object WhisperEngine {
                 }
             }
 
-            this@WhisperEngine.context = null
-            this@WhisperEngine.modelKey = null
+            whisperContext = null
+            modelKey = null
 
-            val createdResult = runCatching {
-                Log.i(LOG_TAG, "Creating WhisperContext from file=$key")
-                WhisperContext.createContextFromFile(key)
-            }.onFailure { e ->
-                Log.e(LOG_TAG, "Failed to create WhisperContext from $key", e)
+            var created: WhisperContext? = null
+            val elapsed = measureTimeMillis {
+                val createdResult = runCatching {
+                    Log.i(LOG_TAG, "Creating WhisperContext from file=$key")
+                    WhisperContext.createContextFromFile(key)
+                }.onFailure { e ->
+                    Log.e(LOG_TAG, "Failed to create WhisperContext from $key", e)
+                }
+
+                if (createdResult.isFailure) {
+                    return@withLock Result.failure(createdResult.exceptionOrNull()!!)
+                }
+
+                created = createdResult.getOrThrow()
             }
 
-            if (createdResult.isFailure) {
-                return@withLock Result.failure(createdResult.exceptionOrNull()!!)
-            }
+            whisperContext = created
+            modelKey = key
 
-            val created = createdResult.getOrThrow()
-
-            this@WhisperEngine.context = created
-            this@WhisperEngine.modelKey = key
-
-            Log.i(LOG_TAG, "WhisperEngine initialized with model file=$key")
+            Log.i(LOG_TAG, "WhisperEngine initialized with model file=$key (${elapsed}ms)")
             Result.success(Unit)
         }
     }
@@ -152,23 +187,55 @@ object WhisperEngine {
      *
      * Behavior mirrors [ensureInitializedFromFile] but uses
      * [WhisperContext.createContextFromAsset].
+     *
+     * @param context Android [Context] used for asset access.
+     * @param assetPath Relative asset path under the APK assets directory.
      */
     suspend fun ensureInitializedFromAsset(
         context: Context,
         assetPath: String
     ): Result<Unit> = withContext(Dispatchers.Default) {
 
-        engineMutex.withLock {
-            val key = "asset:$assetPath"
-            val current = this@WhisperEngine.context
+        /**
+         * Lightweight asset existence check.
+         */
+        val assetOk = runCatching {
+            context.assets.open(assetPath).use { }
+            true
+        }.getOrElse { false }
 
-            // Fast path: already initialized with the same asset model.
+        if (!assetOk) {
+            return@withContext Result.failure(
+                IllegalArgumentException(
+                    "Whisper asset model does not exist: assets/$assetPath"
+                )
+            )
+        }
+
+        val key = ASSET_KEY_PREFIX + assetPath
+
+        /**
+         * Fast path without locking.
+         */
+        if (whisperContext != null && modelKey == key) {
+            Log.d(LOG_TAG, "Already initialized with asset model=$assetPath")
+            return@withContext Result.success(Unit)
+        }
+
+        engineMutex.withLock {
+            val current = whisperContext
+
+            /**
+             * Double-check inside the lock.
+             */
             if (current != null && modelKey == key) {
-                Log.d(LOG_TAG, "Already initialized with asset model=$assetPath")
+                Log.d(LOG_TAG, "Already initialized with asset model=$assetPath (locked)")
                 return@withLock Result.success(Unit)
             }
 
-            // Release any previous context before switching models.
+            /**
+             * Release any previous context before switching models.
+             */
             if (current != null) {
                 runCatching {
                     Log.i(LOG_TAG, "Releasing previous WhisperContext for $modelKey")
@@ -178,33 +245,32 @@ object WhisperEngine {
                 }
             }
 
-            this@WhisperEngine.context = null
-            this@WhisperEngine.modelKey = null
+            whisperContext = null
+            modelKey = null
 
-            val createdResult = runCatching {
-                Log.i(LOG_TAG, "Creating WhisperContext from assets/$assetPath")
-                WhisperContext.createContextFromAsset(context.assets, assetPath)
-            }.onFailure { e ->
-                Log.e(LOG_TAG, "Failed to create WhisperContext from assets/$assetPath", e)
+            var created: WhisperContext? = null
+            val elapsed = measureTimeMillis {
+                val createdResult = runCatching {
+                    Log.i(LOG_TAG, "Creating WhisperContext from assets/$assetPath")
+                    WhisperContext.createContextFromAsset(context.assets, assetPath)
+                }.onFailure { e ->
+                    Log.e(LOG_TAG, "Failed to create WhisperContext from assets/$assetPath", e)
+                }
+
+                if (createdResult.isFailure) {
+                    return@withLock Result.failure(createdResult.exceptionOrNull()!!)
+                }
+
+                created = createdResult.getOrThrow()
             }
 
-            if (createdResult.isFailure) {
-                return@withLock Result.failure(createdResult.exceptionOrNull()!!)
-            }
+            whisperContext = created
+            modelKey = key
 
-            val created = createdResult.getOrThrow()
-
-            this@WhisperEngine.context = created
-            this@WhisperEngine.modelKey = key
-
-            Log.i(LOG_TAG, "WhisperEngine initialized with asset model=$assetPath")
+            Log.i(LOG_TAG, "WhisperEngine initialized with asset model=$assetPath (${elapsed}ms)")
             Result.success(Unit)
         }
     }
-
-    // ---------------------------------------------------------------------
-    // Transcription
-    // ---------------------------------------------------------------------
 
     /**
      * Transcribe the given WAV [file] and return plain-text output.
@@ -219,25 +285,23 @@ object WhisperEngine {
      * Return policy:
      * - The first non-empty trimmed transcript is returned as success.
      * - If all attempts produce empty text without throwing, the last empty
-     *   trimmed result is returned as success. This allows callers to decide
-     *   how to handle "no speech" or near-silence cases.
+     *   trimmed result is returned as success.
      *
      * Thread-safety:
-     * - The Whisper JNI call is protected by [engineMutex] to prevent concurrent
-     *   release/model swap.
+     * - The Whisper JNI call is protected by [engineMutex].
      *
      * @param file Input WAV file (PCM16 or Float32). Must exist.
      * @param lang Language code ("en", "ja", "sw", or "auto").
      * @param translate If true, runs Whisper in translation-to-English mode.
      * @param printTimestamp If true, appends timestamps to each output line.
-     * @param targetSampleRate Target sample rate for decoding, default 16 kHz.
+     * @param targetSampleRate Target sample rate for decoding.
      */
     suspend fun transcribeWaveFile(
         file: File,
         lang: String,
         translate: Boolean = false,
         printTimestamp: Boolean = false,
-        targetSampleRate: Int = 16_000
+        targetSampleRate: Int = DEFAULT_TARGET_SAMPLE_RATE
     ): Result<String> = withContext(Dispatchers.Default) {
 
         if (!file.exists() || !file.isFile) {
@@ -246,7 +310,6 @@ object WhisperEngine {
             )
         }
 
-        // Decode WAV into normalized mono float PCM outside the mutex.
         val pcmResult = runCatching {
             decodeWaveFile(
                 file = file,
@@ -269,7 +332,6 @@ object WhisperEngine {
             )
         }
 
-        // Basic PCM stats for debugging (helps spot near-silence / clipping).
         val stats = computePcmStats(pcm)
         Log.d(
             LOG_TAG,
@@ -284,10 +346,9 @@ object WhisperEngine {
                 listOf(lang)
             }
 
-        // Protect the WhisperContext usage from concurrent release/swap.
         engineMutex.withLock {
 
-            val ctx = context
+            val ctx = whisperContext
                 ?: return@withLock Result.failure(
                     IllegalStateException(
                         "WhisperEngine is not initialized. " +
@@ -326,17 +387,19 @@ object WhisperEngine {
 
                 val trimmed = result.getOrThrow().trim()
 
+                val preview =
+                    if (trimmed.length > 120) trimmed.take(90) + " … " + trimmed.takeLast(20)
+                    else trimmed
+
                 Log.d(
                     LOG_TAG,
-                    "Whisper result for lang=$code: length=${trimmed.length}, " +
-                            "preview=\"${trimmed.take(80)}\""
+                    "Whisper result for lang=$code: length=${trimmed.length}, preview=\"$preview\""
                 )
 
                 if (trimmed.isNotEmpty()) {
                     return@withLock Result.success(trimmed)
                 }
 
-                // Keep the last empty success so we can return it if all attempts are empty.
                 lastEmptySuccess = trimmed
                 Log.w(
                     LOG_TAG,
@@ -344,7 +407,6 @@ object WhisperEngine {
                 )
             }
 
-            // All attempts either failed or were empty.
             when {
                 lastEmptySuccess != null -> Result.success(lastEmptySuccess!!)
                 lastFailure != null -> Result.failure(lastFailure!!)
@@ -355,28 +417,42 @@ object WhisperEngine {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Cleanup
-    // ---------------------------------------------------------------------
+    /**
+     * Softly detach the engine from UI lifecycle without releasing native resources.
+     *
+     * This is intended for:
+     * - Compose screen disposal.
+     * - Navigation resets.
+     * - "Restart" flows that should not invalidate the heavy model load.
+     *
+     * The underlying [WhisperContext] remains alive in the process.
+     */
+    suspend fun detach() {
+        engineMutex.withLock {
+            Log.d(LOG_TAG, "Detach called. Keeping native context alive for key=$modelKey")
+        }
+    }
 
     /**
      * Release the active Whisper context, if any, and reset the engine.
      *
-     * This is safe to call multiple times.
-     * After calling [release], you must call one of the ensureInitialized*
-     * methods again before using [transcribeWaveFile].
+     * This is a hard cleanup:
+     * - Frees native resources.
+     * - Clears [modelKey].
+     *
+     * After calling [release], callers must re-initialize before transcription.
      */
     suspend fun release() {
         engineMutex.withLock {
-            val ctx = context
+            val ctx = whisperContext
             if (ctx == null) {
                 modelKey = null
                 return
             }
 
-            this@WhisperEngine.context = null
+            whisperContext = null
             val oldKey = modelKey
-            this@WhisperEngine.modelKey = null
+            modelKey = null
 
             runCatching {
                 Log.i(LOG_TAG, "Releasing WhisperContext for $oldKey")
@@ -387,14 +463,15 @@ object WhisperEngine {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Internal helpers
-    // ---------------------------------------------------------------------
+    /**
+     * Alias of [release] for clarity when a hard cleanup is explicitly desired.
+     */
+    suspend fun cleanUp() {
+        release()
+    }
 
     /**
      * Simple statistics container for PCM buffers.
-     *
-     * This is used for logging only.
      */
     private data class PcmStats(
         val min: Float,

@@ -11,16 +11,19 @@
  *  Summary:
  *  ---------------------------------------------------------------------
  *  Concurrency-safe helper for managing MediaPipe LLM inference sessions
- *  on Android. Responsibilities:
+ *  on Android.
  *
- *    - Initialize and configure LlmInference / LlmInferenceSession.
- *    - Stream responses via generateResponseAsync with partial tokens.
- *    - Provide cancellation and cleanup hooks with session reuse.
- *    - Expose simple busy-state checks for higher-level watchdogs.
+ *  Responsibilities:
+ *    • Initialize and configure LlmInference / LlmInferenceSession.
+ *    • Stream responses via generateResponseAsync with partial tokens.
+ *    • Provide cancellation and cleanup hooks with session reuse.
+ *    • Expose simple busy-state checks for higher-level watchdogs.
  *
- *  This object is designed to be called from a single coordinator
- *  (for example, SlmDirectRepository) that serializes requests across
- *  the app process.
+ *  Update:
+ *    • Add process-wide instance cache to avoid repeated heavy init.
+ *    • Add ensureInitialized() as the idempotent entry point.
+ *    • Add release() to detach a Model from cached runtime without closing.
+ *    • Keep cleanUp() as a hard-evict path.
  * =====================================================================
  */
 
@@ -125,11 +128,27 @@ data class LlmModelInstance(
 
 /**
  * Safe Language Model inference helper.
+ *
+ * This object is designed to be called from a single coordinator
+ * (for example, SlmDirectRepository) that serializes requests across
+ * the app process.
  */
 object SLM {
 
     /** Per-model cleanup listeners keyed by model identity. */
     private val cleanUpListeners = ConcurrentHashMap<String, () -> Unit>()
+
+    /**
+     * Process-wide cache to reuse heavy engine/session across UI resets.
+     *
+     * Key design:
+     * - The task file path is the main discriminator.
+     * - Backend preference and maxTokens are included because they affect
+     *   engine-level options.
+     *
+     * Sampling params (topK/topP/temp) are session-level and can be rebuilt.
+     */
+    private val instanceCache = ConcurrentHashMap<String, LlmModelInstance>()
 
     /**
      * Returns true when the model has an instance and its run state is not [RunState.IDLE].
@@ -138,7 +157,62 @@ object SLM {
         model.instance?.state?.get()?.let { it != RunState.IDLE } == true
 
     /**
+     * Idempotent initialization entry point.
+     *
+     * Behavior:
+     * - If a cached instance exists, attach it to [model.instance].
+     * - If session params differ, rebuild ONLY the session.
+     * - Otherwise, no-op with success.
+     * - If no cache exists, fall back to [initialize] and cache on success.
+     */
+    @Synchronized
+    fun ensureInitialized(context: Context, model: Model, onDone: (String) -> Unit) {
+        val cacheKey = cacheKeyOf(model)
+        val cached = instanceCache[cacheKey]
+
+        if (cached != null) {
+            if (cached.state.get() != RunState.IDLE) {
+                onDone("Model '${model.name}' is busy. Try again after done=true or call cancel().")
+                return
+            }
+
+            val desired = paramsFromModel(model)
+            if (cached.lastParams != desired) {
+                val old = cached.session
+                val newSession = runCatching { buildSession(cached.engine, desired) }
+                    .getOrElse {
+                        Log.e(TAG, "ensureInitialized: session rebuild failed: ${it.message}", it)
+                        onDone(cleanError(it.message))
+                        return
+                    }
+
+                cached.session = newSession
+                cached.lastParams = desired
+                tryCloseQuietly(old)
+            }
+
+            model.instance = cached
+            cleanUpListeners.remove(keyOf(model))
+            onDone("")
+            return
+        }
+
+        initialize(context, model) { err ->
+            if (err.isEmpty()) {
+                model.instance?.let { inst ->
+                    instanceCache[cacheKey] = inst
+                }
+            }
+            onDone(err)
+        }
+    }
+
+    /**
      * Initializes an engine + session for [model].
+     *
+     * Note:
+     * - Prefer calling [ensureInitialized] from UI.
+     * - This function remains as the hard init implementation.
      */
     @Synchronized
     fun initialize(context: Context, model: Model, onDone: (String) -> Unit) {
@@ -166,7 +240,7 @@ object SLM {
         val temp = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
         val backendPref = model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
 
-        val backend = when (backendPref) {
+        val backend = when (backendPref.uppercase()) {
             Accelerator.CPU.label -> LlmInference.Backend.CPU
             else -> LlmInference.Backend.GPU
         }
@@ -249,16 +323,34 @@ object SLM {
     }
 
     /**
+     * Detach this [model] from runtime without closing engine/session.
+     *
+     * Use this from Compose onDispose when you want to keep the SLM warm
+     * across UI session resets.
+     */
+    @Synchronized
+    fun release(model: Model) {
+        cleanUpListeners.remove(keyOf(model))
+        model.instance = null
+    }
+
+    /**
      * Completely cleans up the model's engine and session and disposes resources.
+     *
+     * This is a hard-evict path:
+     * - Removes the cached instance for the model's cache key.
+     * - Closes engine/session.
      */
     @Synchronized
     fun cleanUp(model: Model, onDone: () -> Unit) {
         val inst = model.instance ?: run {
+            instanceCache.remove(cacheKeyOf(model))
             onDone()
             return
         }
 
         cleanUpListeners.remove(keyOf(model))?.invoke()
+        instanceCache.remove(cacheKeyOf(model))
 
         runCatching {
             if (inst.state.get() != RunState.IDLE) {
@@ -469,6 +561,16 @@ object SLM {
      */
     private fun keyOf(model: Model): String =
         "${model.name}#${System.identityHashCode(model)}"
+
+    /**
+     * Build a process-wide cache key for heavy runtime reuse.
+     */
+    private fun cacheKeyOf(model: Model): String {
+        val maxTokens = model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN)
+        val backendPref = model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
+            .uppercase()
+        return "${model.getPath()}|$backendPref|$maxTokens"
+    }
 
     /**
      * Clean and compress error messages for UI.

@@ -45,9 +45,12 @@ import java.io.FileInputStream
 import java.security.MessageDigest
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -64,6 +67,12 @@ import kotlinx.coroutines.withContext
  * - [isTranscribing] is true while transcription is running.
  * - When recording stops and transcription succeeds, [partialText] is updated
  *   with the final recognized text.
+ *
+ * Lifecycle policy:
+ * - This controller does NOT hard-release Whisper native resources on
+ *   ViewModel clearance to avoid expensive re-initialization during
+ *   navigation/restart flows.
+ * - Instead it calls [WhisperEngine.detach].
  */
 class WhisperSpeechController(
     private val appContext: Context,
@@ -94,6 +103,19 @@ class WhisperSpeechController(
          * and keep this as "models/ggml-model-q4_0.bin".
          */
         private const val DEFAULT_ASSET_MODEL = "models/ggml-model-q4_0.bin"
+
+        /**
+         * Preferred sample rates to attempt for the recorder backend.
+         */
+        private val RECORDER_RATE_CANDIDATES = intArrayOf(16_000, 48_000, 44_100)
+
+        /**
+         * Minimum WAV byte length heuristic.
+         *
+         * 44 bytes is the typical PCM header size.
+         * Anything at or below this is effectively empty audio.
+         */
+        private const val MIN_WAV_BYTES = 44L
 
         /**
          * Factory for use with Compose `viewModel(factory = ...)`.
@@ -186,9 +208,20 @@ class WhisperSpeechController(
 
     /**
      * Prevent repeated model initialization across multiple recordings.
+     *
+     * Note:
+     * This mutex gates init attempts, while the actual truth of initialization
+     * is derived from [WhisperEngine.isInitializedForAsset].
      */
     private val modelInitMutex = Mutex()
-    private var modelInitialized = false
+
+    /**
+     * Cleanup scope not tied to [viewModelScope].
+     *
+     * This avoids the common pitfall where [viewModelScope] is already cancelled
+     * when [onCleared] executes.
+     */
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ---------------------------------------------------------------------
     // State exposed to the UI
@@ -217,7 +250,9 @@ class WhisperSpeechController(
      * Normalized language code for Whisper calls.
      */
     private val normalizedLanguage: String =
-        languageCodeRaw.trim().lowercase(Locale.ROOT).ifBlank { DEFAULT_LANGUAGE }
+        languageCodeRaw.trim()
+            .lowercase(Locale.ROOT)
+            .ifBlank { DEFAULT_LANGUAGE }
 
     // ---------------------------------------------------------------------
     // Optional context setter
@@ -253,7 +288,6 @@ class WhisperSpeechController(
         Log.d(TAG, "startRecording: requested")
         _error.value = null
         _partialText.value = ""
-
         _isRecording.value = true
 
         workerJob?.cancel()
@@ -278,7 +312,7 @@ class WhisperSpeechController(
                     Log.d(TAG, "startRecording: recorder.startRecording -> ${wav.path}")
                     recorder.startRecording(
                         output = wav,
-                        rates = intArrayOf(16_000, 48_000, 44_100)
+                        rates = RECORDER_RATE_CANDIDATES
                     )
 
                     Log.d(TAG, "startRecording: started")
@@ -306,7 +340,6 @@ class WhisperSpeechController(
         }
 
         Log.d(TAG, "stopRecording: requested")
-
         _isRecording.value = false
 
         workerJob?.cancel()
@@ -335,7 +368,7 @@ class WhisperSpeechController(
                         Log.d(TAG, "stopRecording: WAV missing (likely quick cancel) -> ${wav.path}")
                         return@withLock
                     }
-                    if (wav.length() <= 44L) {
+                    if (wav.length() <= MIN_WAV_BYTES) {
                         Log.d(TAG, "stopRecording: WAV too short (likely no speech) (${wav.length()} bytes)")
                         _error.value = "Recording too short or empty"
                         return@withLock
@@ -443,13 +476,23 @@ class WhisperSpeechController(
     }
 
     /**
-     * Ensure Whisper model is initialized via [WhisperEngine] using assets once.
+     * Ensure Whisper model is initialized via [WhisperEngine] using assets.
+     *
+     * This function is safe to call repeatedly.
+     * It avoids repeated heavy initialization by:
+     * - Checking [WhisperEngine.isInitializedForAsset] first.
+     * - Using [modelInitMutex] to serialize init attempts.
      */
     private suspend fun ensureModelInitializedFromAssetsOnce() {
-        if (modelInitialized) return
+        if (WhisperEngine.isInitializedForAsset(assetModelPath)) {
+            return
+        }
 
         modelInitMutex.withLock {
-            if (modelInitialized) return
+            if (WhisperEngine.isInitializedForAsset(assetModelPath)) {
+                Log.d(TAG, "WhisperEngine already initialized for assets/$assetModelPath (locked)")
+                return
+            }
 
             val result = WhisperEngine.ensureInitializedFromAsset(
                 context = appContext,
@@ -464,8 +507,7 @@ class WhisperSpeechController(
                 )
             }
 
-            modelInitialized = true
-            Log.d(TAG, "Whisper model initialized: assets/$assetModelPath")
+            Log.d(TAG, "WhisperEngine initialized: assets/$assetModelPath")
         }
     }
 
@@ -505,20 +547,33 @@ class WhisperSpeechController(
     // ---------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------
-    override fun onCleared() {
-        super.onCleared()
 
+    override fun onCleared() {
         workerJob?.cancel()
         workerJob = null
 
-        viewModelScope.launch(Dispatchers.Main.immediate) {
+        cleanupScope.launch {
             withContext(NonCancellable) {
-                runCatching { WhisperEngine.release() }
-                    .onFailure { e -> Log.w(TAG, "WhisperEngine.release failed", e) }
+                /**
+                 * Soft detach to keep the heavy model alive across navigation
+                 * and restart flows.
+                 */
+                runCatching { WhisperEngine.detach() }
+                    .onFailure { e -> Log.w(TAG, "WhisperEngine.detach failed", e) }
 
+                /**
+                 * Recorder resources should be released with the ViewModel.
+                 */
                 runCatching { recorder.close() }
                     .onFailure { e -> Log.w(TAG, "Recorder.close failed", e) }
             }
+
+            /**
+             * Ensure the cleanup scope does not leak.
+             */
+            cleanupScope.cancel()
         }
+
+        super.onCleared()
     }
 }

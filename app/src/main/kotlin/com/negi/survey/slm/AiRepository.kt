@@ -262,8 +262,10 @@ class SlmDirectRepository(
                 try {
 
                     // Defensive pre-run cleanup.
-                    SLM.cancel(model)
-                    SLM.resetSession(model)
+                    // SLM.cancel(model)
+                    // SLM.resetSession(model)
+
+                    Log.w(TAG, "prompt = " + prompt.normalize())
 
                     SLM.runInference(
                         model = model,

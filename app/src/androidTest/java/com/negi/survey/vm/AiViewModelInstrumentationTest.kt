@@ -168,7 +168,7 @@ class AiViewModelInstrumentationTest {
         repo = SlmDirectRepository(model, config)
         vm = AiViewModel(
             repo = repo,
-            timeout_ms = TIMEOUT_SEC * 1_000
+            defaultTimeoutMs = TIMEOUT_SEC * 1_000
         )
 
         val busy = runCatching { SLM.isBusy(model) }
