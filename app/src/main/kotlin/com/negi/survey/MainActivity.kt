@@ -135,9 +135,9 @@ import kotlin.coroutines.resumeWithException
 /**
  * Root activity of the SurveyNav app.
  *
- * - Enables edge-to-edge system bars with dark (black) backgrounds.
- * - Delegates all UI to [AppNav] which hosts the configuration selector,
- *   survey flow, model download gate, and SLM initialization gate.
+ * This activity is intentionally thin:
+ * - Applies edge-to-edge system bar styling.
+ * - Delegates all runtime state and UI composition to [AppNav].
  */
 class MainActivity : ComponentActivity() {
 
@@ -145,7 +145,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         /**
-         * Prefer modern edge-to-edge API. Fall back gracefully on older devices.
+         * Prefer the modern edge-to-edge API.
+         * Fall back to legacy insets handling on older or vendor-modified devices.
          */
         try {
             enableEdgeToEdge(
@@ -175,7 +176,8 @@ class MainActivity : ComponentActivity() {
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
 /**
- * Simple vertical gradient used as a dark backplate behind loading cards.
+ * A simple vertical gradient used as a dark backplate behind
+ * loading/error cards.
  */
 @Composable
 private fun animatedBackplate(): Brush =
@@ -185,10 +187,10 @@ private fun animatedBackplate(): Brush =
     )
 
 /**
- * Ultra-thin neon-like edge glow for cards.
+ * An ultra-thin neon-like edge glow for cards.
  *
- * The effect is built with a radial gradient centered on the composable,
- * fading from a slightly tinted primary color into full transparency.
+ * This uses a radial gradient centered on the composable surface
+ * to create a subtle halo that remains readable on a monochrome palette.
  */
 @Composable
 private fun Modifier.neonEdgeThin(
@@ -213,13 +215,16 @@ private fun Modifier.neonEdgeThin(
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 
 /**
- * Generic initialization gate composable.
+ * A generic initialization gate composable.
  *
- * - Executes [init] exactly once for the given [key].
- * - While running, shows a blocking loading card with subtle animation.
- * - On failure, shows an error card with a "Retry" action.
- * - Once [init] succeeds, renders [content] and never shows the gate again
- *   for the same [key].
+ * Contract:
+ * - Executes [init] once per [key].
+ * - While running, blocks the subtree and shows a loading card.
+ * - On failure, shows an error card with a Retry action.
+ * - On success, renders [content].
+ *
+ * This is safe to use for expensive or stateful components such as
+ * on-device model initialization.
  */
 @Composable
 fun InitGate(
@@ -363,16 +368,15 @@ fun InitGate(
 /* ──────────────────────── Audio Permission Gate ─────────────────────────── */
 
 /**
- * Simple permission gate for RECORD_AUDIO.
+ * A simple permission gate for [Manifest.permission.RECORD_AUDIO].
  *
- * Behaviour:
- * - If the permission is granted, renders [content] immediately.
- * - If not, shows a small card explaining why the microphone is needed
- *   and offers a button to request permission.
- * - When the user denies, shows a snackbar with a quick Settings action.
+ * Behavior:
+ * - If granted, renders [content].
+ * - If denied, shows an explanation card with a request button.
+ * - On denial, offers a snackbar action to open app settings.
  *
- * The permission state is re-checked on ON_RESUME so returning from
- * the system settings updates the gate correctly.
+ * The permission state is re-checked on ON_RESUME to correctly
+ * reflect changes made in the system settings screen.
  */
 @Composable
 fun AudioPermissionGate(
@@ -394,7 +398,7 @@ fun AudioPermissionGate(
     }
 
     /**
-     * Re-check permission when the app returns from Settings.
+     * Re-check permission when returning from Settings.
      */
     DisposableEffect(lifecycleOwner, context) {
         val observer = LifecycleEventObserver { _, event ->
@@ -519,12 +523,17 @@ private const val DEFAULT_WHISPER_LANGUAGE = "auto"
 /**
  * Top-level navigation host for the SurveyNav app.
  *
- * Stages:
- *  1) Intro/config selector.
- *  2) Config load from assets.
+ * Pipeline:
+ *  1) Intro/config selection.
+ *  2) Asset config load and structural validation.
  *  3) Model download gate.
  *  4) SLM initialization gate.
  *  5) Survey navigation host.
+ *
+ * Important:
+ * This function introduces a "selection epoch" to generate a unique
+ * session key per user selection, ensuring ViewModels are not reused
+ * when the same config is re-selected after a restart.
  */
 @Composable
 fun AppNav() {
@@ -533,7 +542,7 @@ fun AppNav() {
     /**
      * Configuration options surfaced on the intro screen.
      *
-     * Automatically discover survey_config*.yaml under assets.
+     * Automatically discovers survey_config*.yaml under assets.
      */
     val options = remember(appContext) {
         val assetManager = appContext.assets
@@ -592,6 +601,15 @@ fun AppNav() {
     var configError by remember { mutableStateOf<String?>(null) }
 
     /**
+     * A monotonically increasing epoch that changes every time
+     * the user starts a new config session.
+     *
+     * This prevents Activity-scoped ViewModelStore from reusing
+     * previous instances when the same config file is selected again.
+     */
+    var selectionEpoch by remember { mutableStateOf(0) }
+
+    /**
      * Stage 1: No config chosen yet.
      */
     if (chosen == null) {
@@ -599,16 +617,45 @@ fun AppNav() {
             options = options,
             defaultOptionId = options.firstOrNull()?.id,
             onStart = { option ->
+                /**
+                 * Start a brand-new session:
+                 * - Increment epoch
+                 * - Clear stale config UI state
+                 * - Bind the new selection
+                 */
+                selectionEpoch += 1
+                config = null
+                configError = null
+                configLoading = false
                 chosen = option
+
+                Log.d(
+                    "MainActivity",
+                    "Intro -> Start session. epoch=$selectionEpoch, file=${option.id}"
+                )
             }
         )
         return
     }
 
     /**
-     * Stage 2: Load the chosen configuration once per selection.
+     * A unique session key per selection event.
+     *
+     * Example:
+     *  - survey_config2.yaml@1
+     *  - survey_config2.yaml@2  (re-selected after restart)
      */
-    LaunchedEffect(chosen!!.id) {
+    val sessionKey = remember(chosen!!.id, selectionEpoch) {
+        "${chosen!!.id}@$selectionEpoch"
+    }
+
+    /**
+     * Stage 2: Load the chosen configuration once per session key.
+     *
+     * Using [sessionKey] (not only file id) ensures that selecting the
+     * same file again after a restart still triggers a fresh load path.
+     */
+    LaunchedEffect(sessionKey) {
         configLoading = true
         configError = null
         try {
@@ -616,9 +663,11 @@ fun AppNav() {
                 SurveyConfigLoader.fromAssetsValidated(appContext, chosen!!.id)
             }
             config = loaded
+            Log.d("MainActivity", "Config loaded. session=$sessionKey")
         } catch (t: Throwable) {
             config = null
             configError = t.message ?: "Failed to load survey configuration."
+            Log.e("MainActivity", "Config load failed. session=$sessionKey", t)
         } finally {
             configLoading = false
         }
@@ -701,9 +750,11 @@ fun AppNav() {
                         Spacer(Modifier.height(12.dp))
                         OutlinedButton(
                             onClick = {
+                                Log.d("MainActivity", "Error -> Back to selector. session=$sessionKey")
                                 chosen = null
                                 config = null
                                 configError = null
+                                configLoading = false
                             }
                         ) {
                             Text("Back to config selector")
@@ -720,7 +771,14 @@ fun AppNav() {
      */
     val cfg = config!!
 
+    /**
+     * App-level download/UI ViewModel.
+     *
+     * Keyed by [sessionKey] to guarantee a fresh instance
+     * even when the same config file is re-selected.
+     */
     val appVm: AppViewModel = viewModel(
+        key = "AppViewModel_$sessionKey",
         factory = AppViewModel.factoryFromOverrides(
             modelUrlOverride = cfg.modelDefaults.defaultModelUrl,
             fileNameOverride = cfg.modelDefaults.defaultFileName,
@@ -737,18 +795,26 @@ fun AppNav() {
      */
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
+            Log.d("MainActivity", "DownloadGate idle -> start download. session=$sessionKey")
             appVm.ensureModelDownloaded(appContext)
         }
     }
 
     DownloadGate(
         state = state,
-        onRetry = { appVm.ensureModelDownloaded(appContext) }
+        onRetry = {
+            Log.d("MainActivity", "DownloadGate retry. session=$sessionKey")
+            appVm.ensureModelDownloaded(appContext)
+        }
     ) { modelFile ->
 
         val modelConfig = remember(cfg) { buildModelConfig(cfg.slm) }
 
-        val slmModel = remember(modelFile.absolutePath, modelConfig, cfg.modelDefaults.defaultFileName) {
+        val slmModel = remember(
+            modelFile.absolutePath,
+            modelConfig,
+            cfg.modelDefaults.defaultFileName
+        ) {
             val modelName = cfg.modelDefaults.defaultFileName
                 ?.substringBeforeLast('.')
                 ?.ifBlank { null }
@@ -782,10 +848,10 @@ fun AppNav() {
         ) {
             /**
              * IMPORTANT:
-             * Do not call SLM.release() here.
+             * Do not call SLM.release() in this composable scope.
              *
-             * Releasing on dispose tends to trigger repeated init loops
-             * during config reloads or composition changes.
+             * Releasing on dispose can cause repeated init loops during
+             * config reloads or transient recompositions.
              * The runtime should own the lifecycle of the model instance.
              */
 
@@ -795,23 +861,45 @@ fun AppNav() {
                 SlmDirectRepository(slmModel, cfg)
             }
 
+            /**
+             * Survey ViewModel keyed by session.
+             *
+             * This ensures that "Restart -> reselect same config"
+             * cannot resurrect stale navigation/answer state.
+             */
             val vmSurvey: SurveyViewModel = viewModel(
+                key = "SurveyViewModel_$sessionKey",
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
-                    override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                        SurveyViewModel(nav = backStack, config = cfg) as T
+                    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                        return SurveyViewModel(nav = backStack, config = cfg) as T
+                    }
                 }
             )
 
+            /**
+             * AI ViewModel keyed by session and model identity.
+             *
+             * This prevents repository/model mismatches across sessions.
+             */
             val vmAI: AiViewModel = viewModel(
+                key = "AiViewModel_${sessionKey}_${slmModel.name}",
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
-                    override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                        AiViewModel(repo) as T
+                    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                        return AiViewModel(repo) as T
+                    }
                 }
             )
 
+            /**
+             * Hard reset back to the config selector.
+             *
+             * The next selection will increment [selectionEpoch]
+             * and produce a new [sessionKey].
+             */
             val resetToSelector: () -> Unit = {
+                Log.d("MainActivity", "resetToSelector invoked. session=$sessionKey")
                 chosen = null
                 config = null
                 configError = null
@@ -848,6 +936,7 @@ fun AppNav() {
 /**
  * Host composable for the survey navigation flow.
  *
+ * Responsibilities:
  * - Places [UploadProgressOverlay] at the root so upload HUD is always visible.
  * - Wires each navigation flow key to its corresponding screen.
  * - Manages back navigation via [BackHandler].
@@ -874,6 +963,12 @@ fun SurveyNavHost(
 
     val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
 
+    /**
+     * Speech controller is created only when voice is enabled.
+     *
+     * The key includes SurveyViewModel identity plus asset/language
+     * to avoid accidental reuse across stateful Whisper sessions.
+     */
     val speechController: SpeechController = if (voiceEnabled) {
         val assetPath = remember(whisperMeta.assetModelPath) {
             whisperMeta.assetModelPath?.ifBlank { null } ?: DEFAULT_WHISPER_ASSET_MODEL
@@ -889,7 +984,13 @@ fun SurveyNavHost(
                 assetModelPath = assetPath,
                 languageCode = lang,
                 onVoiceExported = onVoiceExported@{ voice ->
-                    val resolvedQid = voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
+                    /**
+                     * Resolve an effective question id:
+                     * - Use the explicit questionId from the voice context if present.
+                     * - Otherwise fall back to the latest node id.
+                     */
+                    val resolvedQid =
+                        voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
 
                     if (resolvedQid.isBlank()) {
                         Log.w(
@@ -931,6 +1032,7 @@ fun SurveyNavHost(
             entry<FlowHome> {
                 HomeScreen(
                     onStart = {
+                        Log.d("MainActivity", "Home -> Start survey")
                         vmSurvey.resetToStart()
                         vmAI.resetAll(keepError = false)
                         vmSurvey.advanceToNext()
@@ -986,6 +1088,7 @@ fun SurveyNavHost(
                 DoneScreen(
                     vm = vmSurvey,
                     onRestart = {
+                        Log.d("MainActivity", "Done -> Restart requested (return to selector)")
                         vmAI.resetStates()
                         vmSurvey.resetToStart()
                         onResetToSelector()
@@ -997,6 +1100,7 @@ fun SurveyNavHost(
     )
 
     BackHandler(enabled = canGoBack) {
+        Log.d("MainActivity", "BackHandler -> backToPrevious")
         vmAI.resetStates()
         vmSurvey.backToPrevious()
     }
@@ -1005,11 +1109,9 @@ fun SurveyNavHost(
 /* ───────────────────────────── Home Screen ───────────────────────────── */
 
 /**
- * Simple home screen shown after model initialization.
+ * A simple home screen shown after model initialization.
  *
- * This screen intentionally keeps the visual language similar to the
- * loading/error gates so that the transition into the survey feels
- * continuous.
+ * This keeps a consistent design language with the init/download gates.
  */
 @Composable
 private fun HomeScreen(
@@ -1059,11 +1161,13 @@ private fun HomeScreen(
 /* ───────────────────────────── SLM Config Helpers ────────────────────────── */
 
 /**
- * Build a normalized model configuration map for the SLM engine.
+ * Builds a normalized model configuration map for the SLM engine.
  *
+ * Strategy:
  * - Reads SLM metadata from [SurveyConfig.SlmMeta].
- * - Fills in default values if fields are missing.
- * - Normalizes numeric types and clamps sensitive ranges.
+ * - Applies conservative defaults when fields are missing.
+ * - Normalizes numeric types for JNI/engine stability.
+ * - Clamps sensitive ranges.
  */
 private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
     val out = mutableMapOf<ConfigKey, Any>(
@@ -1079,11 +1183,11 @@ private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, A
 }
 
 /**
- * Normalize JVM number types for SLM configuration values.
+ * Normalizes JVM number types for SLM configuration values.
  *
- * - MAX_TOKENS, TOP_K → Int
- * - TOP_P, TEMPERATURE → Double
- * - Falls back to safe defaults when parsing fails.
+ * Rationale:
+ * Some inference backends are strict about primitive types.
+ * This helper reduces variability introduced by YAML/JSON parsing.
  */
 private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
     m[ConfigKey.MAX_TOKENS] =
@@ -1097,12 +1201,13 @@ private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
 }
 
 /**
- * Clamp sampling parameters to safe ranges before passing them to the engine.
+ * Clamps sampling parameters to safe ranges before passing them to the engine.
  *
- * - MAX_TOKENS is clamped to [1, +∞).
- * - TOP_K is clamped to [1, +∞).
- * - TOP_P is clamped to [0.0, 1.0].
- * - TEMPERATURE is clamped to [0.0, +∞).
+ * Defensive rules:
+ * - MAX_TOKENS: >= 1
+ * - TOP_K: >= 1
+ * - TOP_P: [0.0, 1.0]
+ * - TEMPERATURE: >= 0.0
  */
 private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
     val maxTokens = (m[ConfigKey.MAX_TOKENS] as Number)
