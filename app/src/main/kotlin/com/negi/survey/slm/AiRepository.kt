@@ -21,6 +21,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
@@ -31,6 +32,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Repository that streams inference results from an on-device SLM.
@@ -79,6 +81,10 @@ interface Repository {
  *   - A finished flag from the listener.
  *   - An onClean callback when the engine is fully safe to reuse.
  *   - Idle-grace and watchdog timers as a fallback when onClean is late.
+ *
+ * Safety additions:
+ * - Adds an absolute watchdog independent of finished/onClean.
+ * - Adds a progress-stall detector to prevent global gate deadlocks.
  */
 class SlmDirectRepository(
     private val model: Model,
@@ -88,7 +94,9 @@ class SlmDirectRepository(
     companion object {
         private const val TAG = "SlmDirectRepository"
 
-        // ---------- YAML fallback defaults ----------
+        // ---------------------------------------------------------------------
+        // YAML fallback defaults
+        // ---------------------------------------------------------------------
 
         private const val DEF_USER_TURN_PREFIX = "<start_of_turn>user"
         private const val DEF_MODEL_TURN_PREFIX = "<start_of_turn>model"
@@ -134,7 +142,9 @@ class SlmDirectRepository(
                     "- Prefer compact JSON.\n" +
                     "- Entire output should be short and machine-parseable."
 
-        // ---------- Concurrency / lifecycle ----------
+        // ---------------------------------------------------------------------
+        // Concurrency / lifecycle
+        // ---------------------------------------------------------------------
 
         /** Process-wide gate: serialize access to the single SLM instance. */
         private val globalGate = Semaphore(1)
@@ -148,6 +158,24 @@ class SlmDirectRepository(
 
         private const val FINISH_WATCHDOG_MS = FINISH_WATCHDOG_DEFAULT_MS
         private const val FINISH_IDLE_GRACE_MS = FINISH_IDLE_GRACE_DEFAULT_MS
+
+        // ---------------------------------------------------------------------
+        // Absolute safety watchdogs
+        // ---------------------------------------------------------------------
+
+        /**
+         * Hard limit for a single inference.
+         * This prevents a permanent gate lock if the engine never emits done/onClean.
+         */
+        private const val HARD_WATCHDOG_MS = 20_000L
+
+        /**
+         * Close the flow if no progress callback is observed within this window.
+         * This targets "partial garbage + no forward progress" failure modes.
+         */
+        private const val PROGRESS_STALL_MS = 6_000L
+
+        private const val PROGRESS_POLL_MS = 250L
     }
 
     // -------------------------------------------------------------------------
@@ -158,18 +186,17 @@ class SlmDirectRepository(
      * Build the final prompt string with YAML-backed overrides from
      * [SurveyConfig.slm].
      *
-     * Rules:
-     * - When [userPrompt] is blank, fall back to `empty_json_instruction`.
-     * - Normalize line breaks and trim trailing newlines.
-     * - Skip any blank blocks when joining to avoid duplicate empty lines.
+     * Chat-format rule:
+     * - Place ALL instruction blocks inside the user turn so that
+     *   <start_of_turn>user appears at the very top of the prompt.
      *
      * Final ordering:
-     *   1. preamble
-     *   2. key_contract
-     *   3. length_budget
-     *   4. scoring_rule
-     *   5. strict_output
-     *   6. user_turn_prefix
+     *   1. user_turn_prefix
+     *   2. preamble
+     *   3. key_contract
+     *   4. length_budget
+     *   5. scoring_rule
+     *   6. strict_output
      *   7. userPrompt (or empty_json_instruction)
      *   8. turn_end
      *   9. model_turn_prefix
@@ -188,21 +215,25 @@ class SlmDirectRepository(
         val scoringRule = slm.scoring_rule ?: DEF_SCORING_RULE
         val strictOutput = slm.strict_output ?: DEF_STRICT_OUTPUT
 
-        // User prompt body (or explicit fallback for "no content").
         val effective = if (userPrompt.isBlank()) {
             emptyJson
         } else {
             userPrompt.trimIndent().normalize()
         }
 
-        val finalPrompt = compactJoin(
+        // Place all instruction blocks inside the user turn.
+        val userBlock = compactJoin(
             preamble,
             keyContract,
             lengthBudget,
             scoringRule,
             strictOutput,
+            effective
+        )
+
+        val finalPrompt = compactJoin(
             userTurn,
-            effective,
+            userBlock,
             turnEnd,
             modelTurn
         )
@@ -223,28 +254,36 @@ class SlmDirectRepository(
         callbackFlow {
             val out = this
 
-            // Serialize access to the underlying SLM engine.
+            // Serialize access to the underlying SLM engine for the full lifetime
+            // of this Flow (until awaitClose returns).
             globalGate.withPermit {
                 Log.d(
                     TAG,
                     "SLM request start: model='${model.name}', prompt.len=${prompt.length}"
                 )
 
-                // Anchor scope for watchdog tasks tied to this flow's lifecycle.
-                val anchorScope = CoroutineScope(coroutineContext + SupervisorJob())
+                // Dedicated scope for watchdog tasks and background checks.
+                val anchorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-                // State flags shared between listener, watchdog, and awaitClose.
                 val closed = AtomicBoolean(false)
                 val seenFinished = AtomicBoolean(false)
                 val seenOnClean = AtomicBoolean(false)
                 val finishWatchdogStarted = AtomicBoolean(false)
+
+                // Absolute progress tracking (independent of finished/onClean).
+                val startAt = AtomicLong(android.os.SystemClock.elapsedRealtime())
+                val lastProgressAt = AtomicLong(startAt.get())
+
+                fun markProgress() {
+                    lastProgressAt.set(android.os.SystemClock.elapsedRealtime())
+                }
 
                 fun isBusyNow(): Boolean =
                     runCatching { SLM.isBusy(model) }
                         .onFailure {
                             Log.w(TAG, "SLM.isBusy threw: ${it.message}")
                         }
-                        .getOrElse { true } // fall back to "busy" on failures
+                        .getOrElse { true }
 
                 fun safeClose(reason: String? = null, cause: Throwable? = null) {
                     if (closed.compareAndSet(false, true)) {
@@ -259,18 +298,60 @@ class SlmDirectRepository(
                     }
                 }
 
+                /**
+                 * Absolute watchdog independent of finished/onClean.
+                 * This is the main guard against globalGate deadlocks.
+                 */
+                anchorScope.launch {
+                    while (isActive && !closed.get()) {
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val elapsed = now - startAt.get()
+                        val stalled = now - lastProgressAt.get()
+
+                        if (elapsed >= HARD_WATCHDOG_MS) {
+                            Log.w(
+                                TAG,
+                                "hard watchdog timeout (${elapsed}ms) → cancel/reset/close"
+                            )
+                            runCatching { SLM.cancel(model) }
+                            runCatching { SLM.resetSession(model) }
+                            safeClose("hard-watchdog-timeout")
+                            break
+                        }
+
+                        // Only enforce stall before a normal finish signal is observed.
+                        if (!seenFinished.get() && stalled >= PROGRESS_STALL_MS) {
+                            Log.w(
+                                TAG,
+                                "progress stall (${stalled}ms) → cancel/reset/close"
+                            )
+                            runCatching { SLM.cancel(model) }
+                            runCatching { SLM.resetSession(model) }
+                            safeClose("progress-stall-timeout")
+                            break
+                        }
+
+                        delay(PROGRESS_POLL_MS)
+                    }
+                }
+
                 try {
+                    // Defensive pre-run cleanup if a previous run leaked state.
+                    if (isBusyNow()) {
+                        Log.w(TAG, "pre-run: engine reported BUSY → cancel/resetSession")
+                        runCatching { SLM.cancel(model) }
+                        runCatching { SLM.resetSession(model) }
+                    }
 
-                    // Defensive pre-run cleanup.
-                    // SLM.cancel(model)
-                    // SLM.resetSession(model)
-
-                    Log.w(TAG, "prompt = " + prompt.normalize())
+                    Log.d(TAG, "prompt =\n${prompt.normalize()}")
 
                     SLM.runInference(
                         model = model,
                         input = prompt,
                         listener = { partial, finished ->
+                            // Any callback indicates forward progress.
+                            markProgress()
+
                             if (partial.isNotEmpty() && !out.isClosedForSend) {
                                 val result = out.trySend(partial)
                                 if (result.isFailure) {
@@ -296,7 +377,7 @@ class SlmDirectRepository(
                                     // Wait until:
                                     //  (a) onClean observed, OR
                                     //  (b) engine stays idle for FINISH_IDLE_GRACE_MS, OR
-                                    //  (c) watchdog timeout is reached.
+                                    //  (c) finish watchdog timeout is reached.
                                     val ok = withTimeoutOrNull(FINISH_WATCHDOG_MS) {
                                         var idleSince = -1L
 
@@ -324,7 +405,7 @@ class SlmDirectRepository(
                                                 idleSince = -1L
                                             }
 
-                                            kotlinx.coroutines.delay(FINISH_WATCHDOG_STEP_MS)
+                                            delay(FINISH_WATCHDOG_STEP_MS)
                                         }
                                         true
                                     } != null
@@ -345,6 +426,7 @@ class SlmDirectRepository(
                             }
                         },
                         onClean = {
+                            markProgress()
                             seenOnClean.set(true)
                             Log.d(TAG, "SLM onClean (model='${model.name}')")
                             safeClose("onClean")
@@ -397,7 +479,7 @@ class SlmDirectRepository(
                         cleaned -> {
                             Log.d(
                                 TAG,
-                                "awaitClose: onClean observed → wait for idle then release"
+                                "awaitClose: onClean observed → wait for idle then return"
                             )
                             waitCleanOrIdle("cleaned")
                         }
@@ -458,7 +540,7 @@ class SlmDirectRepository(
                 }
             }
         }
-            // BUFFERED is typically enough for token streams.
+            // Buffered channel is typically enough for token streams.
             .buffer(Channel.BUFFERED)
             // Run callbacks on IO dispatcher to avoid blocking callers.
             .flowOn(Dispatchers.IO)
@@ -467,7 +549,9 @@ class SlmDirectRepository(
     // Utilities
     // -------------------------------------------------------------------------
 
-    /** Normalize CRLF/CR to LF and trim trailing newlines. */
+    /**
+     * Normalize CRLF/CR to LF and trim trailing newlines.
+     */
     private fun String.normalize(): String =
         replace("\r\n", "\n")
             .replace("\r", "\n")
@@ -477,9 +561,9 @@ class SlmDirectRepository(
      * Join non-blank parts with a single newline separating each block.
      *
      * This helper:
-     *  - Applies [normalize] to each input.
-     *  - Drops blocks that are entirely blank.
-     *  - Avoids trailing newline at the end of the result.
+     * - Applies [normalize] to each input.
+     * - Drops blocks that are entirely blank.
+     * - Avoids trailing newline at the end of the result.
      */
     private fun compactJoin(vararg parts: String): String {
         val list = buildList {

@@ -311,9 +311,13 @@ class AiViewModel(
             return viewModelScope.launch { }
         }
 
+        Log.d("AiViewModel", "prompt: $prompt")
+
         val fullPrompt = runCatching { repo.buildPrompt(prompt) }
             .onFailure { t -> Log.e(TAG, "evaluateAsync: buildPrompt failed", t) }
             .getOrElse { prompt }
+
+        Log.d("AiViewModel", "fullPrompt: $fullPrompt")
 
         if (!running.compareAndSet(false, true)) {
             Log.w(TAG, "evaluateAsync: already running -> returning existing job")

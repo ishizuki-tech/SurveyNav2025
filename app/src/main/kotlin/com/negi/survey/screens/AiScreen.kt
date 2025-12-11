@@ -37,6 +37,7 @@
 package com.negi.survey.screens
 
 import android.annotation.SuppressLint
+import android.util.Log
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -561,6 +562,7 @@ fun AiScreen(
         scope.launch {
             val q = vmSurvey.getQuestion(nodeId)
             val prompt = vmSurvey.getPrompt(nodeId, q, answer)
+            Log.d("AiScreen", "Submitting: $prompt")
             vmAI.evaluateAsync(prompt)
         }
 
