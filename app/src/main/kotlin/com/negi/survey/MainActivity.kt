@@ -97,8 +97,7 @@ import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
-import androidx.navigation3.runtime.rememberSavedStateNavEntryDecorator
-import androidx.navigation3.scene.rememberSceneSetupNavEntryDecorator
+import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
@@ -126,6 +125,7 @@ import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -561,46 +561,18 @@ fun AppNav() {
     /**
      * Configuration options surfaced on the intro screen.
      *
-     * Automatically discovers survey_config*.yaml under assets.
+     * Automatically discovers survey YAML files under assets root.
      */
     val options = remember(appContext) {
         val assetManager = appContext.assets
         val files = assetManager.list("")?.toList().orEmpty()
 
         val yamlFiles = files
-            .filter { it.startsWith("survey_config") && it.endsWith(".yaml") }
+            .filter { it.endsWith(".yaml") && (it.startsWith("survey_") || it.startsWith("survey_config")) }
             .sorted()
 
         val mapped = yamlFiles.map { fileName ->
-            val base = fileName.removeSuffix(".yaml")
-
-            val label = when (fileName) {
-                "survey_config1.yaml" -> "Demo config"
-                "survey_config2.yaml" -> "Full (1 follow-up)"
-                "survey_config3.yaml" -> "Full (3 follow-ups)"
-                else -> base
-                    .replace('_', ' ')
-                    .replaceFirstChar { ch ->
-                        if (ch.isLowerCase()) ch.titlecase() else ch.toString()
-                    }
-            }
-
-            val description = when (fileName) {
-                "survey_config1.yaml" ->
-                    "Short FAW demo with a few questions."
-                "survey_config2.yaml" ->
-                    "Long-form survey with a single follow-up per item."
-                "survey_config3.yaml" ->
-                    "Long-form survey with three follow-ups per item."
-                else ->
-                    "Survey configuration loaded from $fileName."
-            }
-
-            ConfigOptionUi(
-                id = fileName,
-                label = label,
-                description = description
-            )
+            configOptionFromFileName(fileName = fileName)
         }
 
         mapped.ifEmpty {
@@ -608,7 +580,7 @@ fun AppNav() {
                 ConfigOptionUi(
                     id = "survey_config1.yaml",
                     label = "Default config",
-                    description = "Fallback survey configuration."
+                    description = "Fallback survey configuration loaded from survey_config1.yaml."
                 )
             )
         }
@@ -988,7 +960,7 @@ fun SurveyNavHost(
             whisperMeta.assetModelPath?.ifBlank { null } ?: DEFAULT_WHISPER_ASSET_MODEL
         }
         val lang = remember(whisperMeta.language) {
-            whisperMeta.language?.trim()?.lowercase()?.ifBlank { null } ?: DEFAULT_WHISPER_LANGUAGE
+            whisperMeta.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_WHISPER_LANGUAGE
         }
 
         viewModel(
@@ -1052,8 +1024,7 @@ fun SurveyNavHost(
     NavDisplay(
         backStack = backStack,
         entryDecorators = listOf(
-            rememberSceneSetupNavEntryDecorator(),
-            rememberSavedStateNavEntryDecorator(),
+            rememberSaveableStateHolderNavEntryDecorator(),
             rememberViewModelStoreNavEntryDecorator()
         ),
         entryProvider = entryProvider {
@@ -1199,7 +1170,7 @@ private fun HomeScreen(
  */
 private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
     val out = mutableMapOf<ConfigKey, Any>(
-        ConfigKey.ACCELERATOR to (slm.accelerator ?: "GPU").uppercase(),
+        ConfigKey.ACCELERATOR to (slm.accelerator ?: "GPU").uppercase(Locale.US),
         ConfigKey.MAX_TOKENS to (slm.maxTokens ?: 512),
         ConfigKey.TOP_K to (slm.topK ?: 1),
         ConfigKey.TOP_P to (slm.topP ?: 0.0),
@@ -1290,5 +1261,87 @@ private class NoOpSpeechController : SpeechController {
 
     override fun toggleRecording() {
         startRecording()
+    }
+}
+
+/* ───────────────────────────── Config UI Helpers ───────────────────────────── */
+
+/**
+ * Create a user-facing label/description from the given YAML file name.
+ *
+ * Rules:
+ * - Purely filename-driven (no hardcoded per-file mapping).
+ * - Tokens related to follow-ups are ignored/removed.
+ * - Recognizes a few lightweight conventions (demo/full/faw) if present.
+ */
+private fun configOptionFromFileName(fileName: String): ConfigOptionUi {
+    val stem = fileName.removeSuffix(".yaml").removeSuffix(".yml")
+    val lower = stem.lowercase(Locale.US)
+
+    val isDemo = "demo" in lower
+    val isFull = "full" in lower
+    val isFaw = ("faw" in lower) || ("fall_armyworm" in lower) || ("armyworm" in lower)
+
+    val configNumber = Regex("""(?:^|_)survey_config(\d+)(?:_|$)""")
+        .find(lower)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+
+    val baseLabel = when {
+        isDemo -> "Demo config"
+        isFull -> "Full config"
+        configNumber != null -> "Config $configNumber"
+        else -> prettyNameFromFileStem(stem)
+    }
+
+    val label = if (isFaw && !baseLabel.contains("FAW")) {
+        "$baseLabel — FAW"
+    } else {
+        baseLabel
+    }
+
+    val pretty = prettyNameFromFileStem(stem)
+    val description = buildString {
+        if (isFaw) append("FAW survey configuration. ") else append("Survey configuration. ")
+        if (pretty.isNotBlank()) append("“$pretty”. ")
+        append("Loaded from $fileName.")
+    }
+
+    return ConfigOptionUi(
+        id = fileName,
+        label = label,
+        description = description
+    )
+}
+
+/**
+ * Convert a filename stem into a human-friendly title.
+ *
+ * Notes:
+ * - Removes generic tokens (survey/config) and follow-up tokens.
+ * - Keeps other tokens as meaningful hints for users.
+ */
+private fun prettyNameFromFileStem(stem: String): String {
+    val tokens = stem
+        .replace('-', '_')
+        .split('_')
+        .filter { it.isNotBlank() }
+        .filterNot { t ->
+            val x = t.lowercase(Locale.US)
+            x == "survey" ||
+                    x == "config" ||
+                    x == "configs" ||
+                    x == "followup" ||
+                    x == "followups" ||
+                    x == "fu"
+        }
+
+    if (tokens.isEmpty()) return stem
+
+    return tokens.joinToString(" ") { token ->
+        token.replaceFirstChar { ch ->
+            if (ch.isLowerCase()) ch.titlecase() else ch.toString()
+        }
     }
 }
