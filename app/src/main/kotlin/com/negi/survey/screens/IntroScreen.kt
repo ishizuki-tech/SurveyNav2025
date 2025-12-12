@@ -14,10 +14,10 @@
  *
  *  Layout model:
  *   • Full-screen Box with an animated dark monotone gradient background.
- *   • Centered glass-like card that introduces the app and exposes a single
- *     “Start” CTA.
- *   • Inside the card, a small monotone selector lets the user choose which
- *     survey configuration to use (e.g., which YAML file to load).
+ *   • Centered glass-like card that introduces the app and exposes:
+ *       - A monotone selector for survey configuration.
+ *       - A primary “Start” CTA.
+ *       - An optional “Restart” CTA that can be wired to an engine reset.
  * =====================================================================
  */
 
@@ -34,6 +34,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -48,6 +49,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DividerDefaults
@@ -55,6 +58,7 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -99,13 +103,21 @@ data class ConfigOptionUi(
  * Responsibilities:
  *  - Paint an animated dark monotone background for the content region.
  *  - Present a centered intro card with title, subtitle, a configuration
- *    selector, and a single “Start” button.
+ *    selector, and a “Start” button.
+ *  - Optionally show a “Restart” button to reset an engine/session upstream.
+ *
+ * @param restartEpoch A monotonically increasing token. When this value changes,
+ *        internal UI state (e.g., selectedId) is re-initialized deterministically.
  */
 @Composable
 fun IntroScreen(
     options: List<ConfigOptionUi>,
     defaultOptionId: String? = null,
     onStart: (ConfigOptionUi) -> Unit,
+    restartEpoch: Long = 0L,
+    showRestart: Boolean = false,
+    isRestarting: Boolean = false,
+    onRestart: (() -> Unit)? = null,
 ) {
     val bgBrush = animatedMonotoneBackground()
 
@@ -125,7 +137,11 @@ fun IntroScreen(
                 subtitle = "A focused, privacy-friendly evaluation flow",
                 options = options,
                 defaultOptionId = defaultOptionId,
-                onStart = onStart
+                onStart = onStart,
+                restartEpoch = restartEpoch,
+                showRestart = showRestart,
+                isRestarting = isRestarting,
+                onRestart = onRestart
             )
         }
     }
@@ -145,7 +161,11 @@ private fun IntroCardMono(
     subtitle: String,
     options: List<ConfigOptionUi>,
     defaultOptionId: String?,
-    onStart: (ConfigOptionUi) -> Unit
+    onStart: (ConfigOptionUi) -> Unit,
+    restartEpoch: Long,
+    showRestart: Boolean,
+    isRestarting: Boolean,
+    onRestart: (() -> Unit)?,
 ) {
     require(options.isNotEmpty()) {
         "IntroCardMono requires at least one ConfigOptionUi."
@@ -162,12 +182,18 @@ private fun IntroCardMono(
      * If the requested default ID does not exist in the current options,
      * fall back to the first option to avoid an unselected initial UI.
      */
-    val initialId = remember(optionIds, defaultOptionId) {
+    val initialId = remember(optionIds, defaultOptionId, restartEpoch) {
         val def = defaultOptionId?.takeIf { it.isNotBlank() }
         if (def != null && optionIds.contains(def)) def else options.first().id
     }
 
-    var selectedId by remember(optionIds, defaultOptionId) {
+    /**
+     * Selected option state.
+     *
+     * Keying by restartEpoch ensures a deterministic reset when the upstream
+     * "Restart" flow is triggered (engine reset, nav re-entry, etc.).
+     */
+    var selectedId by remember(optionIds, defaultOptionId, restartEpoch) {
         mutableStateOf(initialId)
     }
 
@@ -247,26 +273,101 @@ private fun IntroCardMono(
             val selectedOption =
                 options.firstOrNull { it.id == selectedId } ?: options.first()
 
-            Button(
-                onClick = { onStart(selectedOption) },
-                shape = CircleShape,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = lerp(Color(0xFF1F1F1F), cs.surface, 0.25f),
+            CtaRowMono(
+                onStart = { onStart(selectedOption) },
+                showRestart = showRestart,
+                isRestarting = isRestarting,
+                onRestart = onRestart
+            )
+        }
+    }
+}
+
+/**
+ * CTA row that hosts the primary Start button and an optional Restart button.
+ */
+@Composable
+private fun CtaRowMono(
+    onStart: () -> Unit,
+    showRestart: Boolean,
+    isRestarting: Boolean,
+    onRestart: (() -> Unit)?,
+) {
+    val cs = MaterialTheme.colorScheme
+    var confirmRestart by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Button(
+            onClick = onStart,
+            shape = CircleShape,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = lerp(Color(0xFF1F1F1F), cs.surface, 0.25f),
+                contentColor = Color.White
+            ),
+            modifier = Modifier.testTag("StartButton")
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                contentDescription = null
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "Start",
+                style = MaterialTheme.typography.labelLarge
+            )
+        }
+
+        if (showRestart && onRestart != null) {
+            Spacer(Modifier.width(10.dp))
+
+            OutlinedButton(
+                enabled = !isRestarting,
+                onClick = { confirmRestart = true },
+                border = BorderStroke(1.dp, Color(0xFF7A7A7A).copy(alpha = 0.65f)),
+                colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = Color.White
                 ),
-                modifier = Modifier.testTag("StartButton")
+                modifier = Modifier.testTag("RestartButton")
             ) {
                 Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                    imageVector = Icons.Filled.Refresh,
                     contentDescription = null
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    text = "Start",
+                    text = if (isRestarting) "Restarting..." else "Restart",
                     style = MaterialTheme.typography.labelLarge
                 )
             }
         }
+    }
+
+    if (confirmRestart) {
+        AlertDialog(
+            onDismissRequest = { confirmRestart = false },
+            title = { Text("Restart engine?") },
+            text = { Text("This cancels current work and recreates the engine/session.") },
+            confirmButton = {
+                Button(
+                    enabled = !isRestarting,
+                    onClick = {
+                        confirmRestart = false
+                        onRestart?.invoke()
+                    }
+                ) {
+                    Text("Restart")
+                }
+            },
+            dismissButton = {
+                Button(onClick = { confirmRestart = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
