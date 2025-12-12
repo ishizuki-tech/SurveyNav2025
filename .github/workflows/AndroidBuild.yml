@@ -153,7 +153,7 @@ jobs:
           # English comment:
           # - Try to extract a literal versionName from Gradle or Manifest.
           # - For the current setup, this will usually fail (versionName is computed),
-          #   so we fall back to a sane default "0.0.1".
+          #   so we fall back to a sane default "0.2.1" for KeenWaySoftware builds.
           if [[ -f "$FILE_GRADLE" ]]; then
             VERSION=$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*[:=][[:space:]]*"([^"]+)".*/\1/p' "$FILE_GRADLE" | head -n1 || true)
           fi
@@ -164,7 +164,7 @@ jobs:
 
           # Fallback to a base version that matches the Gradle defaultConfig.
           if [[ -z "${VERSION:-}" ]]; then
-            VERSION="0.0.1"
+            VERSION="0.2.1"
           fi
 
           echo "Base version: ${VERSION}"

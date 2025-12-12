@@ -1,11 +1,72 @@
 // file: app/build.gradle.kts
+import java.io.ByteArrayOutputStream
 import java.util.Properties
+import org.gradle.api.tasks.Exec
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+}
+
+// ------------------------------------------------------------
+// 🔧 Initialize native submodule (safe + idempotent)
+// ------------------------------------------------------------
+tasks.register<Exec>("checkSubmodule") {
+    description = "Recursively initialize the native submodule if not yet set up"
+    group = "setup"
+
+    val subDir = layout.projectDirectory.dir("nativelib/whisper_core").asFile
+    onlyIf {
+        val missing = !(subDir.exists() && subDir.listFiles()?.isNotEmpty() == true)
+        if (missing) logger.lifecycle("🔄 Submodule not initialized. Running: git submodule update --init --recursive")
+        missing
+    }
+
+    workingDir = rootProject.projectDir
+    commandLine("git", "submodule", "update", "--init", "--recursive")
+    isIgnoreExitValue = true
+    standardOutput = ByteArrayOutputStream()
+    errorOutput = ByteArrayOutputStream()
+    doLast {
+        logger.lifecycle("✅ Submodule check completed.")
+    }
+}
+
+// ------------------------------------------------------------
+// 🔧 Execute model download script (safe, CI-friendly)
+// ------------------------------------------------------------
+tasks.register<Exec>("downloadModel") {
+    description = "Run the model download script safely"
+    group = "setup"
+
+    val script = file("download_models.sh")
+    onlyIf {
+        if (!script.exists()) {
+            logger.warn("⚠️ download_models.sh not found. Skipping model download.")
+            return@onlyIf false
+        }
+        true
+    }
+
+    doFirst {
+        if (!script.canExecute()) {
+            logger.lifecycle("🔧 Adding execute permission to download_models.sh")
+            script.setExecutable(true)
+        }
+    }
+
+    workingDir = project.projectDir
+    commandLine("bash", "./download_models.sh")
+    isIgnoreExitValue = false
+}
+
+// ------------------------------------------------------------
+// ✅ Ensure setup tasks before preBuild
+// ------------------------------------------------------------
+tasks.named("preBuild") {
+    dependsOn("checkSubmodule", "downloadModel")
 }
 
 android {
@@ -37,10 +98,35 @@ android {
 
     defaultConfig {
         applicationId = appId
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "1.0"
+
+        /**
+         * CI-provided version name (tag-safe; no spaces).
+         *
+         * Example:
+         * - Local build: falls back to "0.0.1"
+         * - CI build   : "v1.0-20251125-0134" (exported as CI_APP_VERSION_NAME)
+         */
+        val ciVersionName = System.getenv("CI_APP_VERSION_NAME")
+        val resolvedVersionName = ciVersionName
+            ?.takeIf { it.isNotBlank() }
+            ?: "0.0.1"
+
+        // This one is used by Android / Git tags and must NOT contain spaces.
+        versionName = resolvedVersionName
+
+        /**
+         * Human-readable display version for UI / logs.
+         * Example: "v1.0-20251125-0134 with WhisperCpp"
+         */
+        val displayVersion = "$resolvedVersionName with WhisperCpp"
+        buildConfigField(
+            "String",
+            "DISPLAY_VERSION",
+            "\"$displayVersion\""
+        )
 
         // Use AndroidX Test Runner (required for Orchestrator)
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -50,8 +136,7 @@ android {
         testInstrumentationRunnerArguments["clearPackageData"] = "true"
         // useTestStorageService: scoped test storage instead of legacy external storage (A14+).
         testInstrumentationRunnerArguments["useTestStorageService"] = "true"
-        // 🔒 Safety guard: explicitly disable sharding unless a CI overrides it.
-        // Some CI/build scripts inject -e numShards=2 by default; this keeps a single run per device.
+        // Safety guard: explicitly disable sharding unless a CI overrides it.
         testInstrumentationRunnerArguments["numShards"] = "1"
         // NOTE: A CI can still override this with: -Pandroid.testInstrumentationRunnerArguments.numShards=2
     }
@@ -133,10 +218,15 @@ android {
 }
 
 dependencies {
+    implementation(project(":nativelib"))
+
     // ===== Compose BOM =====
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui.geometry)
     implementation(libs.androidx.compose.foundation.layout)
+    implementation(libs.androidx.compose.foundation)
+    implementation(libs.androidx.lifecycle.process)
+    implementation(libs.androidx.foundation.layout)
     androidTestImplementation(platform(libs.androidx.compose.bom))
 
     // Navigation 3 (Runtime/UI helpers)
@@ -173,6 +263,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.viewmodel.navigation3.android)
+    implementation(libs.androidx.lifecycle.process)
 
     // WorkManager
     implementation(libs.androidx.work.runtime.ktx)
@@ -261,6 +352,31 @@ tasks.register("checkSingleConnectedDevice") {
                 "More than one device/emulator is connected. " +
                         "Run `adb devices -l` and keep exactly one to avoid duplicate test runs."
             )
+        }
+    }
+}
+
+// ============================================================
+// ✅ Diagnostic Task — verify included assets in APK
+// ============================================================
+tasks.register("printAssets") {
+    group = "diagnostic"
+    description = "Print all assets included in src/main/assets"
+    doLast {
+        val assetsDir = file("src/main/assets")
+        if (!assetsDir.exists()) {
+            println("⚠️ No assets directory found!")
+            return@doLast
+        }
+
+        val files = assetsDir.walkTopDown().filter { it.isFile }.toList()
+        if (files.isEmpty()) {
+            println("⚠️ Assets directory is empty.")
+        } else {
+            println("📦 Found ${files.size} asset files under: ${assetsDir.absolutePath}")
+            files.forEach { f ->
+                println("  - ${f.relativeTo(assetsDir)} (${f.length()} bytes)")
+            }
         }
     }
 }

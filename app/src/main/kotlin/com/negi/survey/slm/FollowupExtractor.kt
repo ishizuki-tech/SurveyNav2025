@@ -20,6 +20,8 @@
  * =====================================================================
  */
 
+@file:Suppress("MemberVisibilityCanBePrivate", "unused")
+
 package com.negi.survey.slm
 
 import org.json.JSONArray
@@ -47,29 +49,45 @@ object FollowupExtractor {
     /* Configuration                                                         */
     /* --------------------------------------------------------------------- */
 
+    /** Regex used to normalize key separators into a single dash. */
+    private val KEY_SEP_REGEX =
+        Regex("""[\s_\u200B\u200C\u200D\u2060\u2010-\u2015]+""")
+
     /**
      * Normalize field keys for matching:
      * - lowercase
      * - convert any run of [space/_/unicode-dash/zero-width] to a single '-'
      */
     private fun normKey(k: String): String =
-        k.lowercase().replace(Regex("""[\s_​\u200B\u200C\u200D\u2060\u2010-\u2015]+"""), "-")
+        k.lowercase().replace(KEY_SEP_REGEX, "-").trim('-')
 
-    /** Normalized followup-like keys we consider as primary containers. */
-    private val FOLLOWUP_KEYS_NORM: Set<String> = setOf(
+    /** Raw followup-like keys we consider as primary containers. */
+    private val FOLLOWUP_KEYS_RAW: List<String> = listOf(
+        // Singular
+        "followup question",
+        "follow-up question",
+        "follow_up_question",
+        "followUpQuestion",
+
+        // Plural / list containers
         "followup",
+        "follow-up",
+        "followups",
         "follow-ups",
         "followup-questions",
         "follow-up-questions",
-        "followups",
-        "follow-up",
+        "follow_up_questions",
+        "followUpQuestions",
         "follow-up-q",
         "next-questions",
-        "suggested-questions",
-        "follow_up_questions".let(::normKey),
-        "followUpQuestions".let(::normKey),
-        "questions" // very broad; keep last but allowed
-    ).map(::normKey).toSet()
+        "suggested-questions"
+        // NOTE: We intentionally do NOT include a broad "questions" key here
+        // to avoid accidentally treating original question lists as follow-ups.
+    )
+
+    /** Normalized followup-like keys we consider as primary containers. */
+    private val FOLLOWUP_KEYS_NORM: Set<String> =
+        FOLLOWUP_KEYS_RAW.map(::normKey).toSet()
 
     /** Field candidates inside an object that may carry question text. */
     private val QUESTION_FIELD_CANDIDATES: List<String> = listOf(
@@ -84,14 +102,15 @@ object FollowupExtractor {
         "value"
     )
 
+    /** Normalized set for strict key equality checks. */
+    private val QUESTION_FIELDS_NORM: Set<String> =
+        QUESTION_FIELD_CANDIDATES.map(::normKey).toSet()
+
     /** Trailing question marks (ASCII or full-width) to be coalesced to exactly one. */
     private val TRAILING_QUESTION_REGEX = Regex("[?？]+$")
 
     /** Matches integers 0..100; last match in the text is used for fallback scoring. */
     private val NUMBER_0_TO_100_REGEX = Regex("""\b(?:100|[1-9]?\d)\b""")
-
-    /** Sentence-ish split for plain text fallback. */
-    private val SENTENCE_SPLIT_REGEX = Regex("""(?<=\?|？)|[\r\n]+|(?<=[。．!！])""")
 
     /* --------------------------------------------------------------------- */
     /* Public API                                                            */
@@ -124,7 +143,7 @@ object FollowupExtractor {
 
         // Plain text fallback: if nothing found via JSON, try sentence-level heuristic.
         if (out.isEmpty()) {
-            for (piece in raw.split(SENTENCE_SPLIT_REGEX)) {
+            for (piece in splitSentenceLike(raw)) {
                 if (out.size >= max) break
                 val trimmed = piece.trim()
                 if (trimmed.endsWith("?") || trimmed.endsWith("？")) {
@@ -177,17 +196,14 @@ object FollowupExtractor {
      */
     @JvmStatic
     fun extractScore(text: String): Int? {
-        // JSON-first recursive search
-        runCatching {
-            val fragments = extractJsonFragments(text)
-            for (frag in fragments) {
-                val v = when (frag) {
-                    is JSONObject -> findScoreRecursive(frag)
-                    is JSONArray -> findScoreRecursive(frag)
-                    else -> null
-                }
-                if (v != null) return clamp0to100(v)
+        val fragments = extractJsonFragments(text)
+        for (frag in fragments) {
+            val v = when (frag) {
+                is JSONObject -> findScoreRecursive(frag)
+                is JSONArray -> findScoreRecursive(frag)
+                else -> null
             }
+            if (v != null) return clamp0to100(v)
         }
 
         // Plain-text fallback (last integer 0..100)
@@ -269,8 +285,11 @@ object FollowupExtractor {
                         is String -> {
                             val kn = normKey(k)
                             val looksLikeQuestionField =
-                                (kn == "question") ||
-                                        QUESTION_FIELD_CANDIDATES.any { kn.contains(normKey(it)) }
+                                kn in QUESTION_FIELDS_NORM ||
+                                        kn == "question" ||
+                                        kn.endsWith("-question") ||
+                                        kn.endsWith("-q")
+
                             if (looksLikeQuestionField) {
                                 addIfMeaningful(v, out, max)
                             }
@@ -299,7 +318,7 @@ object FollowupExtractor {
             normalizedMap[normKey(k)] = obj.opt(k)
         }
 
-        // Strong match: normalized candidate keys
+        // Strong match: exact normalized candidate keys
         for (candidate in QUESTION_FIELD_CANDIDATES) {
             val v = normalizedMap[normKey(candidate)]
             if (v is String && v.isNotBlank()) {
@@ -378,6 +397,40 @@ object FollowupExtractor {
         else -> null
     }
 
+    /* ----------------------- Plain-text sentence split -------------------- */
+
+    /**
+     * A tiny sentence-like splitter used only for non-JSON fallback.
+     *
+     * This avoids zero-width regex split pitfalls and keeps punctuation
+     * attached to the fragment.
+     */
+    private fun splitSentenceLike(raw: String): List<String> {
+        val out = ArrayList<String>()
+        val sb = StringBuilder()
+
+        fun flush() {
+            val t = sb.toString().trim()
+            if (t.isNotEmpty()) out.add(t)
+            sb.setLength(0)
+        }
+
+        for (ch in raw) {
+            when (ch) {
+                '\r', '\n' -> {
+                    flush()
+                }
+                '。', '．', '!', '！', '?', '？' -> {
+                    sb.append(ch)
+                    flush()
+                }
+                else -> sb.append(ch)
+            }
+        }
+        flush()
+        return out
+    }
+
     /* ----------------------- JSON fragment extraction --------------------- */
 
     /**
@@ -411,6 +464,7 @@ object FollowupExtractor {
                 stack.addLast(ch)
                 var inString = false
                 i++ // move past opener
+
                 while (i < n && stack.isNotEmpty()) {
                     val c = s0[i]
                     if (inString) {
@@ -436,6 +490,7 @@ object FollowupExtractor {
                     }
                     i++
                 }
+
                 val endIdx = i
                 if (stack.isEmpty() && endIdx <= n) {
                     val frag = s0.substring(start, endIdx)
@@ -457,12 +512,11 @@ object FollowupExtractor {
      * Also tolerates extra whitespace/newlines around fences.
      */
     private fun stripCodeFences(s: String): String {
-        // Strict fenced block
         val fenced = Regex("""^\s*```[A-Za-z0-9_-]*\s*\n([\s\S]*?)\n```\s*$""")
         val m = fenced.find(s)
         if (m != null) return m.groupValues[1].trim()
 
-        // Simple surrounding fence without language (best-effort).
+        // Best-effort fallback for simple cases
         return s.removeSurrounding("```", "```").trim()
     }
 
@@ -471,7 +525,7 @@ object FollowupExtractor {
         val t = s.trim()
         when {
             t.startsWith("{") -> JSONObject(t)
-            t.startsWith("[" ) -> JSONArray(t)
+            t.startsWith("[") -> JSONArray(t)
             else -> null
         }
     } catch (_: Throwable) {

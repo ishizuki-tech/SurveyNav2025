@@ -23,6 +23,8 @@
  *  Notes:
  *    • Ordering is stabilized by sorting on nodeId, so repeated visits to
  *      this screen show a predictable layout.
+ *    • Q/A section is built from the union of question + answer keys to avoid
+ *      dropping unanswered or question-only nodes.
  * =====================================================================
  */
 
@@ -40,12 +42,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.Button
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -82,11 +82,9 @@ fun ReviewScreen(
     onNext: () -> Unit,
     onBack: () -> Unit
 ) {
+    val cs = MaterialTheme.colorScheme
+
     // Compact typography presets (tight but readable for dense lists).
-    val baseCompact = MaterialTheme.typography.bodySmall.copy(
-        fontSize = 11.sp,
-        lineHeight = 14.sp
-    )
     val titleTight = MaterialTheme.typography.titleSmall.copy(
         fontSize = 12.sp,
         lineHeight = 14.sp
@@ -105,164 +103,232 @@ fun ReviewScreen(
     val allAnswers by vm.answers.collectAsState(initial = emptyMap())
     val allFollowups by vm.followups.collectAsState(initial = emptyMap())
 
-    // Memoized, sorted views for stable item ordering.
-    val qaEntries = remember(allAnswers, allQuestions) {
-        // Pair nodeId with question + answer, sorted by nodeId for predictability.
-        allAnswers.entries
-            .map { (id, ans) ->
-                val q = allQuestions[id].orEmpty()
-                Triple(id, q, ans)
-            }
-            .sortedBy { it.first }
+    /**
+     * Build a stable union of node IDs that own either a question or an answer.
+     *
+     * This prevents the review screen from dropping:
+     *  - unanswered nodes,
+     *  - question-only nodes,
+     *  - legacy call sites that set answers before questions.
+     */
+    val qaOwnerIds = remember(allQuestions, allAnswers) {
+        (allQuestions.keys + allAnswers.keys)
+            .toSet()
+            .toList()
+            .sorted()
     }
 
+    /**
+     * Stable Q/A entries derived from the union list above.
+     */
+    val qaEntries = remember(qaOwnerIds, allQuestions, allAnswers) {
+        qaOwnerIds.map { id ->
+            QaEntry(
+                nodeId = id,
+                question = allQuestions[id].orEmpty(),
+                answer = allAnswers[id].orEmpty()
+            )
+        }
+    }
+
+    /**
+     * Follow-ups sorted by node ID for predictable layout.
+     *
+     * The per-node list order is preserved as-is to respect insertion/creation order.
+     */
     val sortedFollowups = remember(allFollowups) {
-        // Sort nodes by id; keep per-node follow-ups in insertion order.
         allFollowups.toSortedMap()
     }
 
-    CompositionLocalProvider(LocalTextStyle provides baseCompact) {
-        Scaffold(containerColor = Color.Transparent) { pad ->
-            // LazyColumn provides smoother scrolling as questions grow.
-            LazyColumn(
-                modifier = Modifier
-                    .padding(pad)
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                // Header.
-                item {
-                    Text("Review", style = titleTight)
-                }
+    Scaffold(containerColor = Color.Transparent) { pad ->
+        LazyColumn(
+            modifier = Modifier
+                .padding(pad)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Header.
+            item {
+                Text(
+                    text = "Review",
+                    style = titleTight,
+                    color = cs.onSurface
+                )
+            }
 
-                // Q & A Card.
-                item {
-                    ElevatedCard(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(12.dp)) {
+            // Q & A Card.
+            item {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            text = "All Original Questions and Answers",
+                            style = titleTight,
+                            color = cs.onSurface
+                        )
+                        Spacer(Modifier.height(6.dp))
+
+                        if (qaEntries.isEmpty()) {
                             Text(
-                                text = "All Original Questions and Answers",
-                                style = titleTight
+                                text = "No records yet.",
+                                style = bodyTight,
+                                color = cs.onSurfaceVariant
                             )
-                            Spacer(Modifier.height(6.dp))
-
-                            if (qaEntries.isEmpty()) {
-                                Text("No records yet.", style = bodyTight)
-                            } else {
-                                qaEntries.forEachIndexed { idx, (nodeId, question, answer) ->
-                                    if (idx > 0) {
-                                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                                    }
-
-                                    Column {
-                                        // Node id label.
-                                        Text(
-                                            text = nodeId,
-                                            style = labelTight,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                        Spacer(Modifier.height(2.dp))
-
-                                        // Question (show placeholder when missing).
-                                        val qText =
-                                            if (question.isBlank()) "– No Question."
-                                            else "Q: $question"
-                                        Text(qText, style = bodyTight)
-
-                                        Spacer(Modifier.height(2.dp))
-
-                                        // Answer (highlight missing answers with lower alpha).
-                                        val aText =
-                                            if (answer.isBlank()) "– No Answer."
-                                            else answer
-                                        Text(
-                                            text = "A: $aText",
-                                            maxLines = 6,
-                                            overflow = TextOverflow.Ellipsis,
-                                            color = if (answer.isBlank()) {
-                                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                                            } else {
-                                                MaterialTheme.colorScheme.onSurface
-                                            },
-                                            style = bodyTight
-                                        )
-                                    }
+                        } else {
+                            qaEntries.forEachIndexed { idx, entry ->
+                                if (idx > 0) {
+                                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
                                 }
+
+                                QaRow(
+                                    entry = entry,
+                                    labelStyle = labelTight,
+                                    bodyStyle = bodyTight
+                                )
                             }
                         }
                     }
                 }
+            }
 
-                // Follow-ups Card.
-                item {
-                    ElevatedCard(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text("Follow-up History", style = titleTight)
-                            Spacer(Modifier.height(6.dp))
+            // Follow-ups Card.
+            item {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            text = "Follow-up History",
+                            style = titleTight,
+                            color = cs.onSurface
+                        )
+                        Spacer(Modifier.height(6.dp))
 
-                            if (sortedFollowups.isEmpty()) {
-                                Text("No follow-up questions.", style = bodyTight)
-                            } else {
-                                sortedFollowups.entries.forEachIndexed { idx, (nodeId, list) ->
-                                    if (idx > 0) {
-                                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                                    }
+                        if (sortedFollowups.isEmpty()) {
+                            Text(
+                                text = "No follow-up questions.",
+                                style = bodyTight,
+                                color = cs.onSurfaceVariant
+                            )
+                        } else {
+                            sortedFollowups.entries.forEachIndexed { idx, (nodeId, list) ->
+                                if (idx > 0) {
+                                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                                }
 
+                                Text(
+                                    text = "Node: $nodeId",
+                                    style = labelTight,
+                                    color = cs.onSurfaceVariant
+                                )
+
+                                if (list.isEmpty()) {
                                     Text(
-                                        text = "Node: $nodeId",
-                                        style = labelTight,
-                                        color = MaterialTheme.colorScheme.primary
+                                        text = "– No follow-ups recorded.",
+                                        style = bodyTight,
+                                        color = cs.onSurfaceVariant
                                     )
-
-                                    if (list.isEmpty()) {
-                                        Text("– No follow-ups recorded.", style = bodyTight)
-                                    } else {
-                                        list.forEachIndexed { i, entry ->
-                                            Spacer(Modifier.height(4.dp))
-                                            Text(
-                                                text = "${i + 1}. Q: ${entry.question}",
-                                                style = bodyTight
-                                            )
-                                            Text(
-                                                text = "   A: ${entry.answer ?: "– No Answer."}",
-                                                style = bodyTight,
-                                                color = if (entry.answer.isNullOrBlank()) {
-                                                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                                                } else {
-                                                    MaterialTheme.colorScheme.onSurface
-                                                }
-                                            )
-                                        }
+                                } else {
+                                    list.forEachIndexed { i, entry ->
+                                        Spacer(Modifier.height(4.dp))
+                                        Text(
+                                            text = "${i + 1}. Q: ${entry.question}",
+                                            style = bodyTight,
+                                            color = cs.onSurface
+                                        )
+                                        Text(
+                                            text = "   A: ${entry.answer ?: "– No Answer."}",
+                                            style = bodyTight,
+                                            color = if (entry.answer.isNullOrBlank()) {
+                                                cs.onSurface.copy(alpha = 0.6f)
+                                            } else {
+                                                cs.onSurface
+                                            }
+                                        )
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                // Bottom buttons.
-                item {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 4.dp, bottom = 8.dp)
+            // Bottom buttons.
+            item {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp, bottom = 8.dp)
+                ) {
+                    Button(
+                        onClick = onBack,
+                        modifier = Modifier.weight(1f)
                     ) {
-                        Button(
-                            onClick = onBack,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Back")
-                        }
-                        Button(
-                            onClick = onNext,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Next")
-                        }
+                        Text("Back")
+                    }
+                    Button(
+                        onClick = onNext,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Next")
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * Immutable view model for a single Q/A row in the review card.
+ */
+private data class QaEntry(
+    val nodeId: String,
+    val question: String,
+    val answer: String
+)
+
+/**
+ * Render a compact Q/A row with consistent missing-value styling.
+ */
+@Composable
+private fun QaRow(
+    entry: QaEntry,
+    labelStyle: androidx.compose.ui.text.TextStyle,
+    bodyStyle: androidx.compose.ui.text.TextStyle
+) {
+    val cs = MaterialTheme.colorScheme
+
+    Column {
+        Text(
+            text = entry.nodeId,
+            style = labelStyle,
+            color = cs.onSurfaceVariant
+        )
+        Spacer(Modifier.height(2.dp))
+
+        val qText = if (entry.question.isBlank()) "– No Question." else "Q: ${entry.question}"
+        Text(
+            text = qText,
+            style = bodyStyle,
+            color = if (entry.question.isBlank()) {
+                cs.onSurface.copy(alpha = 0.6f)
+            } else {
+                cs.onSurface
+            }
+        )
+
+        Spacer(Modifier.height(2.dp))
+
+        val aText = if (entry.answer.isBlank()) "– No Answer." else entry.answer
+        Text(
+            text = "A: $aText",
+            maxLines = 6,
+            overflow = TextOverflow.Ellipsis,
+            style = bodyStyle,
+            color = if (entry.answer.isBlank()) {
+                cs.onSurface.copy(alpha = 0.6f)
+            } else {
+                cs.onSurface
+            }
+        )
     }
 }

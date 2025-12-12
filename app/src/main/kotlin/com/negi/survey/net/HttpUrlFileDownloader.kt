@@ -20,17 +20,10 @@
  *   • Exponential backoff retry with Retry-After compliance
  *   • SHA-256 integrity verification and free-space check
  *   • Progress callback suitable for Android foreground workers
- *
- *  Usage Example:
- *  ---------------------------------------------------------------------
- *  val downloader = HttpUrlFileDownloader(hfToken = HF_TOKEN)
- *  downloader.downloadToFile(
- *      url = "https://huggingface.co/.../resolve/main/model.bin",
- *      dst = File(context.cacheDir, "model.bin"),
- *      onProgress = { done, total -> Log.d("DL", "$done / $total") }
- *  )
  * =====================================================================
  */
+
+@file:Suppress("MemberVisibilityCanBePrivate", "unused")
 
 package com.negi.survey.net
 
@@ -51,6 +44,7 @@ import java.net.URL
 import java.security.MessageDigest
 import kotlin.math.max
 import kotlin.math.pow
+import kotlin.coroutines.coroutineContext
 
 /**
  * Coroutine-safe downloader for large, resumable HTTP transfers.
@@ -79,7 +73,7 @@ class HttpUrlFileDownloader(
      * @param onProgress Called periodically with downloaded bytes and total length.
      * @param expectedSha256 Optional expected SHA-256 hash for final validation.
      * @param connectTimeoutMs Timeout for connection setup.
-     * @param firstByteTimeoutMs Timeout for HEAD request (faster fail).
+     * @param firstByteTimeoutMs Timeout for HEAD request read.
      * @param stallTimeoutMs Timeout for read stalls during transfer.
      * @param ioBufferBytes Buffer size in bytes (default: 1 MiB).
      * @param maxRetries Maximum number of retry attempts.
@@ -103,12 +97,12 @@ class HttpUrlFileDownloader(
         val part = File(parent, dst.name + ".part")
         val meta = MetaFile(part)
 
-        // Fast path: skip if already complete and valid
+        // Fast path: skip if already complete and valid.
         runCatching { headProbe(url, connectTimeoutMs, firstByteTimeoutMs).total }.getOrNull()
             ?.let { headLen ->
-                if (dst.exists() && dst.length() == headLen &&
-                    (expectedSha256 == null || sha256(dst).equals(expectedSha256, true))
-                ) {
+                val okSize = dst.exists() && dst.length() == headLen
+                val okHash = expectedSha256 == null || sha256(dst).equals(expectedSha256, true)
+                if (okSize && okHash) {
                     onProgress(dst.length(), dst.length())
                     logd("Already complete, skipping download.")
                     return@withContext
@@ -121,29 +115,39 @@ class HttpUrlFileDownloader(
         while (attempt < maxRetries) {
             try {
                 coroutineContext.ensureActive()
+
                 val probe = headProbe(url, connectTimeoutMs, firstByteTimeoutMs)
                 val total = probe.total ?: throw IOException("Missing Content-Length.")
-                if (!probe.acceptRanges) throw IOException("Server does not support range requests.")
                 var finalUrl = probe.finalUrl
 
                 val already = if (part.exists()) part.length() else 0L
-                checkFreeSpaceOrThrow(parent, (total - already) + 50L * 1024 * 1024)
+
+                // Do not hard-fail only on missing Accept-Ranges header.
+                // Some servers support Range but do not advertise it.
+                if (!probe.acceptRanges && already > 0L) {
+                    logw("Accept-Ranges missing, but partial exists; will attempt resume anyway.")
+                }
+
+                checkFreeSpaceOrThrow(parent, max(0L, (total - already)) + 50L * 1024 * 1024)
 
                 meta.write(Meta(probe.etag, probe.lastModified, total))
+
                 var resumeFrom = already.coerceIn(0, total)
                 var triesOnThisStream = 0
 
                 STREAM@ while (true) {
                     if (triesOnThisStream > 0) {
                         val refreshed = headProbe(url, connectTimeoutMs, firstByteTimeoutMs)
-                        if (refreshed.total != null && refreshed.total != total)
+                        if (refreshed.total != null && refreshed.total != total) {
                             throw IOException("Remote size changed (old=$total new=${refreshed.total})")
+                        }
                         finalUrl = refreshed.finalUrl
                     }
 
                     val conn = openConn(finalUrl, "GET", connectTimeoutMs, stallTimeoutMs, true)
                     try {
                         setCommonHeaders(conn, finalUrl)
+
                         if (resumeFrom > 0) {
                             conn.setRequestProperty("Range", "bytes=$resumeFrom-")
                             meta.read()?.let { m ->
@@ -153,30 +157,45 @@ class HttpUrlFileDownloader(
                         }
 
                         val code = conn.responseCode
+
                         when (code) {
                             HttpURLConnection.HTTP_UNAUTHORIZED,
                             HttpURLConnection.HTTP_FORBIDDEN -> {
-                                logw("GET $code: refreshing link.")
+                                // Token missing/expired or signed URL rotated.
+                                logw("GET $code: may need refreshed access. Retrying HEAD.")
                                 triesOnThisStream++
                                 resumeFrom = part.length().coerceIn(0, total)
                                 continue@STREAM
                             }
 
                             HttpURLConnection.HTTP_OK -> if (resumeFrom > 0) {
+                                // Server ignored Range; restart cleanly.
                                 logw("Server ignored Range, restarting from 0.")
                                 part.delete()
+                                meta.delete()
                                 resumeFrom = 0L
                                 if (++triesOnThisStream <= 3) continue@STREAM
                                 throw IOException("Server ignored Range repeatedly.")
                             }
 
-                            416 -> handleRangeNotSatisfiable(
-                                dst,
-                                part,
-                                total,
-                                expectedSha256,
-                                onProgress
-                            )
+                            416 -> {
+                                val done = handleRangeNotSatisfiable(
+                                    dst = dst,
+                                    part = part,
+                                    meta = meta,
+                                    total = total,
+                                    expectedSha256 = expectedSha256,
+                                    onProgress = onProgress
+                                )
+                                if (done) {
+                                    return@withContext
+                                } else {
+                                    // We deleted .part inside handler; restart cleanly.
+                                    resumeFrom = 0L
+                                    if (++triesOnThisStream <= 3) continue@STREAM
+                                    throw IOException("416 reconciliation failed repeatedly.")
+                                }
+                            }
                         }
 
                         if (code !in listOf(
@@ -190,6 +209,7 @@ class HttpUrlFileDownloader(
 
                         val bufSize = ioBufferBytes.coerceIn(64 * 1024, 2 * 1024 * 1024)
                         var downloaded = resumeFrom
+
                         onProgress(downloaded, total)
 
                         try {
@@ -221,18 +241,27 @@ class HttpUrlFileDownloader(
                             throw t
                         }
 
+                        // Promote .part → final.
                         if (dst.exists()) dst.delete()
-                        if (!part.renameTo(dst)) part.copyTo(dst, overwrite = true)
-                            .also { part.delete() }
+                        if (!part.renameTo(dst)) {
+                            part.copyTo(dst, overwrite = true)
+                            part.delete()
+                        }
+                        meta.delete()
 
-                        if (dst.length() != total)
+                        // Final validations.
+                        if (dst.length() != total) {
                             throw IOException("Size mismatch: expected=$total got=${dst.length()}")
+                        }
                         if (expectedSha256 != null) {
                             val got = sha256(dst)
-                            if (!got.equals(expectedSha256, true))
+                            if (!got.equals(expectedSha256, true)) {
+                                dst.delete()
                                 throw IOException("SHA-256 mismatch: expected=$expectedSha256 got=$got")
+                            }
                         }
 
+                        onProgress(total, total)
                         logd("Saved ${dst.name} (${dst.length()} bytes)")
                         return@withContext
                     } finally {
@@ -242,9 +271,12 @@ class HttpUrlFileDownloader(
             } catch (t: Throwable) {
                 lastError = t
                 logw("Attempt ${attempt + 1} failed: ${t::class.simpleName}: ${t.message}")
+
                 val retryAfterMs = (t as? HttpExceptionWithRetryAfter)?.retryAfterMs
+
                 if (attempt < maxRetries - 1) {
-                    val backoffMs = retryAfterMs ?: (500.0 * 2.0.pow(attempt.toDouble())).toLong()
+                    val backoffMs =
+                        retryAfterMs ?: (500.0 * 2.0.pow(attempt.toDouble())).toLong()
                     logw("Retrying in ${backoffMs}ms …")
                     delay(backoffMs)
                 }
@@ -261,6 +293,7 @@ class HttpUrlFileDownloader(
     // ----------------------------------------------------------
     // HEAD probe (resolves redirects and captures validators)
     // ----------------------------------------------------------
+
     private data class Probe(
         val total: Long?,
         val acceptRanges: Boolean,
@@ -279,6 +312,7 @@ class HttpUrlFileDownloader(
             conn = openConn(current, "HEAD", connectTimeoutMs, readTimeoutMs, false)
             setCommonHeaders(conn, current)
             conn.connect()
+
             val code = conn.responseCode
 
             if (code in 300..399) {
@@ -289,24 +323,30 @@ class HttpUrlFileDownloader(
                 continue
             }
 
-            if (code == 429 || code == 503)
+            if (code == 429 || code == 503) {
                 throw HttpExceptionWithRetryAfter("HEAD HTTP $code", readRetryAfterMs(conn))
+            }
 
-            if (code !in 200..299)
-                throw IOException("HEAD HTTP $code: ${readErrorSnippet(conn) ?: ""}")
+            if (code !in 200..299) {
+                throw IOException("HEAD HTTP $code${readErrorSnippet(conn)?.let { ": $it" } ?: ""}")
+            }
 
             val total = conn.getHeaderFieldLong("Content-Length", -1L).takeIf { it >= 0 }
-            val acceptRanges = (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes", true)
+            val acceptRanges =
+                (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes", true)
+
             val etag = conn.getHeaderField("ETag")
             val lastMod = conn.getHeaderField("Last-Modified")
             val finalUrl = conn.url.toString()
+
             return Probe(total, acceptRanges, etag, lastMod, finalUrl)
         }
     }
 
     // ----------------------------------------------------------
-    // Helper Classes
+    // Meta file
     // ----------------------------------------------------------
+
     private data class Meta(val etag: String?, val lastModified: String?, val total: Long?)
 
     private class MetaFile(private val part: File) {
@@ -323,29 +363,49 @@ class HttpUrlFileDownloader(
 
         fun write(meta: Meta) {
             runCatching {
-                file.writeText(buildString {
-                    meta.etag?.let { append("etag=$it\n") }
-                    meta.lastModified?.let { append("lastModified=$it\n") }
-                    meta.total?.let { append("total=$it\n") }
-                })
+                file.writeText(
+                    buildString {
+                        meta.etag?.let { append("etag=$it\n") }
+                        meta.lastModified?.let { append("lastModified=$it\n") }
+                        meta.total?.let { append("total=$it\n") }
+                    }
+                )
             }
+        }
+
+        fun delete() {
+            runCatching { if (file.exists()) file.delete() }
         }
     }
 
     // ----------------------------------------------------------
-    // Utility Functions
+    // 416 reconciliation
     // ----------------------------------------------------------
+
+    /**
+     * Handle HTTP 416 by reconciling local partial state.
+     *
+     * @return true if the download can be considered complete and promoted to [dst].
+     *         false if caller should restart from 0.
+     */
     private fun handleRangeNotSatisfiable(
         dst: File,
         part: File,
+        meta: MetaFile,
         total: Long,
         expectedSha256: String?,
         onProgress: (Long, Long?) -> Unit
-    ) {
+    ): Boolean {
         val onDisk = part.length()
+
         if (onDisk == total) {
             if (dst.exists()) dst.delete()
-            if (!part.renameTo(dst)) part.copyTo(dst, overwrite = true).also { part.delete() }
+            if (!part.renameTo(dst)) {
+                part.copyTo(dst, overwrite = true)
+                part.delete()
+            }
+            meta.delete()
+
             if (expectedSha256 != null) {
                 val got = sha256(dst)
                 if (!got.equals(expectedSha256, true)) {
@@ -353,13 +413,22 @@ class HttpUrlFileDownloader(
                     throw IOException("SHA mismatch after 416 reconciliation.")
                 }
             }
+
             onProgress(total, total)
             logd("Completed via 416 reconciliation.")
-        } else {
-            logw("416 mismatch, restarting from 0.")
-            part.delete()
+            return true
         }
+
+        // Partial is inconsistent; reset local state.
+        logw("416 mismatch (part=$onDisk, total=$total), restarting from 0.")
+        part.delete()
+        meta.delete()
+        return false
     }
+
+    // ----------------------------------------------------------
+    // Utility functions
+    // ----------------------------------------------------------
 
     private fun sha256(f: File): String {
         val md = MessageDigest.getInstance("SHA-256")
@@ -389,6 +458,7 @@ class HttpUrlFileDownloader(
             readTimeout = readTimeoutMs
             useCaches = false
             doInput = true
+            doOutput = false
         }
     }
 
@@ -397,16 +467,24 @@ class HttpUrlFileDownloader(
         conn.setRequestProperty("Accept", "application/octet-stream")
         conn.setRequestProperty("Accept-Charset", "UTF-8")
         conn.setRequestProperty("Accept-Encoding", "identity")
+
         if (isHfHost(url) && !hfToken.isNullOrBlank()) {
             conn.setRequestProperty("Authorization", "Bearer $hfToken")
         }
     }
 
-    private fun readErrorSnippet(conn: HttpURLConnection): String? {
+    private fun readErrorSnippet(conn: HttpURLConnection, maxBytes: Int = 2048): String? {
         return try {
-            (conn.errorStream ?: return null).use { it.readBytes().decodeToString() }
-                .replace("\n", " ")
-                .take(300)
+            val es = conn.errorStream ?: return null
+            es.use { stream ->
+                val buf = ByteArray(maxBytes)
+                val n = stream.read(buf)
+                if (n <= 0) return null
+                buf.copyOf(n).decodeToString()
+                    .replace("\n", " ")
+                    .replace("\r", " ")
+                    .trim()
+            }
         } catch (_: Throwable) {
             null
         }
@@ -418,8 +496,9 @@ class HttpUrlFileDownloader(
     private fun checkFreeSpaceOrThrow(dir: File, required: Long) {
         val fs = StatFs(dir.absolutePath)
         val avail = max(0L, fs.availableBytes)
-        if (avail < required)
+        if (avail < required) {
             throw IOException("Not enough space: need ${required}B, available ${avail}B")
+        }
     }
 
     private fun isHfHost(u: String): Boolean {
@@ -435,6 +514,8 @@ class HttpUrlFileDownloader(
         if (debugLogs) Log.w(tag, msg)
     }
 
-    private class HttpExceptionWithRetryAfter(message: String, val retryAfterMs: Long?) :
-        IOException(message)
+    private class HttpExceptionWithRetryAfter(
+        message: String,
+        val retryAfterMs: Long?
+    ) : IOException(message)
 }
