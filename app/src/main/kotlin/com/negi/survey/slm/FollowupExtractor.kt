@@ -38,10 +38,10 @@ import kotlin.math.min
  * - Deduplicates while preserving encounter order (LinkedHashSet semantics).
  * - Provides a light-weight 0..100 score extractor with robust JSON recursion + textual fallback.
  *
- * Behavior / Compatibility:
- * - Public APIs and defaults are preserved.
- * - Conservative by default: blank strings are ignored; trailing "???" or "？？" collapse to exactly one mark,
- *   preserving full/half width depending on the original run.
+ * Typical usage:
+ * - [fromRaw] for full SLM output (possibly including code fences and commentary).
+ * - [extractFollowupQuestion] when only the first follow-up question is needed.
+ * - [extractScore] to pull a coarse 0..100 score from the same output.
  */
 object FollowupExtractor {
 
@@ -49,14 +49,20 @@ object FollowupExtractor {
     /* Configuration                                                         */
     /* --------------------------------------------------------------------- */
 
-    /** Regex used to normalize key separators into a single dash. */
+    /** Regex used to normalize key separators (space, underscore, dashes, zero-width) into a single dash. */
     private val KEY_SEP_REGEX =
         Regex("""[\s_\u200B\u200C\u200D\u2060\u2010-\u2015]+""")
 
     /**
      * Normalize field keys for matching:
-     * - lowercase
-     * - convert any run of [space/_/unicode-dash/zero-width] to a single '-'
+     * - Lowercase the entire string.
+     * - Convert any run of [space/_/unicode-dash/zero-width] to a single '-'.
+     * - Trim leading/trailing dashes.
+     *
+     * Examples:
+     * - "followup question"      -> "followup-question"
+     * - "follow_up_question"     -> "follow-up-question"
+     * - "Follow-Up–Question"     -> "follow-up-question"
      */
     private fun normKey(k: String): String =
         k.lowercase().replace(KEY_SEP_REGEX, "-").trim('-')

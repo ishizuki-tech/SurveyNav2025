@@ -88,6 +88,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.navigation3.rememberViewModelStoreNavEntryDecorator
 import androidx.navigation3.runtime.NavBackStack
@@ -108,10 +111,10 @@ import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.screens.UploadProgressOverlay
 import com.negi.survey.slm.ConfigKey
+import com.negi.survey.slm.LiteRtLM
+import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
 import com.negi.survey.slm.Repository
-import com.negi.survey.slm.SLM
-import com.negi.survey.slm.SlmDirectRepository
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -124,13 +127,11 @@ import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /**
  * Root activity of the SurveyNav app.
@@ -238,15 +239,20 @@ fun InitGate(
 ) {
     var isLoading by remember(key) { mutableStateOf(true) }
     var error by remember(key) { mutableStateOf<Throwable?>(null) }
+    var initJob by remember(key) { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
     /**
      * Starts or restarts the initialization coroutine.
+     *
+     * Defensive:
+     * - Cancels any in-flight init job to avoid concurrent init races.
      */
     fun kick() {
+        initJob?.cancel()
         isLoading = true
         error = null
-        scope.launch {
+        initJob = scope.launch {
             try {
                 init()
                 isLoading = false
@@ -254,6 +260,15 @@ fun InitGate(
                 error = t
                 isLoading = false
             }
+        }
+    }
+
+    /**
+     * Cancel running init if this gate leaves composition.
+     */
+    DisposableEffect(key) {
+        onDispose {
+            initJob?.cancel()
         }
     }
 
@@ -532,8 +547,12 @@ private const val DEFAULT_WHISPER_LANGUAGE = "auto"
  *
  * Important:
  * This function introduces a "selection epoch" to generate a unique
- * session key per user selection, ensuring ViewModels are not reused
- * when the same config is re-selected after a restart.
+ * session key per user selection, ensuring config reload is forced even
+ * when selecting the same file again.
+ *
+ * Defensive:
+ * ViewModels are scoped to a per-session ViewModelStore that is cleared
+ * when leaving the session, preventing Activity-level ViewModel leaks.
  */
 @Composable
 fun AppNav() {
@@ -603,9 +622,6 @@ fun AppNav() {
     /**
      * A monotonically increasing epoch that changes every time
      * the user starts a new config session.
-     *
-     * This prevents Activity-scoped ViewModelStore from reusing
-     * previous instances when the same config file is selected again.
      */
     var selectionEpoch by remember { mutableStateOf(0) }
 
@@ -617,12 +633,6 @@ fun AppNav() {
             options = options,
             defaultOptionId = options.firstOrNull()?.id,
             onStart = { option ->
-                /**
-                 * Start a brand-new session:
-                 * - Increment epoch
-                 * - Clear stale config UI state
-                 * - Bind the new selection
-                 */
                 selectionEpoch += 1
                 config = null
                 configError = null
@@ -640,10 +650,6 @@ fun AppNav() {
 
     /**
      * A unique session key per selection event.
-     *
-     * Example:
-     *  - survey_config2.yaml@1
-     *  - survey_config2.yaml@2  (re-selected after restart)
      */
     val sessionKey = remember(chosen!!.id, selectionEpoch) {
         "${chosen!!.id}@$selectionEpoch"
@@ -651,9 +657,6 @@ fun AppNav() {
 
     /**
      * Stage 2: Load the chosen configuration once per session key.
-     *
-     * Using [sessionKey] (not only file id) ensures that selecting the
-     * same file again after a restart still triggers a fresh load path.
      */
     LaunchedEffect(sessionKey) {
         configLoading = true
@@ -772,12 +775,30 @@ fun AppNav() {
     val cfg = config!!
 
     /**
-     * App-level download/UI ViewModel.
+     * Per-session ViewModelStore to prevent Activity-level ViewModel accumulation.
      *
-     * Keyed by [sessionKey] to guarantee a fresh instance
-     * even when the same config file is re-selected.
+     * When this session subtree leaves composition, the store is cleared,
+     * triggering ViewModel.onCleared() and releasing resources.
+     */
+    val sessionVmStore = remember(sessionKey) { ViewModelStore() }
+    val sessionVmOwner = remember(sessionVmStore) {
+        object : ViewModelStoreOwner {
+            override val viewModelStore: ViewModelStore = sessionVmStore
+        }
+    }
+
+    DisposableEffect(sessionKey) {
+        onDispose {
+            Log.d("MainActivity", "Session dispose -> clearing ViewModelStore. session=$sessionKey")
+            sessionVmStore.clear()
+        }
+    }
+
+    /**
+     * App-level download/UI ViewModel (scoped to session store).
      */
     val appVm: AppViewModel = viewModel(
+        viewModelStoreOwner = sessionVmOwner,
         key = "AppViewModel_$sessionKey",
         factory = AppViewModel.factoryFromOverrides(
             modelUrlOverride = cfg.modelDefaults.defaultModelUrl,
@@ -834,40 +855,29 @@ fun AppNav() {
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
             init = {
                 withContext(Dispatchers.Default) {
-                    suspendCancellableCoroutine { cont ->
-                        SLM.ensureInitialized(appContext, slmModel) { err ->
-                            if (err.isEmpty()) {
-                                cont.resume(Unit)
-                            } else {
-                                cont.resumeWithException(IllegalStateException(err))
-                            }
-                        }
-                    }
+                    /**
+                     * Initialize LiteRtLM backend (text-only).
+                     */
+                    LiteRtLM.initializeIfNeeded(
+                        context = appContext,
+                        model = slmModel,
+                        supportImage = false,
+                        supportAudio = false
+                    )
                 }
             }
         ) {
-            /**
-             * IMPORTANT:
-             * Do not call SLM.release() in this composable scope.
-             *
-             * Releasing on dispose can cause repeated init loops during
-             * config reloads or transient recompositions.
-             * The runtime should own the lifecycle of the model instance.
-             */
-
             val backStack = rememberNavBackStack(FlowHome)
 
             val repo: Repository = remember(appContext, slmModel, cfg) {
-                SlmDirectRepository(slmModel, cfg)
+                LiteRtRepository(slmModel, cfg)
             }
 
             /**
-             * Survey ViewModel keyed by session.
-             *
-             * This ensures that "Restart -> reselect same config"
-             * cannot resurrect stale navigation/answer state.
+             * Survey ViewModel keyed and scoped to the session store.
              */
             val vmSurvey: SurveyViewModel = viewModel(
+                viewModelStoreOwner = sessionVmOwner,
                 key = "SurveyViewModel_$sessionKey",
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
@@ -878,11 +888,10 @@ fun AppNav() {
             )
 
             /**
-             * AI ViewModel keyed by session and model identity.
-             *
-             * This prevents repository/model mismatches across sessions.
+             * AI ViewModel keyed and scoped to the session store.
              */
             val vmAI: AiViewModel = viewModel(
+                viewModelStoreOwner = sessionVmOwner,
                 key = "AiViewModel_${sessionKey}_${slmModel.name}",
                 factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
@@ -894,9 +903,6 @@ fun AppNav() {
 
             /**
              * Hard reset back to the config selector.
-             *
-             * The next selection will increment [selectionEpoch]
-             * and produce a new [sessionKey].
              */
             val resetToSelector: () -> Unit = {
                 Log.d("MainActivity", "resetToSelector invoked. session=$sessionKey")
@@ -915,7 +921,9 @@ fun AppNav() {
                         vmAI = vmAI,
                         backStack = backStack,
                         onResetToSelector = resetToSelector,
-                        whisperMeta = cfg.whisper
+                        whisperMeta = cfg.whisper,
+                        sessionId = sessionKey,
+                        sessionVmOwner = sessionVmOwner
                     )
                 }
             } else {
@@ -924,7 +932,9 @@ fun AppNav() {
                     vmAI = vmAI,
                     backStack = backStack,
                     onResetToSelector = resetToSelector,
-                    whisperMeta = cfg.whisper
+                    whisperMeta = cfg.whisper,
+                    sessionId = sessionKey,
+                    sessionVmOwner = sessionVmOwner
                 )
             }
         }
@@ -952,11 +962,15 @@ fun SurveyNavHost(
     vmAI: AiViewModel,
     backStack: NavBackStack<NavKey>,
     onResetToSelector: () -> Unit = {},
-    whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta()
+    whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta(),
+    sessionId: String = "session",
+    sessionVmOwner: ViewModelStoreOwner? = null
 ) {
     UploadProgressOverlay()
 
     val appContext = LocalContext.current.applicationContext
+    val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
+    ?: error("Missing ViewModelStoreOwner")
 
     val latestNode by vmSurvey.currentNode.collectAsState()
     val latestNodeId = latestNode.id
@@ -978,6 +992,7 @@ fun SurveyNavHost(
         }
 
         viewModel(
+            viewModelStoreOwner = owner,
             key = "WhisperSpeechController_${vmSurvey.hashCode()}_${assetPath}_$lang",
             factory = WhisperSpeechController.provideFactory(
                 appContext = appContext,
@@ -986,8 +1001,8 @@ fun SurveyNavHost(
                 onVoiceExported = onVoiceExported@{ voice ->
                     /**
                      * Resolve an effective question id:
-                     * - Use the explicit questionId from the voice context if present.
-                     * - Otherwise fall back to the latest node id.
+                     * - Prefer the explicit questionId captured by SpeechController context.
+                     * - Fall back to the latest node id only as a last resort.
                      */
                     val resolvedQid =
                         voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
@@ -1017,6 +1032,19 @@ fun SurveyNavHost(
         )
     } else {
         remember { NoOpSpeechController() }
+    }
+
+    /**
+     * Keep SpeechController context in sync with the current question.
+     *
+     * This reduces the risk of attaching an exported audio file to the wrong
+     * question when transcription completes after navigation.
+     */
+    LaunchedEffect(sessionId, latestNodeId) {
+        speechController.updateContext(
+            surveyId = sessionId,
+            questionId = latestNodeId
+        )
     }
 
     val canGoBack by vmSurvey.canGoBack.collectAsState()

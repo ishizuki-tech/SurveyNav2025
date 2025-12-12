@@ -20,12 +20,13 @@
  *    • Expose simple busy-state checks for higher-level watchdogs.
  *
  *  Update (Stability Fixes):
- *    • Use a stable runtime key (cacheKey) for cleanup listeners.
- *    • isBusy() checks process-wide cache + native-generation guard.
- *    • Deferred session close to avoid "Previous invocation still processing".
- *    • fireClean() resets captured instance state directly.
- *    • cleanUp() hard-evicts even when model.instance is null.
- *    • runInference() sync-rebuilds session if sampling params changed.
+ *    • initialize() now hard-evicts process cache safely and checks busy.
+ *    • cancel() handles "no active generation yet" without getting stuck.
+ *    • resetSession() builds new session before swapping; never nukes pendingClose.
+ *    • Pending deferred sessions are no longer leaked by resetSession().
+ *    • ACCELERATOR string is normalized (trim/uppercase) for stable cache keys.
+ *    • fireClean() now also flushes deferred closes when safe.
+ *    • Defensive try/catch around listener callbacks to avoid thread crashes.
  * =====================================================================
  */
 
@@ -86,15 +87,24 @@ data class Model(
     val name: String,
     val taskPath: String,
     val config: Map<ConfigKey, Any> = emptyMap(),
-    @Volatile var instance: LlmModelInstance? = null
+    @Volatile var instance: SlmModelInstance? = null
 ) {
+    /**
+     * Returns the raw task path used by MediaPipe Tasks.
+     */
     fun getPath(): String = taskPath
 
+    /**
+     * Lookup an [Int] config value with a sane fallback.
+     */
     fun getIntConfigValue(key: ConfigKey, default: Int): Int =
         (config[key] as? Number)?.toInt()
             ?: (config[key] as? String)?.toIntOrNull()
             ?: default
 
+    /**
+     * Lookup a [Float] config value with a sane fallback.
+     */
     fun getFloatConfigValue(key: ConfigKey, default: Float): Float =
         when (val v = config[key]) {
             is Number -> v.toFloat()
@@ -102,6 +112,9 @@ data class Model(
             else -> default
         }
 
+    /**
+     * Lookup a [String] config value with a sane fallback.
+     */
     fun getStringConfigValue(key: ConfigKey, default: String): String =
         (config[key] as? String) ?: default
 }
@@ -129,7 +142,7 @@ data class SessionParams(
  * - pendingClose holds an old session reference that should be closed only
  *   after done=true is observed for the active generation.
  */
-data class LlmModelInstance(
+data class SlmModelInstance(
     val engine: LlmInference,
     @Volatile var session: LlmInferenceSession,
     val state: AtomicReference<RunState> = AtomicReference(RunState.IDLE),
@@ -171,18 +184,15 @@ object SLM {
      *
      * Sampling params (topK/topP/temp) are session-level and can be rebuilt.
      */
-    private val instanceCache = ConcurrentHashMap<String, LlmModelInstance>()
+    private val instanceCache = ConcurrentHashMap<String, SlmModelInstance>()
 
     /**
-     * Returns true when the runtime is not idle.
+     * Returns true when the runtime is not idle for this [model].
      *
      * This method checks:
-     * - Process-wide cached state
-     * - App-level run state
-     * - Native-generation guard (active > done)
-     *
-     * This prevents false-IDLE right after cancel() when MediaPipe
-     * is still finishing the previous invocation.
+     * - Process-wide cached state.
+     * - App-level run state.
+     * - Native-generation guard (active > done).
      */
     fun isBusy(model: Model): Boolean {
         val cacheKey = cacheKeyOf(model)
@@ -254,7 +264,10 @@ object SLM {
             if (err.isEmpty()) {
                 model.instance?.let { inst ->
                     instanceCache[cacheKey] = inst
-                    Log.d(TAG, "ensureInitialized: cached new instance model='${model.name}', cacheKey='$cacheKey'")
+                    Log.d(
+                        TAG,
+                        "ensureInitialized: cached new instance model='${model.name}', cacheKey='$cacheKey'"
+                    )
                 }
             }
             onDone(err)
@@ -266,42 +279,58 @@ object SLM {
      *
      * Note:
      * - Prefer calling [ensureInitialized] from UI.
-     * - This function remains as the hard init implementation.
+     * - This function is a hard init implementation: it will hard-evict any
+     *   existing cached runtime for the same cache key (if safe).
      */
     @Synchronized
     fun initialize(context: Context, model: Model, onDone: (String) -> Unit) {
-        var oldEngine: LlmInference? = null
-        var oldSession: LlmInferenceSession? = null
+        val targetKey = cacheKeyOf(model)
 
         Log.d(
             TAG,
-            "initialize: model='${model.name}', cacheKey='${cacheKeyOf(model)}', " +
-                    "hasAttached=${model.instance != null}"
+            "initialize: model='${model.name}', cacheKey='$targetKey', hasAttached=${model.instance != null}"
         )
-        Log.d(TAG, "initialize: closing old session/engine (if any)")
 
-        model.instance?.let { inst ->
-            if (inst.state.get() != RunState.IDLE) {
+        // Hard-evict existing runtime for this key if present (and safe).
+        val existing = model.instance ?: instanceCache[targetKey]
+        if (existing != null) {
+            val stateBusy = existing.state.get() != RunState.IDLE
+            val genBusy = existing.activeGenerationId > existing.lastDoneGenerationId
+            if (stateBusy || genBusy) {
                 onDone("Model '${model.name}' is busy. Try again after done=true or call cancel().")
                 return
             }
 
-            oldSession = inst.session
-            oldEngine = inst.engine
-            cleanUpListeners.remove(runtimeKeyOf(model))
-            model.instance = null
-        }
+            val keyInCache = findCacheKeyForInstance(existing) ?: targetKey
+            Log.d(TAG, "initialize: hard-evict existing runtime key='$keyInCache'")
 
-        tryCloseQuietly(oldSession)
-        safeClose(oldEngine)
+            cleanUpListeners.remove(keyInCache)
+            instanceCache.remove(keyInCache)
+
+            // Detach if the model points to this instance.
+            if (model.instance === existing) {
+                model.instance = null
+            }
+
+            // Close any deferred session first.
+            flushPendingClose(existing, "initialize-hard-evict")
+            tryCloseQuietly(existing.session)
+            safeClose(existing.engine)
+        } else {
+            // If model.instance is null but the cache contains a stale instance under another key,
+            // we do not evict here. Use cleanUp() for global eviction.
+            Log.d(TAG, "initialize: no existing runtime found for key='$targetKey'")
+        }
 
         val maxTokens = model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN)
         val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOP_K))
         val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOP_P))
-        val temp = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
-        val backendPref = model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
+        val temp = sanitizeTemperature(
+            model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE)
+        )
 
-        val backend = when (backendPref.uppercase()) {
+        val backendPref = normalizedAccelerator(model)
+        val backend = when (backendPref) {
             Accelerator.CPU.label -> LlmInference.Backend.CPU
             else -> LlmInference.Backend.GPU
         }
@@ -312,14 +341,16 @@ object SLM {
                     "backendPref='$backendPref', resolvedBackend=$backend, " +
                     "maxTokens=$maxTokens, topK=$topK, topP=$topP, temp=$temp"
         )
-        Log.d(TAG, "initialize: creating engine with backend=$backend")
 
         val baseOpts = LlmInference.LlmInferenceOptions.builder()
             .setModelPath(model.getPath())
             .setMaxTokens(maxTokens)
 
         val engine = try {
-            LlmInference.createFromOptions(context, baseOpts.setPreferredBackend(backend).build())
+            LlmInference.createFromOptions(
+                context,
+                baseOpts.setPreferredBackend(backend).build()
+            )
         } catch (e: Exception) {
             if (backend == LlmInference.Backend.GPU) {
                 Log.w(TAG, "GPU init failed. Falling back to CPU: ${e.message}")
@@ -346,18 +377,18 @@ object SLM {
 
             val session = buildSession(engine, params)
 
-            model.instance = LlmModelInstance(
+            val inst = SlmModelInstance(
                 engine = engine,
                 session = session,
                 lastParams = params
             )
 
-            // Cache immediately for process-wide reuse.
-            instanceCache[cacheKeyOf(model)] = model.instance!!
+            model.instance = inst
+            instanceCache[targetKey] = inst
 
             Log.d(
                 TAG,
-                "initialize: success model='${model.name}', cacheKey='${cacheKeyOf(model)}' attached+cached"
+                "initialize: success model='${model.name}', cacheKey='$targetKey' attached+cached"
             )
 
             onDone("")
@@ -375,52 +406,71 @@ object SLM {
      * - If MediaPipe is still processing, the close is deferred until done=true.
      */
     fun resetSession(model: Model): Boolean {
+        val cacheKey = cacheKeyOf(model)
+
         Log.d(
             TAG,
-            "resetSession: model='${model.name}', cacheKey='${cacheKeyOf(model)}', " +
-                    "hasAttached=${model.instance != null}, hasCached=${instanceCache.containsKey(cacheKeyOf(model))}"
+            "resetSession: model='${model.name}', cacheKey='$cacheKey', " +
+                    "hasAttached=${model.instance != null}, hasCached=${instanceCache.containsKey(cacheKey)}"
         )
 
-        val snap = synchronized(this) {
-            val inst = model.instance
-                ?: instanceCache[cacheKeyOf(model)]
-                ?: return false
+        val inst = synchronized(this) {
+            model.instance ?: instanceCache[cacheKey]
+        } ?: return false
 
-            if (inst.state.get() != RunState.IDLE) return false
+        if (inst.state.get() != RunState.IDLE) return false
 
-            val params = paramsFromModel(model)
-            Log.d(TAG, "resetSession: snapshot params desired=$params, last=${inst.lastParams}")
+        val desired = paramsFromModel(model)
+        Log.d(TAG, "resetSession: desired=$desired, last=${inst.lastParams}")
 
-            Snap(inst = inst, oldSession = inst.session, params = params)
-        }
-
-        Log.d(TAG, "resetSession: closing old session before rebuild")
-        scheduleOrCloseOldSession(snap.inst, snap.oldSession, "resetSession-pre-rebuild")
-
-        Log.d(TAG, "resetSession: building new session params=${snap.params}")
+        // Build new session first. If this fails, old session is still intact.
         val newSession = try {
-            buildSession(snap.inst.engine, snap.params)
+            buildSession(inst.engine, desired)
         } catch (e: Exception) {
-            Log.e(TAG, "Session reset failed: ${e.message}", e)
+            Log.e(TAG, "resetSession: new session build failed: ${e.message}", e)
             return false
         }
 
-        synchronized(this) {
-            val inst = model.instance
-                ?: instanceCache[cacheKeyOf(model)]
-                ?: return false.also { tryCloseQuietly(newSession) }
-
-            if (inst.engine != snap.inst.engine || inst.state.get() != RunState.IDLE) {
+        val oldSession: LlmInferenceSession = synchronized(this) {
+            val current = model.instance ?: instanceCache[cacheKey] ?: run {
                 tryCloseQuietly(newSession)
                 return false
             }
 
-            inst.session = newSession
-            inst.lastParams = snap.params
-            model.instance = inst
+            if (current !== inst || current.state.get() != RunState.IDLE) {
+                tryCloseQuietly(newSession)
+                return false
+            }
+
+            val old = current.session
+            current.session = newSession
+            current.lastParams = desired
+            model.instance = current
+
+            old
         }
 
-        Log.d(TAG, "resetSession: success model='${model.name}', cacheKey='${cacheKeyOf(model)}'")
+        // Defer or close old session safely after swap.
+        scheduleOrCloseOldSession(inst, oldSession, "resetSession-swap")
+
+        synchronized(this) {
+            val current = model.instance ?: instanceCache[cacheKey] ?: return false
+            if (current !== inst) return false
+
+            // Reset generation bookkeeping for the new session.
+            current.generationSeq.set(0L)
+            current.activeGenerationId = 0L
+            current.lastDoneGenerationId = 0L
+
+            // IMPORTANT: Do NOT clear pendingClose here.
+            // If old session was deferred, it must survive until a future done=true
+            // triggers flushPendingClose() safely.
+            current.lastGenerateStartMs = 0L
+            current.lastGenerateDoneMs = 0L
+            current.state.set(RunState.IDLE)
+        }
+
+        Log.d(TAG, "resetSession: success model='${model.name}', cacheKey='$cacheKey'")
         return true
     }
 
@@ -440,7 +490,7 @@ object SLM {
      * Completely cleans up the model's engine and session and disposes resources.
      *
      * This is a hard-evict path:
-     * - Removes the cached instance for the model's cache key.
+     * - Removes the cached instance for the model's cache key (and also by identity).
      * - Closes engine/session.
      *
      * This implementation also attempts to evict even when [model.instance] is null.
@@ -448,16 +498,29 @@ object SLM {
     @Synchronized
     fun cleanUp(model: Model, onDone: () -> Unit) {
         val cacheKey = cacheKeyOf(model)
-        val inst = model.instance ?: instanceCache.remove(cacheKey)
-
-        if (inst == null) {
+        val inst = model.instance ?: instanceCache[cacheKey] ?: run {
+            // Also attempt eviction-by-identity if the model points elsewhere.
             cleanUpListeners.remove(runtimeKeyOf(model))
             onDone()
             return
         }
 
-        cleanUpListeners.remove(runtimeKeyOf(model))?.invoke()
-        instanceCache.remove(cacheKey)
+        val stateBusy = inst.state.get() != RunState.IDLE
+        val genBusy = inst.activeGenerationId > inst.lastDoneGenerationId
+
+        Log.d(
+            TAG,
+            "cleanUp: model='${model.name}', cacheKey='$cacheKey', instPresent=true, stateBusy=$stateBusy, genBusy=$genBusy"
+        )
+
+        // Remove from cache by identity to avoid leaving stale keys.
+        findCacheKeyForInstance(inst)?.let { key ->
+            instanceCache.remove(key)
+            cleanUpListeners.remove(key)?.invoke()
+        } ?: run {
+            instanceCache.remove(cacheKey)
+            cleanUpListeners.remove(runtimeKeyOf(model))?.invoke()
+        }
 
         runCatching {
             if (inst.state.get() != RunState.IDLE) {
@@ -466,15 +529,14 @@ object SLM {
         }
 
         inst.state.set(RunState.IDLE)
-
         model.instance = null
 
-        // Best-effort: close any deferred session first.
         flushPendingClose(inst, "cleanup-hard-evict")
 
         tryCloseQuietly(inst.session)
         safeClose(inst.engine)
 
+        Log.d(TAG, "cleanUp: completed for model='${model.name}', cacheKey='$cacheKey'")
         onDone()
     }
 
@@ -482,23 +544,36 @@ object SLM {
      * Attempts to cancel the current generation for [model].
      *
      * Note:
-     * - App-level state may flip to IDLE immediately.
-     * - Native-generation guard keeps isBusy() true until done=true arrives.
-     * - Any pending close is flushed when safe.
+     * - App-level state becomes [RunState.CANCELLING].
+     * - Native-generation guard keeps isBusy() true until done=true arrives
+     *   or a hard [cleanUp] occurs.
+     *
+     * Fix:
+     * - If there is no active generation window yet (active <= done),
+     *   we rebuild the session to clear queued query chunks and return to IDLE.
+     *   This avoids getting stuck in CANCELLING forever.
      */
     @Synchronized
     fun cancel(model: Model) {
         val cacheKey = cacheKeyOf(model)
         val inst = model.instance ?: instanceCache[cacheKey] ?: return
+        model.instance = inst
+
+        val runtimeKey = runtimeKeyOf(model)
+
+        val stateBefore = inst.state.get()
+        val active = inst.activeGenerationId
+        val done = inst.lastDoneGenerationId
+        val genBusy = active > done
 
         Log.d(
             TAG,
-            "cancel: invoked model='${model.name}', runtimeKey='${runtimeKeyOf(model)}', " +
-                    "cacheKey='$cacheKey', stateBefore=${inst.state.get()}"
+            "cancel: invoked model='${model.name}', runtimeKey='$runtimeKey', cacheKey='$cacheKey', " +
+                    "stateBefore=$stateBefore, active=$active, done=$done, genBusy=$genBusy"
         )
 
-        if (inst.state.get() == RunState.IDLE) {
-            cleanUpListeners.remove(runtimeKeyOf(model))
+        if (stateBefore == RunState.IDLE && !genBusy) {
+            cleanUpListeners.remove(runtimeKey)
             flushPendingClose(inst, "cancel-idle")
             return
         }
@@ -508,15 +583,30 @@ object SLM {
         runCatching { inst.session.cancelGenerateResponseAsync() }
             .onFailure { Log.w(TAG, "cancelGenerateResponseAsync failed: ${it.message}") }
 
-        // Do not modify generation IDs here.
-        // done=true callback will finalize native-generation state.
-        inst.state.set(RunState.IDLE)
+        // If there is no active native generation, we will not receive done=true.
+        // Rebuild the session to clear queued chunks and return to IDLE now.
+        if (!genBusy) {
+            Log.d(TAG, "cancel: no active generation -> immediate session rebuild + IDLE")
+            val old = inst.session
+            val params = inst.lastParams
+            val newSession = runCatching { buildSession(inst.engine, params) }
+                .getOrElse {
+                    Log.w(TAG, "cancel: session rebuild failed: ${it.message}")
+                    null
+                }
 
-        Log.d(TAG, "cancel: stateAfter=${inst.state.get()} model='${model.name}'")
+            if (newSession != null) {
+                inst.session = newSession
+                scheduleOrCloseOldSession(inst, old, "cancel-no-active-rebuild")
+            }
 
-        cleanUpListeners.remove(runtimeKeyOf(model))?.invoke()
+            inst.state.set(RunState.IDLE)
+            flushPendingClose(inst, "cancel-no-active-flush")
+            cleanUpListeners.remove(runtimeKey)?.invoke()
+            return
+        }
 
-        // If native has already finished, we can close deferred sessions.
+        // Otherwise, wait for done=true to transition back to IDLE.
         flushPendingClose(inst, "cancel-post")
     }
 
@@ -534,12 +624,26 @@ object SLM {
         val inst = synchronized(this) {
             model.instance ?: instanceCache[cacheKeyOf(model)]
         } ?: run {
-            listener("Model not initialized.", true)
+            safeCallResult(listener, "Model not initialized.", true)
+            safeCallClean(onClean)
             return
         }
 
         // Re-attach the cached instance to this model for consistent visibility.
         model.instance = inst
+
+        // Defensive: refuse if native generation is still busy even though state might be IDLE.
+        val genBusyPre = inst.activeGenerationId > inst.lastDoneGenerationId
+        if (genBusyPre) {
+            Log.w(
+                TAG,
+                "runInference: refused due to native gen busy model='${model.name}', " +
+                        "active=${inst.activeGenerationId}, done=${inst.lastDoneGenerationId}"
+            )
+            safeCallResult(listener, "Model '${model.name}' is still processing a previous request.", true)
+            safeCallClean(onClean)
+            return
+        }
 
         val once = AtomicBoolean(false)
 
@@ -547,18 +651,18 @@ object SLM {
             if (once.compareAndSet(false, true)) {
                 Log.d(
                     TAG,
-                    "runInference: onClean fired tag='$tag' model='${model.name}', " +
-                            "stateBefore=${inst.state.get()}"
+                    "runInference: onClean fired tag='$tag' model='${model.name}', stateBefore=${inst.state.get()}"
                 )
                 inst.state.set(RunState.IDLE)
-                onClean()
+                flushPendingClose(inst, "fireClean-$tag")
+                safeCallClean(onClean)
             }
         }
 
         // Ensure session params are aligned before state transition.
         val desired = paramsFromModel(model)
         if (!ensureSessionParams(inst, desired)) {
-            listener("Session rebuild failed.", true)
+            safeCallResult(listener, "Session rebuild failed.", true)
             fireClean("session-rebuild-failed")
             cleanUpListeners.remove(runtimeKey)
             return
@@ -568,21 +672,18 @@ object SLM {
         if (!acquired) {
             cancel(model)
             if (!inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)) {
-                listener("Model '${model.name}' is busy.", true)
+                safeCallResult(listener, "Model '${model.name}' is busy.", true)
                 fireClean("busy-refused")
                 cleanUpListeners.remove(runtimeKey)
                 return
             }
         }
 
-        // Start a new native-generation window.
-        val genId = markGenerationStart(inst)
-
         Log.d(
             TAG,
             "runInference[1/1]: start model='${model.name}', runtimeKey='$runtimeKey', " +
                     "cacheKey='${cacheKeyOf(model)}', state=${inst.state.get()}, " +
-                    "lastParams=${inst.lastParams}, input.len=${input.length}, genId=$genId"
+                    "lastParams=${inst.lastParams}, input.len=${input.length}"
         )
 
         cleanUpListeners[runtimeKey] = { fireClean("cleanup-listener") }
@@ -592,11 +693,14 @@ object SLM {
             Log.d(TAG, "runInference[1/1]: addQueryChunk start len=${text.length}")
             val ok = addQueryChunkWithOneRetry(model, inst, desired, text)
             if (!ok) {
-                listener("Failed to add query chunk.", true)
+                safeCallResult(listener, "Failed to add query chunk.", true)
                 cleanUpListeners.remove(runtimeKey)?.invoke()
                 return
             }
         }
+
+        // Start a new native-generation window only after query chunks are in place.
+        val genId = markGenerationStart(inst)
 
         try {
             Log.d(TAG, "runInference[1/1]: generateResponseAsync START")
@@ -608,15 +712,18 @@ object SLM {
                         partial
                     }
 
-                Log.d(TAG, "runInference[1/1]: partial[len=${partial.length}, done=$done] $preview")
+                Log.d(
+                    TAG,
+                    "runInference[1/1]: partial[len=${partial.length}, done=$done] $preview"
+                )
 
                 if (!done) {
-                    listener(partial, false)
+                    safeCallResult(listener, partial, false)
                 } else {
                     markGenerationDone(inst, genId)
                     flushPendingClose(inst, "done-callback")
 
-                    listener(partial, true)
+                    safeCallResult(listener, partial, true)
 
                     Log.d(TAG, "runInference[1/1]: DONE received → invoking cleanup listener")
                     cleanUpListeners.remove(runtimeKey)?.invoke()
@@ -624,7 +731,10 @@ object SLM {
             }
         } catch (e: Exception) {
             Log.e(TAG, "generateResponseAsync failed: ${e.message}", e)
-            listener(cleanError(e.message), true)
+            // Ensure generation bookkeeping is consistent even on exceptions.
+            markGenerationDone(inst, genId)
+            flushPendingClose(inst, "exception-generateResponseAsync")
+            safeCallResult(listener, cleanError(e.message), true)
             cleanUpListeners.remove(runtimeKey)?.invoke()
         }
     }
@@ -639,7 +749,10 @@ object SLM {
     private fun paramsFromModel(model: Model): SessionParams {
         val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOP_K))
         val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOP_P))
-        val temp = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
+        val temp =
+            sanitizeTemperature(
+                model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE)
+            )
         return SessionParams(topK = topK, topP = topP, temperature = temp)
     }
 
@@ -650,7 +763,7 @@ object SLM {
      * config changed without a full re-init.
      */
     private fun ensureSessionParams(
-        inst: LlmModelInstance,
+        inst: SlmModelInstance,
         desired: SessionParams
     ): Boolean {
         if (inst.lastParams == desired) return true
@@ -690,7 +803,7 @@ object SLM {
      */
     private fun addQueryChunkWithOneRetry(
         model: Model,
-        inst: LlmModelInstance,
+        inst: SlmModelInstance,
         desired: SessionParams,
         text: String
     ): Boolean {
@@ -741,7 +854,7 @@ object SLM {
     /**
      * Mark the start of a new generation and return its id.
      */
-    private fun markGenerationStart(inst: LlmModelInstance): Long {
+    private fun markGenerationStart(inst: SlmModelInstance): Long {
         val id = inst.generationSeq.incrementAndGet()
         inst.activeGenerationId = id
         inst.lastGenerateStartMs = SystemClock.elapsedRealtime()
@@ -751,8 +864,7 @@ object SLM {
     /**
      * Mark the completion of a generation.
      */
-    private fun markGenerationDone(inst: LlmModelInstance, id: Long) {
-        // Only advance done marker forward.
+    private fun markGenerationDone(inst: SlmModelInstance, id: Long) {
         if (id >= inst.lastDoneGenerationId) {
             inst.lastDoneGenerationId = id
             inst.lastGenerateDoneMs = SystemClock.elapsedRealtime()
@@ -764,7 +876,7 @@ object SLM {
      * Otherwise defer the close until done=true is observed.
      */
     private fun scheduleOrCloseOldSession(
-        inst: LlmModelInstance,
+        inst: SlmModelInstance,
         old: LlmInferenceSession?,
         reason: String
     ) {
@@ -796,7 +908,7 @@ object SLM {
     /**
      * Flush a deferred close if it is safe to do so.
      */
-    private fun flushPendingClose(inst: LlmModelInstance, reason: String) {
+    private fun flushPendingClose(inst: SlmModelInstance, reason: String) {
         val active = inst.activeGenerationId
         val done = inst.lastDoneGenerationId
         val genBusy = active > done
@@ -831,6 +943,15 @@ object SLM {
         t.takeIf { it in 0f..2f } ?: DEFAULT_TEMPERATURE
 
     /**
+     * Normalize accelerator preference string for stable cache keys.
+     */
+    private fun normalizedAccelerator(model: Model): String =
+        model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
+            .trim()
+            .uppercase()
+            .ifBlank { Accelerator.GPU.label }
+
+    /**
      * Stable runtime key for cleanup/listener routing.
      */
     private fun runtimeKeyOf(model: Model): String = cacheKeyOf(model)
@@ -840,10 +961,16 @@ object SLM {
      */
     private fun cacheKeyOf(model: Model): String {
         val maxTokens = model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN)
-        val backendPref = model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
-            .uppercase()
-        return "${model.getPath()}|$backendPref|$maxTokens"
+        val backendPref = normalizedAccelerator(model)
+        val path = model.getPath().trim()
+        return "$path|$backendPref|$maxTokens"
     }
+
+    /**
+     * Find the cache key that maps to the given [inst] by identity.
+     */
+    private fun findCacheKeyForInstance(inst: SlmModelInstance): String? =
+        instanceCache.entries.firstOrNull { it.value === inst }?.key
 
     /**
      * Clean and compress error messages for UI.
@@ -876,9 +1003,19 @@ object SLM {
             .onFailure { Log.w(TAG, "Engine close failed: ${it.message}") }
     }
 
-    private data class Snap(
-        val inst: LlmModelInstance,
-        val oldSession: LlmInferenceSession,
-        val params: SessionParams
-    )
+    /**
+     * Invoke [listener] safely without crashing the calling thread.
+     */
+    private fun safeCallResult(listener: ResultListener, text: String, done: Boolean) {
+        runCatching { listener(text, done) }
+            .onFailure { Log.w(TAG, "ResultListener threw: ${it.message}") }
+    }
+
+    /**
+     * Invoke [onClean] safely without crashing the calling thread.
+     */
+    private fun safeCallClean(onClean: CleanUpListener) {
+        runCatching { onClean() }
+            .onFailure { Log.w(TAG, "CleanUpListener threw: ${it.message}") }
+    }
 }
