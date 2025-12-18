@@ -14,23 +14,10 @@
  *  renders them in a simple vertical layout, and exposes export actions:
  *
  *   • Local JSON export (auto-save to device storage).
- *   • Immediate GitHub upload (online now, JSON + voice WAV).
+ *   • Immediate GitHub upload (online now, JSON + voice WAV + logcat snapshot).
  *   • Deferred GitHub upload via WorkManager (runs when online).
  *   • Deferred upload of recorded voice WAV files via WorkManager.
- *
- *  Storage model (JSON auto-save):
- *   • API 29+ : MediaStore Downloads/SurveyNav (visible in Files app).
- *   • API 28- : app-specific external Downloads/SurveyNav (no runtime perms).
- *
- *  Notes:
- *   • JSON is built manually with a small escaper to keep dependencies light.
- *   • Newlines are not preprocessed; escapeJson() handles them correctly.
- *   • JSON payload includes:
- *       - "survey_id": UUID for the current survey run.
- *       - "exported_at": local timestamp string.
- *       - "answers": question/answer pairs with optional "audio" array.
- *       - "followups": follow-up question/answer pairs.
- *       - "voice_files": flat array of audio mappings for ingestion pipelines.
+ *   • Optional log-only upload now / later for offline-friendly diagnostics.
  *
  *  Key design rule:
  *   • JSON must be built from SurveyViewModel.recordedAudioRefs (logical manifest),
@@ -48,7 +35,9 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Process
 import android.provider.MediaStore
+import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -81,21 +70,57 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequest
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
+import androidx.work.WorkManager
+import androidx.work.workDataOf
+import com.negi.survey.BuildConfig
 import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.Node
 import com.negi.survey.vm.SurveyViewModel
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val REMOTE_VOICE_DIR = "voice"
+
+/** Remote directory for session log snapshots (gzip). */
+private const val REMOTE_LOG_DIR = "diagnostics/logcat"
+
+/** Cap logcat bytes to keep GitHub contents uploads safe-ish. */
+private const val MAX_LOGCAT_BYTES = 850_000
+
+private const val LOG_TAG = "DoneScreen"
+
+/**
+ * Limit logcat to a small set of app tags to reduce noise.
+ * Note: This is best-effort; fallbacks may capture broader output depending on device support.
+ */
+private val LOGCAT_TAG_FILTERS = arrayOf(
+    "WhisperEngine",
+    "MainActivity",
+    "CrashCapture",
+    "GitHubUploadWorker",
+    "GitHubUploader",
+    "LiteRtLM",
+    "LiteRtRepository"
+)
 
 /**
  * Final survey screen that summarizes all collected answers and follow-ups.
@@ -107,6 +132,7 @@ private const val REMOTE_VOICE_DIR = "voice"
  * - Provide optional GitHub upload and deferred upload via WorkManager.
  * - Optionally auto-save the JSON to device storage on first composition.
  * - Upload WAV files that physically exist under exports/voice for this run.
+ * - Capture and upload a logcat snapshot (gzip) for diagnostics (now / later).
  *
  * The key design rule:
  * - JSON must be built from the logical audio manifest in the ViewModel,
@@ -516,12 +542,12 @@ fun DoneScreen(
 
             Spacer(Modifier.height(24.dp))
 
-            // Export / upload actions (JSON + voice).
+            // Export / upload actions (JSON + voice + logs).
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Immediate GitHub upload (JSON + voice WAV).
+                // Immediate GitHub upload (JSON + voice WAV + logcat snapshot).
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
@@ -530,58 +556,77 @@ fun DoneScreen(
                                 uploading = true
                                 try {
                                     val cfg = gitHubConfig
+                                    val resultLabel: String
+                                    val voiceCount: Int
+                                    val logUploaded: Boolean
 
-                                    val (jsonResult, uploadedVoices) =
+                                    val fileName = buildSurveyFileName(
+                                        surveyId = surveyUuid,
+                                        prefix = "survey",
+                                        stamp = exportedAtStamp
+                                    )
+
+                                    val (jsonRes, voicesUploaded, didUploadLog) =
                                         withContext(Dispatchers.IO) {
-                                            val fileName = buildSurveyFileName(
-                                                surveyId = surveyUuid,
-                                                prefix = "survey",
-                                                stamp = exportedAtStamp
-                                            )
-
                                             // 1) Upload JSON summary.
-                                            val jsonRes = GitHubUploader.uploadJson(
+                                            val jsonResult = GitHubUploader.uploadJson(
                                                 cfg = cfg,
                                                 relativePath = fileName,
                                                 content = jsonText,
                                                 message = "Upload $fileName"
                                             )
 
-                                            // 2) Upload WAV files that are both:
-                                            //    - referenced by the VM manifest
-                                            //    - physically present on device
+                                            // 2) Upload WAV files referenced by manifest AND present on device.
                                             val currentVoiceFiles =
                                                 scanVoiceFilesByNames(context, expectedVoiceFileNames)
 
-                                            var voiceCount = 0
+                                            var uploadedVoices = 0
                                             currentVoiceFiles.forEach { file ->
                                                 val bytes = file.readBytes()
-
-                                                // Keep remote structure aligned with local exports/voice.
                                                 GitHubUploader.uploadFile(
                                                     cfg = cfg,
                                                     relativePath = "$REMOTE_VOICE_DIR/${file.name}",
                                                     bytes = bytes,
                                                     message = "Upload ${file.name}"
                                                 )
-
                                                 runCatching { deleteVoiceSidecars(file) }
                                                 runCatching { file.delete() }
-                                                voiceCount++
+                                                uploadedVoices++
                                             }
 
-                                            jsonRes to voiceCount
+                                            // 3) Upload session log snapshot (gzip).
+                                            val logFile = captureSessionLogcatToPendingFile(
+                                                context = context,
+                                                surveyUuid = surveyUuid,
+                                                exportedAtStamp = exportedAtStamp,
+                                                maxBytes = MAX_LOGCAT_BYTES
+                                            )
+
+                                            val didUpload = runCatching {
+                                                GitHubUploader.uploadFile(
+                                                    cfg = cfg,
+                                                    relativePath = "$REMOTE_LOG_DIR/${logFile.name}",
+                                                    bytes = logFile.readBytes(),
+                                                    message = "Upload ${logFile.name}"
+                                                )
+                                            }.isSuccess
+
+                                            if (didUpload) {
+                                                runCatching { logFile.delete() }
+                                            }
+
+                                            Triple(jsonResult, uploadedVoices, didUpload)
                                         }
 
-                                    val label =
-                                        jsonResult.fileUrl ?: jsonResult.commitSha ?: "(no URL)"
+                                    resultLabel = jsonRes.fileUrl ?: jsonRes.commitSha ?: "(no URL)"
+                                    voiceCount = voicesUploaded
+                                    logUploaded = didUploadLog
 
-                                    if (uploadedVoices > 0) {
-                                        snackbar.showOnce(
-                                            "Uploaded JSON + $uploadedVoices voice file(s): $label"
-                                        )
+                                    val logMsg = if (logUploaded) " + logs" else ""
+                                    if (voiceCount > 0) {
+                                        snackbar.showOnce("Uploaded JSON + $voiceCount voice file(s)$logMsg: $resultLabel")
                                     } else {
-                                        snackbar.showOnce("Uploaded JSON: $label")
+                                        snackbar.showOnce("Uploaded JSON$logMsg: $resultLabel")
                                     }
 
                                     // Refresh physical list after deletion.
@@ -602,50 +647,83 @@ fun DoneScreen(
                     }
                 }
 
-                // Deferred GitHub upload for JSON + voice via WorkManager.
+                // Deferred GitHub upload for JSON + voice + logs via WorkManager.
                 if (gitHubConfig != null) {
                     Button(
                         onClick = {
-                            val fileName = buildSurveyFileName(
+                            val cfg = gitHubConfig
+
+                            // 1) Schedule JSON by writing a pending file.
+                            val jsonRemoteName = buildSurveyFileName(
                                 surveyId = surveyUuid,
                                 prefix = "survey",
                                 stamp = exportedAtStamp
                             )
 
-                            GitHubUploadWorker.enqueue(
-                                context = context,
-                                cfg = gitHubConfig,
-                                fileName = fileName,
-                                jsonContent = jsonText
-                            )
-
-                            scope.launch {
-                                snackbar.showOnce(
-                                    "Upload scheduled (JSON, will run when online)."
+                            runCatching {
+                                val pendingJson = writePendingTextFile(
+                                    context = context,
+                                    fileName = jsonRemoteName,
+                                    content = jsonText
                                 )
+                                enqueueWorkerFileUpload(
+                                    context = context,
+                                    cfg = cfg,
+                                    localFile = pendingJson,
+                                    remoteRelativePath = jsonRemoteName
+                                )
+                                scope.launch {
+                                    snackbar.showOnce("Upload scheduled (JSON, will run when online).")
+                                }
+                            }.onFailure { e ->
+                                scope.launch {
+                                    snackbar.showOnce("Failed to schedule JSON upload: ${e.message}")
+                                }
                             }
 
+                            // 2) Schedule WAV uploads that physically exist and are referenced by manifest.
                             val wavsToSchedule = voiceFilesForRun
                             if (wavsToSchedule.isEmpty()) {
                                 scope.launch {
                                     snackbar.showOnce("No voice recordings on device to upload.")
                                 }
                             } else {
-                                /**
-                                 * We schedule only existing files that are referenced
-                                 * by the current run's logical manifest.
-                                 */
                                 wavsToSchedule.forEach { file ->
-                                    GitHubUploadWorker.enqueueExistingPayload(
-                                        context = context,
-                                        cfg = gitHubConfig,
-                                        file = file
-                                    )
+                                    val remote = "$REMOTE_VOICE_DIR/${file.name}"
+                                    runCatching {
+                                        enqueueWorkerFileUpload(
+                                            context = context,
+                                            cfg = cfg,
+                                            localFile = file,
+                                            remoteRelativePath = remote
+                                        )
+                                    }
                                 }
                                 scope.launch {
-                                    snackbar.showOnce(
-                                        "Upload scheduled (${wavsToSchedule.size} voice file(s))."
-                                    )
+                                    snackbar.showOnce("Upload scheduled (${wavsToSchedule.size} voice file(s)).")
+                                }
+                            }
+
+                            // 3) Schedule logcat snapshot upload (gzip).
+                            runCatching {
+                                val pendingLog = captureSessionLogcatToPendingFile(
+                                    context = context,
+                                    surveyUuid = surveyUuid,
+                                    exportedAtStamp = exportedAtStamp,
+                                    maxBytes = MAX_LOGCAT_BYTES
+                                )
+                                enqueueWorkerFileUpload(
+                                    context = context,
+                                    cfg = cfg,
+                                    localFile = pendingLog,
+                                    remoteRelativePath = "$REMOTE_LOG_DIR/${pendingLog.name}"
+                                )
+                                scope.launch {
+                                    snackbar.showOnce("Upload scheduled (logs, will run when online).")
+                                }
+                            }.onFailure { e ->
+                                scope.launch {
+                                    snackbar.showOnce("Failed to schedule logs: ${e.message}")
                                 }
                             }
                         },
@@ -659,6 +737,86 @@ fun DoneScreen(
             }
 
             Spacer(Modifier.height(12.dp))
+
+            // Optional: log-only actions.
+            if (gitHubConfig != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            if (uploading) return@Button
+                            scope.launch {
+                                uploading = true
+                                try {
+                                    val cfg = gitHubConfig
+                                    val ok = withContext(Dispatchers.IO) {
+                                        val logFile = captureSessionLogcatToPendingFile(
+                                            context = context,
+                                            surveyUuid = surveyUuid,
+                                            exportedAtStamp = exportedAtStamp,
+                                            maxBytes = MAX_LOGCAT_BYTES
+                                        )
+                                        val didUpload = runCatching {
+                                            GitHubUploader.uploadFile(
+                                                cfg = cfg,
+                                                relativePath = "$REMOTE_LOG_DIR/${logFile.name}",
+                                                bytes = logFile.readBytes(),
+                                                message = "Upload ${logFile.name}"
+                                            )
+                                        }.isSuccess
+                                        if (didUpload) runCatching { logFile.delete() }
+                                        didUpload
+                                    }
+                                    snackbar.showOnce(if (ok) "Uploaded logs." else "Log upload failed.")
+                                } catch (e: Exception) {
+                                    snackbar.showOnce("Log upload failed: ${e.message}")
+                                } finally {
+                                    uploading = false
+                                }
+                            }
+                        },
+                        enabled = !uploading
+                    ) {
+                        Text("Upload logs")
+                    }
+
+                    Button(
+                        onClick = {
+                            val cfg = gitHubConfig
+                            runCatching {
+                                val pendingLog = captureSessionLogcatToPendingFile(
+                                    context = context,
+                                    surveyUuid = surveyUuid,
+                                    exportedAtStamp = exportedAtStamp,
+                                    maxBytes = MAX_LOGCAT_BYTES
+                                )
+                                enqueueWorkerFileUpload(
+                                    context = context,
+                                    cfg = cfg,
+                                    localFile = pendingLog,
+                                    remoteRelativePath = "$REMOTE_LOG_DIR/${pendingLog.name}"
+                                )
+                                scope.launch {
+                                    snackbar.showOnce("Logs scheduled (will run when online).")
+                                }
+                            }.onFailure { e ->
+                                scope.launch {
+                                    snackbar.showOnce("Failed to schedule logs: ${e.message}")
+                                }
+                            }
+                        },
+                        enabled = !uploading
+                    ) {
+                        Text("Upload logs later")
+                    }
+
+                    Spacer(Modifier.weight(1f))
+                }
+
+                Spacer(Modifier.height(12.dp))
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -676,6 +834,120 @@ fun DoneScreen(
      */
     LaunchedEffect(surveyUuid) {
         snackbar.showOnce("Thank you for your responses")
+    }
+}
+
+/* ============================================================
+ * WorkManager enqueue helpers
+ * ============================================================ */
+
+/**
+ * Enqueue GitHubUploadWorker in "file" mode with a custom remote relative path.
+ *
+ * Important:
+ * - GitHubUploadWorker uses KEY_FILE_NAME as the *remote relative path*.
+ * - Passing "voice/<name>.wav" keeps remote structure aligned with immediate upload.
+ */
+private fun enqueueWorkerFileUpload(
+    context: Context,
+    cfg: GitHubUploader.GitHubConfig,
+    localFile: File,
+    remoteRelativePath: String
+) {
+    val safeUnique = sanitizeWorkName(remoteRelativePath)
+    val uniqueName = "upload_$safeUnique"
+
+    val req: OneTimeWorkRequest =
+        OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+            .setInputData(
+                workDataOf(
+                    GitHubUploadWorker.KEY_MODE to "file",
+                    GitHubUploadWorker.KEY_OWNER to cfg.owner,
+                    GitHubUploadWorker.KEY_REPO to cfg.repo,
+                    GitHubUploadWorker.KEY_TOKEN to cfg.token,
+                    GitHubUploadWorker.KEY_BRANCH to cfg.branch,
+                    GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
+
+                    GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
+                    GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath
+                )
+            )
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
+            .setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                30,
+                TimeUnit.SECONDS
+            )
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .addTag(GitHubUploadWorker.TAG)
+            .addTag("${GitHubUploadWorker.TAG}:file:$safeUnique")
+            .build()
+
+    WorkManager.getInstance(context)
+        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+}
+
+/**
+ * Sanitize a unique work name so WorkManager never sees illegal characters.
+ */
+private fun sanitizeWorkName(value: String): String {
+    return value
+        .trim()
+        .replace(Regex("""[^\w\-.]+"""), "_")
+        .take(120)
+}
+
+/**
+ * Write a pending UTF-8 text payload to app-private storage so WorkManager can upload it later.
+ *
+ * Location:
+ *  - /files/pending_uploads/<fileName or unique>
+ */
+private fun writePendingTextFile(
+    context: Context,
+    fileName: String,
+    content: String
+): File {
+    require(fileName.isNotBlank()) { "fileName is blank." }
+
+    val safeName = sanitizeFileName(fileName)
+    val dir = File(context.filesDir, "pending_uploads").apply { mkdirs() }
+    val target = uniqueIfExists(File(dir, safeName))
+
+    target.writeText(content, Charsets.UTF_8)
+    return target
+}
+
+/**
+ * Replace all non `[A-Za-z0-9_.-/]` characters with underscores.
+ *
+ * Note:
+ * - We allow '/' because remoteRelativePath may include subdirs like "voice/<name>.wav".
+ * - For local pending files, slashes are converted to underscores to keep a flat directory.
+ */
+private fun sanitizeFileName(name: String): String {
+    val flattened = name.replace("/", "_")
+    return flattened.replace(Regex("""[^\w\-.]"""), "_")
+}
+
+/**
+ * Append a numeric suffix until a non-existing file name is found.
+ */
+private fun uniqueIfExists(file: File): File {
+    if (!file.exists()) return file
+
+    val base = file.nameWithoutExtension
+    val ext = file.extension.takeIf { it.isNotEmpty() }?.let { ".$it" } ?: ""
+
+    var idx = 1
+    while (true) {
+        val candidate = File(file.parentFile, "${base}_$idx$ext")
+        if (!candidate.exists()) return candidate
+        idx++
     }
 }
 
@@ -702,7 +974,7 @@ private fun scanVoiceFilesByNames(
     val wavFiles = voiceDir.listFiles { f ->
         f.isFile &&
                 !f.name.startsWith(".") &&
-                f.name.lowercase().endsWith(".wav") &&
+                f.name.lowercase(Locale.US).endsWith(".wav") &&
                 expectedNames.contains(f.name)
     } ?: return emptyList()
 
@@ -724,6 +996,114 @@ private fun deleteVoiceSidecars(wavFile: File) {
     if (meta.exists()) {
         runCatching { meta.delete() }
     }
+}
+
+/* ============================================================
+ * Logcat capture helpers (diagnostics)
+ * ============================================================ */
+
+/**
+ * Capture a best-effort logcat snapshot for this survey run as a gzip file
+ * under app-private storage.
+ *
+ * The file is placed under /files/pending_uploads so it can be uploaded later
+ * by WorkManager even if the device is currently offline.
+ */
+private fun captureSessionLogcatToPendingFile(
+    context: Context,
+    surveyUuid: String,
+    exportedAtStamp: String,
+    maxBytes: Int
+): File {
+    val pid = Process.myPid()
+    val shortId = surveyUuid.take(8).ifBlank { "unknown" }
+    val baseName = "logcat_${exportedAtStamp}_pid${pid}_$shortId.log.gz"
+    val safeName = sanitizeFileName(baseName)
+
+    val dir = File(context.filesDir, "pending_uploads").apply { mkdirs() }
+    val outFile = uniqueIfExists(File(dir, safeName))
+
+    val header = buildString {
+        appendLine("=== Session Log Snapshot ===")
+        appendLine("time_local=$exportedAtStamp")
+        appendLine("survey_id=$surveyUuid")
+        appendLine("pid=$pid")
+        appendLine("sdk=${Build.VERSION.SDK_INT}")
+        appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
+        appendLine("appId=${BuildConfig.APPLICATION_ID}")
+        appendLine("versionName=${BuildConfig.VERSION_NAME}")
+        appendLine("versionCode=${BuildConfig.VERSION_CODE}")
+        appendLine("tags=${LOGCAT_TAG_FILTERS.joinToString(",")}")
+        appendLine()
+        appendLine("=== Logcat (best-effort) ===")
+    }.toByteArray(Charsets.UTF_8)
+
+    val logBytes = collectLogcatBytesBestEffort(
+        pid = pid,
+        maxBytes = maxBytes,
+        tags = LOGCAT_TAG_FILTERS
+    )
+
+    FileOutputStream(outFile).use { fos ->
+        GZIPOutputStream(fos).use { gz ->
+            gz.write(header)
+            gz.write(logBytes)
+            gz.flush()
+        }
+    }
+
+    Log.d(LOG_TAG, "Captured logcat snapshot: ${outFile.absolutePath} (${outFile.length()} bytes gz)")
+    return outFile
+}
+
+/**
+ * Collect logcat output as bytes with multiple fallback strategies.
+ *
+ * Strategy priority (best to worst):
+ *  1) logcat -d --pid=<pid> -v threadtime -s <tags...>
+ *  2) logcat -d --pid=<pid> -v threadtime
+ *  3) logcat -d -v threadtime -s <tags...>
+ *  4) logcat -d -v threadtime
+ */
+private fun collectLogcatBytesBestEffort(
+    pid: Int,
+    maxBytes: Int,
+    tags: Array<String>
+): ByteArray {
+    val cmd1 = arrayOf("logcat", "-d", "--pid=$pid", "-v", "threadtime", "-s", *tags)
+    val cmd2 = arrayOf("logcat", "-d", "--pid=$pid", "-v", "threadtime")
+    val cmd3 = arrayOf("logcat", "-d", "-v", "threadtime", "-s", *tags)
+    val cmd4 = arrayOf("logcat", "-d", "-v", "threadtime")
+
+    return runCatching { execAndReadCapped(cmd1, maxBytes) }
+        .recoverCatching { execAndReadCapped(cmd2, maxBytes) }
+        .recoverCatching { execAndReadCapped(cmd3, maxBytes) }
+        .recoverCatching { execAndReadCapped(cmd4, maxBytes) }
+        .getOrElse { e ->
+            ("(logcat capture failed: ${e.message})\n").toByteArray(Charsets.UTF_8)
+        }
+}
+
+/**
+ * Execute a command and read stdout up to [maxBytes].
+ */
+private fun execAndReadCapped(cmd: Array<String>, maxBytes: Int): ByteArray {
+    val proc = Runtime.getRuntime().exec(cmd)
+    val input = BufferedInputStream(proc.inputStream)
+
+    val out = ByteArray(maxBytes)
+    var total = 0
+
+    while (total < maxBytes) {
+        val n = input.read(out, total, maxBytes - total)
+        if (n <= 0) break
+        total += n
+    }
+
+    runCatching { input.close() }
+    runCatching { proc.destroy() }
+
+    return if (total == out.size) out else out.copyOf(total)
 }
 
 /* ============================================================

@@ -7,22 +7,6 @@
  *  License: MIT License
  *  © 2025 IshizukiTech LLC. All rights reserved.
  * =====================================================================
- *
- *  Summary:
- *  ---------------------------------------------------------------------
- *  Coroutine-based GitHub file uploader for JSON, text, and binary files.
- *
- *  This object wraps the GitHub Contents API with:
- *   • Path building with optional date folder insertion
- *   • SHA lookup for create/update semantics
- *   • Base64 encoding
- *   • Retry with exponential backoff (and Retry-After support)
- *   • Lightweight progress callbacks
- *
- *  Notes:
- *   • GitHub Contents API is intended for relatively small files.
- *     For large binaries (e.g., long WAV), consider Git LFS or Releases.
- * =====================================================================
  */
 
 @file:Suppress("MemberVisibilityCanBePrivate", "unused")
@@ -31,11 +15,6 @@ package com.negi.survey.net
 
 import android.util.Base64
 import android.util.Log
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
-import org.json.JSONException
-import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStream
@@ -47,19 +26,23 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.min
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import org.json.JSONException
+import org.json.JSONObject
 
 /**
  * Coroutine-based GitHub file uploader for JSON, text, and binary files.
  *
- * This object abstracts away the GitHub Contents API details:
- * - Detects whether a file exists and reuses its SHA for updates.
- * - Uploads content using Base64 encoding.
- * - Retries transient errors with backoff.
- * - Reports simple progress as integer percentage.
+ * Key behavior:
+ * - GET existing file SHA (if present) to decide create/update.
+ * - PUT Base64 content to GitHub Contents API.
+ * - Retry transient failures with backoff (429, 5xx, network IO).
  *
- * Intended usage:
- * - Call from background contexts or WorkManager workers.
- * - Prefer small to medium payloads.
+ * Notes:
+ * - GitHub Contents API is not designed for large binaries.
+ * - Prefer gzip + tail for logs. Use Releases/Git LFS for big files.
  */
 object GitHubUploader {
 
@@ -72,37 +55,25 @@ object GitHubUploader {
     private const val DEFAULT_MESSAGE = "Upload via SurveyNav"
 
     /**
-     * Conservative upper bound for Contents API payload bytes.
+     * Conservative guard for raw bytes before Base64 expansion.
      *
-     * GitHub's create/update contents endpoint is not meant for large files.
-     * This guard prevents confusing server-side failures for oversized payloads.
-     *
-     * Adjust this if your real-world measurements prove safe for slightly larger
-     * payloads, but consider alternative upload strategies for large media.
+     * Base64 expands by ~4/3; request JSON adds overhead.
      */
-    private const val MAX_CONTENTS_API_BYTES = 900_000
+    private const val MAX_RAW_BYTES = 850_000
 
-    // ---------------------------------------------------------------------
-    // Configuration Models
-    // ---------------------------------------------------------------------
+    /**
+     * Conservative guard for final JSON request size (rough).
+     *
+     * This is not an official GitHub limit; it is a safety guard to prevent
+     * confusing failures on mobile networks and Contents API.
+     */
+    private const val MAX_REQUEST_BYTES = 1_250_000
 
     /**
      * Configuration container for GitHub upload operations.
      *
-     * @property owner      Repository owner (user or organization).
-     * @property repo       Repository name.
-     * @property token      GitHub Personal Access Token with contents write permission.
-     * @property branch     Target branch (default: main).
-     * @property pathPrefix Logical root folder inside the repo.
-     *
-     * When using [uploadJson] / [uploadFile] overloads that take [GitHubConfig],
-     * the final path becomes:
-     *
+     * When using cfg overloads:
      *   pathPrefix / yyyy-MM-dd / relativePath
-     *
-     * If [pathPrefix] is empty:
-     *
-     *   yyyy-MM-dd / relativePath
      */
     data class GitHubConfig(
         val owner: String,
@@ -114,9 +85,6 @@ object GitHubUploader {
 
     /**
      * Result of a successful upload or update.
-     *
-     * @property fileUrl   Public HTML URL of the file on GitHub.
-     * @property commitSha Commit SHA from the operation (if available).
      */
     data class UploadResult(
         val fileUrl: String?,
@@ -128,9 +96,7 @@ object GitHubUploader {
     // ---------------------------------------------------------------------
 
     /**
-     * Upload a JSON or text file using [GitHubConfig].
-     *
-     * The final GitHub path includes an automatic date folder.
+     * Upload a JSON or text file using [GitHubConfig] (includes date folder).
      */
     suspend fun uploadJson(
         cfg: GitHubConfig,
@@ -150,9 +116,7 @@ object GitHubUploader {
     )
 
     /**
-     * Core JSON/text upload function.
-     *
-     * [path] is treated as a fully-resolved path.
+     * Upload JSON/text to an explicit [path] (no auto date folder).
      */
     suspend fun uploadJson(
         owner: String,
@@ -179,9 +143,7 @@ object GitHubUploader {
     // ---------------------------------------------------------------------
 
     /**
-     * Upload a binary file (e.g., WAV) using [GitHubConfig].
-     *
-     * The final GitHub path includes an automatic date folder.
+     * Upload binary bytes using [GitHubConfig] (includes date folder).
      */
     suspend fun uploadFile(
         cfg: GitHubConfig,
@@ -201,7 +163,7 @@ object GitHubUploader {
     )
 
     /**
-     * Core binary upload function.
+     * Upload binary bytes to an explicit [path] (no auto date folder).
      */
     suspend fun uploadFile(
         owner: String,
@@ -224,17 +186,17 @@ object GitHubUploader {
     )
 
     // ---------------------------------------------------------------------
-    // Shared JSON/Binary Implementation
+    // Shared Implementation
     // ---------------------------------------------------------------------
 
     /**
      * Shared implementation for both JSON/text and binary uploads.
      *
-     * This method:
-     * 1) Validates arguments.
-     * 2) Resolves the remote SHA if the file already exists.
-     * 3) PUTs Base64 payload to the Contents API.
-     * 4) Parses the response and returns an [UploadResult].
+     * Flow:
+     * 1) Validate args and payload size (raw + estimated request size).
+     * 2) GET existing SHA (if any).
+     * 3) PUT Base64 payload to Contents API.
+     * 4) Parse JSON response.
      */
     private suspend fun uploadBytes(
         owner: String,
@@ -253,11 +215,10 @@ object GitHubUploader {
         require(path.isNotBlank()) { "GitHub path cannot be blank." }
         require(token.isNotBlank()) { "GitHub token cannot be blank." }
 
-        if (contentBytes.size > MAX_CONTENTS_API_BYTES) {
+        if (contentBytes.size > MAX_RAW_BYTES) {
             throw IOException(
-                "Content too large for GitHub Contents API " +
-                        "(size=${contentBytes.size} bytes, limit~$MAX_CONTENTS_API_BYTES). " +
-                        "Use Git LFS or Releases for large binaries."
+                "Content too large for Contents API guard " +
+                        "(size=${contentBytes.size} bytes, limit=$MAX_RAW_BYTES)."
             )
         }
 
@@ -274,17 +235,25 @@ object GitHubUploader {
         onProgress(10)
 
         // Phase 2 — Prepare JSON payload
+        val b64 = Base64.encodeToString(contentBytes, Base64.NO_WRAP)
+
         val payload = JSONObject().apply {
             put("message", message.ifBlank { DEFAULT_MESSAGE })
             put("branch", branch)
-            put("content", Base64.encodeToString(contentBytes, Base64.NO_WRAP))
-            if (!existingSha.isNullOrBlank()) {
-                put("sha", existingSha)
-            }
+            put("content", b64)
+            if (!existingSha.isNullOrBlank()) put("sha", existingSha)
         }.toString()
 
-        val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath")
         val requestBytes = payload.toByteArray(Charsets.UTF_8)
+        if (requestBytes.size > MAX_REQUEST_BYTES) {
+            throw IOException(
+                "Request too large for Contents API guard " +
+                        "(requestBytes=${requestBytes.size}, limit=$MAX_REQUEST_BYTES). " +
+                        "Consider stronger gzip/tail or alternative upload path."
+            )
+        }
+
+        val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath")
         val total = requestBytes.size
 
         val writeBody: (HttpURLConnection) -> Unit = { conn ->
@@ -331,7 +300,6 @@ object GitHubUploader {
                 ?.takeIf { it.isNotBlank() }
 
         Log.d(TAG, "uploadBytes: done url=$fileUrl sha=$commitSha")
-
         UploadResult(fileUrl, commitSha)
     }
 
@@ -339,27 +307,18 @@ object GitHubUploader {
     // Retry/HTTP Internals
     // ---------------------------------------------------------------------
 
-    /**
-     * Lightweight HTTP response container.
-     */
     private data class HttpResponse(
         val code: Int,
         val body: String,
         val headers: Map<String, List<String>>
     )
 
-    /**
-     * Exception for retryable HTTP errors.
-     */
     private class TransientHttpException(
         val code: Int,
         val body: String,
         val retryAfterSeconds: Long?
     ) : IOException()
 
-    /**
-     * Exception for non-retryable HTTP errors.
-     */
     private class HttpFailureException(val code: Int, val body: String) :
         IOException("GitHub request failed ($code): ${body.take(256)}")
 
@@ -428,9 +387,7 @@ object GitHubUploader {
                 if (attempt >= maxAttempts) throw lastError
 
                 val backoff =
-                    e.retryAfterSeconds?.times(1000L)
-                        ?: (500L shl (attempt - 1))
-
+                    e.retryAfterSeconds?.times(1000L) ?: (500L shl (attempt - 1))
                 delay(backoff)
 
             } catch (e: IOException) {
@@ -467,18 +424,11 @@ object GitHubUploader {
     /**
      * Build a dated GitHub path:
      *   prefix / yyyy-MM-dd / relative
-     *
-     * Empty segments are skipped.
      */
     private fun buildPath(prefix: String, relative: String): String {
         val dateSegment = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-
-        val segments = listOf(
-            prefix.trim('/'),
-            dateSegment,
-            relative.trim('/')
-        ).filter { it.isNotBlank() }
-
+        val segments = listOf(prefix.trim('/'), dateSegment, relative.trim('/'))
+            .filter { it.isNotBlank() }
         return segments.joinToString("/")
     }
 
@@ -511,7 +461,6 @@ object GitHubUploader {
         encodedPath: String,
         token: String
     ): String? {
-
         val refEncoded = URLEncoder.encode(branch.trim(), "UTF-8").replace("+", "%20")
         val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath?ref=$refEncoded")
 

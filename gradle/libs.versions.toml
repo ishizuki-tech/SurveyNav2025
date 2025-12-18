@@ -65,6 +65,9 @@ mockk = "1.14.7"
 accompanistNavigationAnimation = "0.36.0"
 material = "1.13.0"
 
+# Security
+securityCrypto = "1.1.0"
+
 [libraries]
 accompanist-navigation-animation = { module = "com.google.accompanist:accompanist-navigation-animation", version.ref = "accompanistNavigationAnimation" }
 
@@ -143,6 +146,9 @@ mockk-android = { module = "io.mockk:mockk-android", version.ref = "mockk" }
 
 # Material Components (View system)
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+
+# Security
+androidx-security-crypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

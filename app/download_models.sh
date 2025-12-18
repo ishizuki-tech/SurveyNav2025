@@ -16,7 +16,7 @@ MODEL_DIR="${MODEL_DIR:-src/main/assets/models}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main}"
 # space-separated list
 MODEL_NAMES="${MODEL_NAMES:-ggml-tiny-q5_1.bin ggml-base-q5_1.bin ggml-small-q5_1.bin ggml-model-q4_0.bin}"
-JACARANDA_Q4_URL="${JACARANDA_Q4_URL:-https://huggingface.co/jboat/jacaranda-asr-whispercpp/resolve/main/ggml-model-q4_0.bin}"
+NDIZI_GGML_Q4_URL="${NDIZI_GGML_Q4_URL:-https://huggingface.co/smutuvi/finetuning-whisper-small-swahili-asr-model_ndizi_gguf/resolve/main/ggml-model-q4_0.bin}"
 
 # --- Preconditions -------------------------------------------
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "❌ Required command '$1' not found"; exit 127; }; }
@@ -30,7 +30,7 @@ trap cleanup EXIT
 url_for_model() {
   local name="$1"
   if [ "$name" = "ggml-model-q4_0.bin" ]; then
-    echo "$JACARANDA_Q4_URL"
+    echo "$NDIZI_GGML_Q4_URL"
   else
     echo "$MODEL_URL/$name"
   fi

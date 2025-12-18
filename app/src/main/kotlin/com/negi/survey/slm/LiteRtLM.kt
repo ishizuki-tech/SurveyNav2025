@@ -28,11 +28,12 @@ import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -52,10 +53,17 @@ private const val ERROR_MAX_CHARS = 240
 
 /**
  * Simple holder for a LiteRT-LM [Engine] and its active [Conversation].
+ *
+ * @property supportImage The engine was initialized with vision backend enabled if true.
+ * @property supportAudio The engine was initialized with audio backend enabled if true.
+ * @property engineConfigSnapshot Snapshot for debug/logging and mismatch warnings.
  */
 data class LiteRtLmInstance(
     val engine: Engine,
-    var conversation: Conversation,
+    @Volatile var conversation: Conversation,
+    val supportImage: Boolean,
+    val supportAudio: Boolean,
+    val engineConfigSnapshot: EngineConfig,
 )
 
 /**
@@ -75,6 +83,12 @@ data class LiteRtLmInstance(
  */
 object LiteRtLM {
 
+    /** Main thread handler for UI-safe callbacks. */
+    private val mainHandler: Handler = Handler(Looper.getMainLooper())
+
+    /** Lock for state transitions across instances/listeners/flags. */
+    private val stateLock = Any()
+
     /**
      * Per-runtime cleanup listener invoked when the model instance has been fully
      * cleaned up (from [cleanUp] or stream terminal paths).
@@ -87,11 +101,25 @@ object LiteRtLM {
     /**
      * Set of runtime keys that currently have an active streaming inference.
      *
-     * This is a defensive guard: it prevents accidental overlap (e.g., UI double taps,
-     * repository gate bugs, etc.). The primary concurrency contract still lives at a
-     * higher level, but this makes failures explicit and safer.
+     * Defensive guard: prevents accidental overlap (UI double taps, etc.).
      */
     private val activeStreams: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * Pending cleanup requests keyed by runtime key.
+     *
+     * If cleanup is requested during streaming, we defer engine/conversation close until
+     * the stream terminates (onDone/onError). This avoids undefined SDK behavior.
+     */
+    private val pendingCleanupCallbacks: MutableMap<String, MutableList<() -> Unit>> =
+        ConcurrentHashMap()
+
+    /**
+     * Keys currently initializing.
+     *
+     * This prevents concurrent initialize() calls from racing and closing each other’s engines.
+     */
+    private val initInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     /**
      * Mutex to serialize initialization and [generateText] calls.
@@ -100,29 +128,21 @@ object LiteRtLM {
      */
     private val mutex: Mutex = Mutex()
 
-    /**
-     * Simple volatile busy flag used only by [generateText] (suspend API).
-     *
-     * This does not represent repository streaming state; use [activeStreams] for that.
-     */
-    @Volatile
-    private var busy: Boolean = false
-
-    /** Main thread handler for UI-safe callbacks. */
-    private val mainHandler: Handler = Handler(Looper.getMainLooper())
+    /** Busy flag used only by [generateText] (suspend API). */
+    private val busy: AtomicBoolean = AtomicBoolean(false)
 
     /**
      * Returns `true` when a [generateText] call is currently in progress.
      *
      * This is not used for repository-based streaming.
      */
-    fun isBusy(): Boolean = busy
+    fun isBusy(): Boolean = busy.get()
 
     /**
      * Stable runtime key for instances and cleanup listeners.
      *
-     * For now this uses [Model.name] directly. If you later need to distinguish
-     * different engine configs for the same name, update this function.
+     * Keeping this as model.name preserves your current behavior,
+     * but we add strict config mismatch warnings and safe re-init pathways.
      */
     private fun runtimeKey(model: Model): String = model.name
 
@@ -140,9 +160,30 @@ object LiteRtLM {
     }
 
     /**
+     * Normalize accelerator string for stable backend selection.
+     */
+    private fun normalizedAccelerator(model: Model): String {
+        return model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
+            .trim()
+            .uppercase()
+            .ifBlank { Accelerator.GPU.label }
+    }
+
+    /**
+     * Resolve preferred backend from model config.
+     */
+    private fun preferredBackend(model: Model): Backend {
+        return when (normalizedAccelerator(model)) {
+            Accelerator.CPU.label -> Backend.CPU
+            Accelerator.GPU.label -> Backend.GPU
+            else -> Backend.GPU
+        }
+    }
+
+    /**
      * Low-level initializer for LiteRT-LM [Engine] and [Conversation].
      *
-     * This is typically wrapped by [initializeIfNeeded].
+     * This method is non-suspending; it always performs heavy work off the main thread.
      *
      * @param context Android [Context] used to resolve model path and cache dir.
      * @param model Model descriptor (name, path, config).
@@ -161,89 +202,123 @@ object LiteRtLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
     ) {
-        val maxTokens = model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN)
-        val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
-        val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
-        val temperature = sanitizeTemperature(
-            model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE),
-        )
-        val accelerator = model.getStringConfigValue(
-            ConfigKey.ACCELERATOR,
-            Accelerator.GPU.label,
-        )
-
         val key = runtimeKey(model)
 
-        Log.d(TAG, "Initializing LiteRT-LM engine for model='${model.name}', key='$key'")
-        Log.d(TAG, "Enable image: $supportImage, enable audio: $supportAudio")
-
-        val preferredBackend = when (accelerator) {
-            Accelerator.CPU.label -> Backend.CPU
-            Accelerator.GPU.label -> Backend.GPU
-            else -> Backend.CPU
+        /**
+         * Prevent concurrent initialize() for the same key.
+         */
+        val accepted = initInFlight.add(key)
+        if (!accepted) {
+            postToMain { onDone("Initialization already in progress for key='$key'.") }
+            return
         }
-        Log.d(TAG, "Preferred backend: $preferredBackend")
 
-        val modelPath = model.getPath()
-        val engineConfig = EngineConfig(
-            modelPath = modelPath,
-            backend = preferredBackend,
-            /**
-             * Vision must be GPU for vision-capable Gemma variants (if enabled).
-             */
-            visionBackend = if (supportImage) Backend.GPU else null,
-            /**
-             * Audio must be CPU for Gemma-3n (if enabled).
-             */
-            audioBackend = if (supportAudio) Backend.CPU else null,
-            maxNumTokens = maxTokens.coerceAtLeast(1),
-            cacheDir = if (modelPath.startsWith("/data/local/tmp")) {
-                context.getExternalFilesDir(null)?.absolutePath
-            } else {
-                null
-            },
-        )
+        /** Run initialization off the main thread to avoid UI jank. */
+        thread(name = "LiteRtLM-init-$key") {
+            var engine: Engine? = null
 
-        var engine: Engine? = null
+            try {
+                val maxTokens =
+                    model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN).coerceAtLeast(1)
+                val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
+                val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
+                val temperature =
+                    sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
 
-        try {
-            /** Create and initialize the engine. */
-            engine = Engine(engineConfig)
-            engine.initialize()
+                val backend = preferredBackend(model)
 
-            /**
-             * If there was an existing instance for this runtime key, close it defensively.
-             */
-            instances.remove(key)?.let { old ->
-                runCatching { old.conversation.close() }
-                    .onFailure { Log.w(TAG, "Failed to close old conversation: ${it.message}", it) }
-                runCatching { old.engine.close() }
-                    .onFailure { Log.w(TAG, "Failed to close old engine: ${it.message}", it) }
+                Log.d(TAG, "Initializing LiteRT-LM engine for model='${model.name}', key='$key'")
+                Log.d(TAG, "Enable image: $supportImage, enable audio: $supportAudio")
+                Log.d(TAG, "Preferred backend: $backend, maxTokens=$maxTokens, topK=$topK, topP=$topP, temp=$temperature")
+
+                val modelPath = model.getPath()
+
+                val cacheDirPath = runCatching {
+                    /** Prefer app-private cache for safety. */
+                    context.cacheDir?.absolutePath
+                }.getOrNull()
+
+                fun buildConfig(forBackend: Backend): EngineConfig {
+                    return EngineConfig(
+                        modelPath = modelPath,
+                        backend = forBackend,
+                        /**
+                         * Vision must be GPU for vision-capable Gemma variants (if enabled).
+                         */
+                        visionBackend = if (supportImage) Backend.GPU else null,
+                        /**
+                         * Audio must be CPU for Gemma-3n (if enabled).
+                         */
+                        audioBackend = if (supportAudio) Backend.CPU else null,
+                        maxNumTokens = maxTokens,
+                        cacheDir = cacheDirPath,
+                    )
+                }
+
+                var engineConfig = buildConfig(backend)
+
+                /**
+                 * Create and initialize the engine.
+                 * If GPU fails and we are NOT using vision/audio, fall back to CPU.
+                 */
+                runCatching {
+                    engine = Engine(engineConfig)
+                    engine!!.initialize()
+                }.getOrElse { first ->
+                    if (backend == Backend.GPU && !supportImage && !supportAudio) {
+                        Log.w(TAG, "GPU init failed. Falling back to CPU: ${first.message}")
+                        engineConfig = buildConfig(Backend.CPU)
+                        engine = Engine(engineConfig)
+                        engine!!.initialize()
+                    } else {
+                        throw first
+                    }
+                }
+
+                synchronized(stateLock) {
+                    if (activeStreams.contains(key)) {
+                        throw IllegalStateException(
+                            "Initialization rejected: active stream in progress for key='$key'.",
+                        )
+                    }
+
+                    instances.remove(key)?.let { old ->
+                        runCatching { old.conversation.close() }
+                            .onFailure { Log.w(TAG, "Failed to close old conversation: ${it.message}", it) }
+                        runCatching { old.engine.close() }
+                            .onFailure { Log.w(TAG, "Failed to close old engine: ${it.message}", it) }
+                    }
+
+                    val conversationConfig = ConversationConfig(
+                        samplerConfig = SamplerConfig(
+                            topK = topK,
+                            topP = topP.toDouble(),
+                            temperature = temperature.toDouble(),
+                        ),
+                        systemMessage = systemMessage,
+                        tools = tools,
+                    )
+
+                    val conversation = engine!!.createConversation(conversationConfig)
+                    instances[key] = LiteRtLmInstance(
+                        engine = engine!!,
+                        conversation = conversation,
+                        supportImage = supportImage,
+                        supportAudio = supportAudio,
+                        engineConfigSnapshot = engineConfig,
+                    )
+                }
+
+                Log.d(TAG, "LiteRT-LM initialization succeeded for model='${model.name}', key='$key'")
+                postToMain { onDone("") }
+            } catch (e: Exception) {
+                Log.e(TAG, "LiteRT-LM initialization failed: ${e.message}", e)
+                runCatching { engine?.close() }
+                    .onFailure { Log.w(TAG, "Failed to close engine after init failure: ${it.message}", it) }
+                postToMain { onDone(cleanError(e.message)) }
+            } finally {
+                initInFlight.remove(key)
             }
-
-            val conversationConfig = ConversationConfig(
-                samplerConfig = SamplerConfig(
-                    topK = topK,
-                    topP = topP.toDouble(),
-                    temperature = temperature.toDouble(),
-                ),
-                systemMessage = systemMessage,
-                tools = tools,
-            )
-
-            val conversation = engine.createConversation(conversationConfig)
-            instances[key] = LiteRtLmInstance(engine = engine, conversation = conversation)
-
-            Log.d(TAG, "LiteRT-LM initialization succeeded for model='${model.name}', key='$key'")
-            postToMain { onDone("") }
-        } catch (e: Exception) {
-            Log.e(TAG, "LiteRT-LM initialization failed: ${e.message}", e)
-            /**
-             * Best-effort cleanup of a partially initialized engine.
-             */
-            runCatching { engine?.close() }
-                .onFailure { Log.w(TAG, "Failed to close LiteRT-LM engine after init failure: ${it.message}", it) }
-            postToMain { onDone(cleanError(e.message)) }
         }
     }
 
@@ -265,14 +340,13 @@ object LiteRtLM {
         tools: List<Any> = emptyList(),
     ) {
         val key = runtimeKey(model)
-        if (instances.containsKey(key)) {
-            return
+        synchronized(stateLock) {
+            if (instances.containsKey(key)) return
         }
 
         mutex.withLock {
-            if (instances.containsKey(key)) {
-                /** Another coroutine finished initialization while we waited. */
-                return
+            synchronized(stateLock) {
+                if (instances.containsKey(key)) return
             }
 
             withContext(Dispatchers.IO) {
@@ -305,11 +379,6 @@ object LiteRtLM {
      * Reset the current [Conversation] for the given [model] while reusing the [Engine].
      *
      * This is useful when you want to clear chat history but avoid reloading the model.
-     *
-     * Note:
-     *  - Vision/audio capabilities are determined at engine initialization time.
-     *  - The [supportImage]/[supportAudio] parameters are logged for clarity but do not
-     *    change the underlying engine backends.
      */
     fun resetConversation(
         model: Model,
@@ -320,29 +389,35 @@ object LiteRtLM {
     ) {
         val key = runtimeKey(model)
 
-        /**
-         * Resetting while streaming is risky; it can invalidate callbacks and produce
-         * undefined SDK states. Prefer cancel/cleanup first at a higher level.
-         */
-        if (activeStreams.contains(key)) {
-            Log.w(TAG, "resetConversation rejected: active stream in progress for key='$key'")
-            return
+        synchronized(stateLock) {
+            if (activeStreams.contains(key)) {
+                Log.w(TAG, "resetConversation rejected: active stream in progress for key='$key'")
+                return
+            }
         }
 
         try {
             Log.d(TAG, "Resetting LiteRT-LM conversation for model='${model.name}', key='$key'")
 
-            val instance = instances[key] ?: return
+            val instance = synchronized(stateLock) { instances[key] } ?: return
+
+            if (instance.supportImage != supportImage || instance.supportAudio != supportAudio) {
+                Log.w(
+                    TAG,
+                    "resetConversation called with different capabilities than initialization. " +
+                            "init(image=${instance.supportImage}, audio=${instance.supportAudio}) vs " +
+                            "reset(image=$supportImage, audio=$supportAudio). " +
+                            "Engine backends will NOT change; reinitialize if needed.",
+                )
+            }
+
             runCatching { instance.conversation.close() }
                 .onFailure { Log.w(TAG, "Failed to close old conversation: ${it.message}", it) }
 
             val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOPK))
             val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOPP))
-            val temperature = sanitizeTemperature(
-                model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE),
-            )
-
-            Log.d(TAG, "Enable image: $supportImage, enable audio: $supportAudio")
+            val temperature =
+                sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
 
             val newConversation = instance.engine.createConversation(
                 ConversationConfig(
@@ -356,7 +431,16 @@ object LiteRtLM {
                 ),
             )
 
-            instance.conversation = newConversation
+            synchronized(stateLock) {
+                val latest = instances[key]
+                if (latest == null) {
+                    runCatching { newConversation.close() }
+                    Log.w(TAG, "resetConversation aborted: instance removed during reset for key='$key'")
+                    return
+                }
+                latest.conversation = newConversation
+            }
+
             Log.d(TAG, "LiteRT-LM conversation reset completed for model='${model.name}', key='$key'")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to reset LiteRT-LM conversation: ${e.message}", e)
@@ -366,46 +450,78 @@ object LiteRtLM {
     /**
      * Fully release the [Engine] and [Conversation] for the given [model].
      *
-     * After calling this method, you must call [initializeIfNeeded] again before
-     * requesting inference for the same runtime key.
+     * If cleanup is requested while a stream is active, cleanup is deferred until the
+     * stream terminates.
      */
     fun cleanUp(model: Model, onDone: () -> Unit) {
         val key = runtimeKey(model)
 
-        /**
-         * Do not eagerly remove [activeStreams] here: if a stream is currently active,
-         * removing it would allow a new request to slip in before callbacks terminate.
-         * The stream terminal paths will remove the key.
-         */
-        val instance = instances.remove(key)
+        val shouldDefer = synchronized(stateLock) {
+            if (activeStreams.contains(key)) {
+                val list = pendingCleanupCallbacks.getOrPut(key) { mutableListOf() }
+                list.add(onDone)
+                true
+            } else {
+                false
+            }
+        }
+
+        if (shouldDefer) {
+            Log.w(TAG, "LiteRT-LM cleanUp deferred: active stream in progress for key='$key'")
+            return
+        }
+
+        val instance = synchronized(stateLock) { instances.remove(key) }
         if (instance == null) {
-            cleanUpListeners.remove(key)
+            synchronized(stateLock) {
+                cleanUpListeners.remove(key)
+                pendingCleanupCallbacks.remove(key)
+            }
             postToMain { onDone() }
             return
         }
 
-        runCatching { instance.conversation.close() }
-            .onFailure { Log.e(TAG, "Failed to close LiteRT-LM conversation: ${it.message}", it) }
+        doCleanupInternal(
+            key = key,
+            instance = instance,
+            extraCallbacks = listOf(onDone),
+        )
+    }
 
-        runCatching { instance.engine.close() }
-            .onFailure { Log.e(TAG, "Failed to close LiteRT-LM engine: ${it.message}", it) }
+    /**
+     * Background cleanup worker.
+     *
+     * @param key Runtime key.
+     * @param instance Instance to close.
+     * @param extraCallbacks Callbacks to invoke on Main after closing.
+     */
+    private fun doCleanupInternal(
+        key: String,
+        instance: LiteRtLmInstance,
+        extraCallbacks: List<() -> Unit>,
+    ) {
+        thread(name = "LiteRtLM-cleanup-$key") {
+            runCatching { instance.conversation.close() }
+                .onFailure { Log.e(TAG, "Failed to close LiteRT-LM conversation: ${it.message}", it) }
 
-        /**
-         * Notify any registered listener (e.g., repository watchdogs).
-         * Note: A streaming terminal path might also try to invoke it; remove() makes it single-shot.
-         */
-        cleanUpListeners.remove(key)?.let { listener ->
-            postToMain { listener.invoke() }
+            runCatching { instance.engine.close() }
+                .onFailure { Log.e(TAG, "Failed to close LiteRT-LM engine: ${it.message}", it) }
+
+            val listener = synchronized(stateLock) { cleanUpListeners.remove(key) }
+            val deferred = synchronized(stateLock) { pendingCleanupCallbacks.remove(key) } ?: mutableListOf()
+
+            postToMain {
+                runCatching { listener?.invoke() }
+                    .onFailure { Log.w(TAG, "Cleanup listener failed for key='$key': ${it.message}", it) }
+
+                (deferred + extraCallbacks).forEach { cb ->
+                    runCatching { cb.invoke() }
+                        .onFailure { Log.w(TAG, "Cleanup callback failed for key='$key': ${it.message}", it) }
+                }
+            }
+
+            Log.d(TAG, "LiteRT-LM clean up done for key='$key'")
         }
-
-        /**
-         * If cleanup was forced externally, the stream should end shortly; if not,
-         * we still clear the guard to prevent permanent lock due to missing callbacks.
-         */
-        activeStreams.remove(key)
-
-        postToMain { onDone() }
-        Log.d(TAG, "LiteRT-LM clean up done for model='${model.name}', key='$key'")
     }
 
     /**
@@ -422,10 +538,7 @@ object LiteRtLM {
     ): List<Content> {
         val contents = mutableListOf<Content>()
 
-        /**
-         * Multimodal-first ordering (image/audio then text).
-         * Adjust if a specific model/prompt template expects text first.
-         */
+        /** Multimodal-first ordering (image/audio then text). */
         for (image in images) {
             contents.add(Content.ImageBytes(image.toPngByteArray()))
         }
@@ -437,6 +550,25 @@ object LiteRtLM {
         }
 
         return contents
+    }
+
+    /**
+     * Compute a robust delta between [last] and [full] using longest common prefix (LCP).
+     *
+     * Note:
+     * - If the SDK "revises" earlier tokens, LCP may be small and deltas may become large.
+     * - This code favors "not missing output" over perfect patching.
+     */
+    private fun computeDelta(last: String, full: String): String {
+        if (last.isEmpty()) return full
+        if (full.isEmpty()) return ""
+
+        val minLen = minOf(last.length, full.length)
+        var i = 0
+        while (i < minLen && last[i] == full[i]) {
+            i++
+        }
+        return if (i <= full.length) full.substring(i) else full
     }
 
     /**
@@ -460,23 +592,40 @@ object LiteRtLM {
         audioClips: List<ByteArray> = emptyList(),
     ) {
         val key = runtimeKey(model)
-        val instance = instances[key]
 
+        val instance = synchronized(stateLock) { instances[key] }
         if (instance == null) {
             val msg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
             Log.w(TAG, msg)
             postToMain {
-                /** Emit error first so suspend wrappers can fail reliably. */
                 onError(msg)
                 resultListener("", true)
             }
             return
         }
 
-        /**
-         * Best-effort guard against overlapping streams on the same key.
-         */
-        if (!activeStreams.add(key)) {
+        /** Capability checks help debug quickly. */
+        if (images.isNotEmpty() && !instance.supportImage) {
+            val msg = "Vision input rejected: supportImage=false for key='$key'. Reinitialize with supportImage=true."
+            Log.w(TAG, msg)
+            postToMain {
+                onError(msg)
+                resultListener("", true)
+            }
+            return
+        }
+        if (audioClips.isNotEmpty() && !instance.supportAudio) {
+            val msg = "Audio input rejected: supportAudio=false for key='$key'. Reinitialize with supportAudio=true."
+            Log.w(TAG, msg)
+            postToMain {
+                onError(msg)
+                resultListener("", true)
+            }
+            return
+        }
+
+        val added = activeStreams.add(key)
+        if (!added) {
             val msg = "LiteRT-LM runInference rejected: another stream is already active for key='$key'."
             Log.w(TAG, msg)
             postToMain {
@@ -486,9 +635,6 @@ object LiteRtLM {
             return
         }
 
-        /**
-         * Register cleanup listener for this key. Warn if overwritten (contract violation).
-         */
         val previous = cleanUpListeners.put(key, cleanUpListener)
         if (previous != null) {
             Log.w(TAG, "LiteRT-LM cleanup listener overwritten for key='$key' (overlapping calls?)")
@@ -497,43 +643,45 @@ object LiteRtLM {
         val conversation = instance.conversation
         val contents = buildContents(input = input, images = images, audioClips = audioClips)
 
-        /**
-         * Terminal guard ensures we signal done exactly once.
-         */
         val didTerminate = AtomicBoolean(false)
-
-        /**
-         * Streaming text normalization:
-         * Some SDKs emit cumulative text, others emit deltas.
-         * We normalize to delta before invoking [resultListener].
-         */
         var lastFullText = ""
 
         fun terminateSafely(errorMessage: String? = null) {
-            if (!didTerminate.compareAndSet(false, true)) {
-                return
-            }
+            if (!didTerminate.compareAndSet(false, true)) return
 
             activeStreams.remove(key)
 
             postToMain {
-                /**
-                 * Emit error first so suspend wrappers can fail reliably.
-                 */
                 if (!errorMessage.isNullOrBlank()) {
                     onError(errorMessage)
                 }
 
-                /**
-                 * Always send terminal signal.
-                 */
+                /** Terminal signal (exactly once). */
                 resultListener("", true)
 
-                /**
-                 * Invoke and clear cleanup listener.
-                 * If [cleanUp] already removed it, this becomes a no-op.
-                 */
-                cleanUpListeners.remove(key)?.invoke()
+                cleanUpListeners.remove(key)?.let { listener ->
+                    runCatching { listener.invoke() }
+                        .onFailure { t ->
+                            Log.w(TAG, "cleanUpListener failed for key='$key': ${t.message}", t)
+                        }
+                }
+            }
+
+            val deferredCallbacks = synchronized(stateLock) { pendingCleanupCallbacks.remove(key) }
+            if (!deferredCallbacks.isNullOrEmpty()) {
+                Log.w(TAG, "Executing deferred cleanup for key='$key' (${deferredCallbacks.size} callbacks)")
+                val latest = synchronized(stateLock) { instances.remove(key) }
+                if (latest != null) {
+                    doCleanupInternal(
+                        key = key,
+                        instance = latest,
+                        extraCallbacks = deferredCallbacks,
+                    )
+                } else {
+                    postToMain {
+                        deferredCallbacks.forEach { cb -> runCatching { cb.invoke() } }
+                    }
+                }
             }
         }
 
@@ -546,26 +694,13 @@ object LiteRtLM {
                             .filterIsInstance<Content.Text>()
                             .joinToString(separator = "") { it.text }
 
-                        if (full.isEmpty()) {
-                            Log.d(TAG, "LiteRT-LM onMessage with non-text payload for model='${model.name}', key='$key'")
-                            return
-                        }
+                        if (full.isEmpty()) return
 
-                        /**
-                         * If the SDK provides cumulative text, emit only the delta.
-                         * If it provides delta already, this still works (fallback branch).
-                         */
-                        val delta = if (full.startsWith(lastFullText)) {
-                            full.substring(lastFullText.length)
-                        } else {
-                            full
-                        }
+                        val delta = computeDelta(lastFullText, full)
                         lastFullText = full
 
                         if (delta.isNotEmpty()) {
-                            postToMain {
-                                resultListener(delta, false)
-                            }
+                            postToMain { resultListener(delta, false) }
                         }
                     }
 
@@ -574,7 +709,7 @@ object LiteRtLM {
                     }
 
                     override fun onError(throwable: Throwable) {
-                        if (throwable is CancellationException || throwable is kotlinx.coroutines.CancellationException) {
+                        if (throwable is CancellationException) {
                             Log.i(TAG, "LiteRT-LM inference cancelled for model='${model.name}', key='$key'.")
                             terminateSafely()
                         } else {
@@ -595,11 +730,6 @@ object LiteRtLM {
      *  - Serializes all requests via a [Mutex].
      *  - Exposes streaming partial text via [onPartial].
      *  - Returns the final concatenated response as a [String].
-     *
-     * Note:
-     *  - You must call [initializeIfNeeded] successfully before using this.
-     *  - This API should not be used concurrently with repository streaming for the
-     *    same runtime key.
      */
     suspend fun generateText(
         model: Model,
@@ -608,10 +738,24 @@ object LiteRtLM {
         audioClips: List<ByteArray> = emptyList(),
         onPartial: (String) -> Unit = {},
     ): String = mutex.withLock {
-        if (busy) {
+        val key = runtimeKey(model)
+
+        synchronized(stateLock) {
+            if (activeStreams.contains(key)) {
+                throw IllegalStateException(
+                    "LiteRT-LM generateText rejected: active stream in progress for key='$key'.",
+                )
+            }
+            if (!instances.containsKey(key)) {
+                throw IllegalStateException(
+                    "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first.",
+                )
+            }
+        }
+
+        if (!busy.compareAndSet(false, true)) {
             throw IllegalStateException("LiteRT-LM is already busy with another request.")
         }
-        busy = true
 
         try {
             suspendCancellableCoroutine { cont ->
@@ -635,7 +779,7 @@ object LiteRtLM {
                         }
                     },
                     cleanUpListener = {
-                        Log.d(TAG, "LiteRT-LM clean-up listener invoked for model='${model.name}', key='${runtimeKey(model)}'")
+                        Log.d(TAG, "LiteRT-LM clean-up listener invoked for model='${model.name}', key='$key'")
                     },
                     onError = { message ->
                         sawError.set(true)
@@ -650,15 +794,12 @@ object LiteRtLM {
                 )
 
                 cont.invokeOnCancellation {
-                    /**
-                     * LiteRT-LM does not expose an explicit cancel API for conversations.
-                     * If a cancel hook is added in the future, it can be invoked here.
-                     */
-                    Log.i(TAG, "LiteRT-LM coroutine cancelled for model='${model.name}', key='${runtimeKey(model)}'.")
+                    /** LiteRT-LM does not expose a true cancel API for conversations. */
+                    Log.i(TAG, "LiteRT-LM coroutine cancelled for model='${model.name}', key='$key'.")
                 }
             }
         } finally {
-            busy = false
+            busy.set(false)
         }
     }
 
@@ -667,29 +808,22 @@ object LiteRtLM {
      */
     private fun Bitmap.toPngByteArray(): ByteArray {
         return ByteArrayOutputStream().use { stream ->
-            this.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            compress(Bitmap.CompressFormat.PNG, 100, stream)
             stream.toByteArray()
         }
     }
 
-    /**
-     * Sanitize TopK - must be >= 1.
-     */
+    /** Sanitize TopK - must be >= 1. */
     private fun sanitizeTopK(k: Int): Int = k.coerceAtLeast(1)
 
-    /**
-     * Sanitize TopP - must be in [0, 1].
-     */
+    /** Sanitize TopP - must be in [0, 1]. */
     private fun sanitizeTopP(p: Float): Float = p.takeIf { it in 0f..1f } ?: DEFAULT_TOPP
 
-    /**
-     * Sanitize Temperature - typical safe band [0, 2].
-     */
-    private fun sanitizeTemperature(t: Float): Float = t.takeIf { it in 0f..2f } ?: DEFAULT_TEMPERATURE
+    /** Sanitize Temperature - typical safe band [0, 2]. */
+    private fun sanitizeTemperature(t: Float): Float =
+        t.takeIf { it in 0f..2f } ?: DEFAULT_TEMPERATURE
 
-    /**
-     * Clean and compress error messages for UI/logging.
-     */
+    /** Clean and compress error messages for UI/logging. */
     private fun cleanError(msg: String?): String {
         return msg
             ?.replace("INTERNAL:", "", ignoreCase = true)

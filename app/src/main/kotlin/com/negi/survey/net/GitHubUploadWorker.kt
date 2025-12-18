@@ -10,21 +10,12 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  Foreground-capable WorkManager coroutine worker that uploads one
- *  local payload file to GitHub using the REST "Create or Update File
- *  Contents" API via [GitHubUploader].
+ *  Foreground-capable WorkManager coroutine worker that uploads either:
+ *   - one local payload file (text/binary) using GitHubUploader, OR
+ *   - a collected logcat snapshot (gzip) using GitHubLogUploader.
  *
- *  This worker ensures compliance with Android 14+ background execution
- *  limits by declaring the `DATA_SYNC` foreground service type and by
- *  maintaining visible progress notifications during upload.
- *
- *  Features:
- *   • Safe, resumable background upload (WorkManager + Foreground Service)
- *   • Determinate progress reporting via both notification and WorkData
- *   • Automatic exponential backoff retry on transient failures
- *   • Robust input validation and output data reporting
- *   • Automatic deletion of successfully uploaded local files
- *   • Supports both JSON (text) and binary payloads (e.g., WAV audio)
+ *  This worker is Android 14+ friendly (DATA_SYNC foreground service type)
+ *  and reports determinate progress via notification + WorkData.
  * =====================================================================
  */
 
@@ -63,36 +54,16 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Coroutine-based [WorkManager] worker responsible for uploading one local file
- * to GitHub via [GitHubUploader].
- *
- * Responsibilities:
- * - Read the specified file from disk (text vs binary).
- * - Stream the file contents to GitHub with visible progress.
- * - Handle automatic retries using exponential backoff.
- * - Clean up successfully uploaded local files.
+ * Coroutine-based [WorkManager] worker responsible for uploading either:
+ *  - a local file, or
+ *  - a logcat snapshot (collected at runtime).
  */
 class GitHubUploadWorker(
     appContext: Context,
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
 
-    /**
-     * Execute a single upload job.
-     *
-     * Steps:
-     *  1. Parse and validate inputs.
-     *  2. Check file existence and size safety for Contents API.
-     *  3. Start a foreground notification.
-     *  4. Load content as text or bytes based on file extension.
-     *  5. Upload via [GitHubUploader].
-     *  6. On success, delete local file and emit output metadata.
-     *  7. On failure, retry if transient and attempts remain.
-     */
     override suspend fun doWork(): Result {
-        // ------------------------------------------------------------
-        // 1) Parse and validate inputs
-        // ------------------------------------------------------------
         val cfg = GitHubUploader.GitHubConfig(
             owner = inputData.getString(KEY_OWNER).orEmpty(),
             repo = inputData.getString(KEY_REPO).orEmpty(),
@@ -101,14 +72,73 @@ class GitHubUploadWorker(
             pathPrefix = inputData.getString(KEY_PATH_PREFIX).orEmpty()
         )
 
-        val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
-        val fileName = inputData.getString(KEY_FILE_NAME) ?: File(filePath).name
-
         if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
             return Result.failure(
                 workDataOf(ERROR_MESSAGE to "Invalid GitHub configuration (owner/repo/token).")
             )
         }
+
+        val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ensureChannel()
+        }
+
+        val notifTitleBase = when (mode) {
+            MODE_LOGCAT -> "Uploading logcat"
+            else -> "Uploading payload"
+        }
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val notifId = NOTIF_BASE + (abs((mode + stamp).hashCode()) % 8000)
+
+        setForegroundAsync(
+            foregroundInfo(
+                notificationId = notifId,
+                pct = 0,
+                title = "$notifTitleBase…"
+            )
+        )
+
+        var lastPct = -1
+        val progressCallback: (Int) -> Unit = progressCallback@{ pct ->
+            val clamped = pct.coerceIn(0, 100)
+            if (clamped == lastPct) return@progressCallback
+            lastPct = clamped
+
+            setProgressAsync(
+                workDataOf(
+                    PROGRESS_PCT to clamped,
+                    PROGRESS_MODE to mode
+                )
+            )
+
+            setForegroundAsync(
+                foregroundInfo(
+                    notificationId = notifId,
+                    pct = clamped,
+                    title = "$notifTitleBase…"
+                )
+            )
+        }
+
+        return when (mode) {
+            MODE_LOGCAT -> doLogcatUpload(cfg, notifId, progressCallback)
+            else -> doFileUpload(cfg, notifId, progressCallback)
+        }
+    }
+
+    /**
+     * Execute file upload mode.
+     */
+    private suspend fun doFileUpload(
+        cfg: GitHubUploader.GitHubConfig,
+        notifId: Int,
+        onProgress: (Int) -> Unit,
+    ): Result {
+
+        val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
+        val fileName = inputData.getString(KEY_FILE_NAME) ?: File(filePath).name
 
         if (filePath.isBlank()) {
             return Result.failure(workDataOf(ERROR_MESSAGE to "Missing file path."))
@@ -116,20 +146,14 @@ class GitHubUploadWorker(
 
         val pendingFile = File(filePath)
         if (!pendingFile.exists()) {
-            return Result.failure(
-                workDataOf(ERROR_MESSAGE to "Pending file not found: $filePath")
-            )
+            return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file not found: $filePath"))
         }
 
         val fileSize = pendingFile.length()
         if (fileSize <= 0L) {
-            return Result.failure(
-                workDataOf(ERROR_MESSAGE to "Pending file is empty: $filePath")
-            )
+            return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file is empty: $filePath"))
         }
 
-        // This guard mirrors the practical constraints of the GitHub Contents API.
-        // For large audio, prefer Git LFS or Releases-based upload flows.
         if (fileSize > MAX_CONTENTS_API_BYTES_HINT) {
             return Result.failure(
                 workDataOf(
@@ -140,71 +164,21 @@ class GitHubUploadWorker(
             )
         }
 
+        val remotePathForUi = buildDatedRemotePath(cfg.pathPrefix, fileName)
+
         Log.d(
             TAG,
-            "doWork: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
+            "doFileUpload: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
                     "prefix='${cfg.pathPrefix}' filePath=$filePath fileName=$fileName size=$fileSize"
         )
 
-        // Remote path is used only for output metadata (UI/logs).
-        val remotePath = buildDatedRemotePath(cfg.pathPrefix, fileName)
-
-        // ------------------------------------------------------------
-        // 2) Prepare notification (foreground execution)
-        // ------------------------------------------------------------
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            ensureChannel()
-        }
-
-        val notifId = NOTIF_BASE + (abs(fileName.hashCode()) % 8000)
-
-        setForegroundAsync(
-            foregroundInfo(
-                notificationId = notifId,
-                pct = 0,
-                title = "Uploading $fileName"
-            )
-        )
-
-        var lastPct = -1
-
-        val progressCallback: (Int) -> Unit = progressCallback@{ pct ->
-            val clamped = pct.coerceIn(0, 100)
-
-            // Avoid noisy notification churn by only updating when progress changes.
-            if (clamped == lastPct) return@progressCallback
-
-            lastPct = clamped
-
-            setProgressAsync(
-                workDataOf(
-                    PROGRESS_PCT to clamped,
-                    PROGRESS_FILE to fileName
-                )
-            )
-
-            setForegroundAsync(
-                foregroundInfo(
-                    notificationId = notifId,
-                    pct = clamped,
-                    title = "Uploading $fileName"
-                )
-            )
-        }
-
-        // ------------------------------------------------------------
-        // 3) Load file content and execute upload
-        // ------------------------------------------------------------
         return try {
             val extension = pendingFile.extension.lowercase(Locale.US)
+            val isText = TEXT_EXTENSIONS.contains(extension)
 
-            Log.d(TAG, "doWork: extension=$extension text=${TEXT_EXTENSIONS.contains(extension)}")
-
-            val result = if (TEXT_EXTENSIONS.contains(extension)) {
+            val result = if (isText) {
                 val text = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
-                    return Result.failure(
-                        workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}")
-                    )
+                    return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}"))
                 }
 
                 GitHubUploader.uploadJson(
@@ -212,13 +186,11 @@ class GitHubUploadWorker(
                     relativePath = fileName,
                     content = text,
                     message = "Upload $fileName (deferred)",
-                    onProgress = progressCallback
+                    onProgress = onProgress
                 )
             } else {
                 val bytes = runCatching { pendingFile.readBytes() }.getOrElse {
-                    return Result.failure(
-                        workDataOf(ERROR_MESSAGE to "Failed to read binary file: ${it.message}")
-                    )
+                    return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read binary file: ${it.message}"))
                 }
 
                 GitHubUploader.uploadFile(
@@ -226,21 +198,9 @@ class GitHubUploadWorker(
                     relativePath = fileName,
                     bytes = bytes,
                     message = "Upload $fileName (deferred)",
-                    onProgress = progressCallback
+                    onProgress = onProgress
                 )
             }
-
-            Log.d(TAG, "doWork: upload success fileUrl=${result.fileUrl} sha=${result.commitSha}")
-
-            // --------------------------------------------------------
-            // 4) Finalization
-            // --------------------------------------------------------
-            setProgressAsync(
-                workDataOf(
-                    PROGRESS_PCT to 100,
-                    PROGRESS_FILE to fileName
-                )
-            )
 
             setForegroundAsync(
                 foregroundInfo(
@@ -251,29 +211,24 @@ class GitHubUploadWorker(
                 )
             )
 
-            runCatching {
-                if (pendingFile.delete()) {
-                    Log.d(TAG, "doWork: deleted local file $filePath")
-                } else {
-                    Log.d(TAG, "doWork: failed to delete local file $filePath")
-                }
-            }
+            runCatching { pendingFile.delete() }
 
             Result.success(
                 workDataOf(
+                    OUT_MODE to MODE_FILE,
                     OUT_FILE_NAME to fileName,
-                    OUT_REMOTE_PATH to remotePath,
+                    OUT_REMOTE_PATH to remotePathForUi,
                     OUT_COMMIT_SHA to (result.commitSha ?: ""),
                     OUT_FILE_URL to (result.fileUrl ?: "")
                 )
             )
         } catch (t: Throwable) {
-            Log.w(TAG, "doWork: upload failed for $filePath", t)
+            Log.w(TAG, "doFileUpload: upload failed for $filePath", t)
 
             setForegroundAsync(
                 foregroundInfo(
                     notificationId = notifId,
-                    pct = max(0, lastPct),
+                    pct = max(0, inputData.getInt(PROGRESS_PCT, 0)),
                     title = "Upload failed: $fileName",
                     error = true
                 )
@@ -281,54 +236,107 @@ class GitHubUploadWorker(
 
             val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
 
-            // Only retry when it looks like a transient failure.
-            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) {
-                Result.retry()
-            } else {
-                Result.failure(failData)
-            }
+            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
+            else Result.failure(failData)
         }
     }
 
-    // -----------------------------------------------------------------
-    // Utilities
-    // -----------------------------------------------------------------
+    /**
+     * Execute logcat upload mode.
+     */
+    private suspend fun doLogcatUpload(
+        cfg: GitHubUploader.GitHubConfig,
+        notifId: Int,
+        onProgress: (Int) -> Unit,
+    ): Result {
+
+        val remoteDir = inputData.getString(KEY_LOG_REMOTE_DIR) ?: "diagnostics/logs"
+        val addDate = inputData.getBoolean(KEY_LOG_ADD_DATE, true)
+        val includeHeader = inputData.getBoolean(KEY_LOG_INCLUDE_HEADER, true)
+        val includeCrash = inputData.getBoolean(KEY_LOG_INCLUDE_CRASH, true)
+        val maxBytes = inputData.getInt(KEY_LOG_MAX_UNCOMPRESSED, 850_000)
+
+        return try {
+            val out = GitHubLogUploader.collectAndUploadLogcat(
+                context = applicationContext,
+                cfg = cfg,
+                remoteDir = remoteDir,
+                addDateSubdir = addDate,
+                includeDeviceHeader = includeHeader,
+                maxUncompressedBytes = maxBytes,
+                includeCrashBuffer = includeCrash,
+                onProgress = onProgress,
+            )
+
+            setForegroundAsync(
+                foregroundInfo(
+                    notificationId = notifId,
+                    pct = 100,
+                    title = "Uploaded logcat",
+                    finished = true
+                )
+            )
+
+            Result.success(
+                workDataOf(
+                    OUT_MODE to MODE_LOGCAT,
+                    OUT_REMOTE_PATH to out.remotePath,
+                    OUT_COMMIT_SHA to (out.commitSha ?: ""),
+                    OUT_FILE_URL to (out.fileUrl ?: ""),
+                    OUT_BYTES_RAW to out.bytesRaw,
+                    OUT_BYTES_GZ to out.bytesGz,
+                )
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "doLogcatUpload: upload failed", t)
+
+            setForegroundAsync(
+                foregroundInfo(
+                    notificationId = notifId,
+                    pct = max(0, inputData.getInt(PROGRESS_PCT, 0)),
+                    title = "Log upload failed",
+                    error = true
+                )
+            )
+
+            val failData = workDataOf(ERROR_MESSAGE to (t.message ?: "Unknown error"))
+
+            if (shouldRetry(t) && runAttemptCount < MAX_ATTEMPTS) Result.retry()
+            else Result.failure(failData)
+        }
+    }
 
     /**
      * Build a date-based remote path consistent with GitHubUploader:
-     *
      *   prefix + yyyy-MM-dd + fileName
      */
     private fun buildDatedRemotePath(prefix: String, fileName: String): String {
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-        return listOf(
-            prefix.trim('/'),
-            date,
-            fileName.trim('/')
-        )
+        return listOf(prefix.trim('/'), date, fileName.trim('/'))
             .filter { it.isNotEmpty() }
             .joinToString("/")
     }
 
     /**
      * Determine if the throwable should be treated as transient.
-     *
-     * This heuristic is conservative:
-     * - Network-ish failures and generic IO issues are retried.
-     * - Obvious permanent failures (size guard, auth config, etc.) are not.
      */
     private fun shouldRetry(t: Throwable): Boolean {
         val msg = t.message.orEmpty()
+
         if (msg.contains("too large", ignoreCase = true)) return false
-        if (msg.contains("Invalid GitHub configuration", ignoreCase = true)) return false
+        if (msg.contains("invalid github configuration", ignoreCase = true)) return false
+
+        // Avoid retrying obvious auth/permanent failures.
+        if (msg.contains("401")) return false
+        if (msg.contains("403")) return false
+        if (msg.contains("bad credentials", ignoreCase = true)) return false
+        if (msg.contains("requires authentication", ignoreCase = true)) return false
+
         return t is IOException || msg.contains("timeout", ignoreCase = true)
     }
 
     /**
      * Build [ForegroundInfo] with an upload progress notification.
-     *
-     * - On Android 10+ uses DATA_SYNC foreground service type.
-     * - On older versions falls back to the 2-arg constructor.
      */
     private fun foregroundInfo(
         notificationId: Int,
@@ -370,9 +378,7 @@ class GitHubUploadWorker(
      */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun ensureChannel() {
-        val nm =
-            applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
+        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Background Uploads",
@@ -381,71 +387,60 @@ class GitHubUploadWorker(
             description = "Displays progress for ongoing uploads to GitHub."
             setShowBadge(false)
         }
-
         nm.createNotificationChannel(channel)
     }
 
-    // -----------------------------------------------------------------
-    // Companion Object
-    // -----------------------------------------------------------------
     companion object {
 
-        /** Tag used for identifying GitHub upload work requests. */
         const val TAG = "github_upload"
 
-        /** Notification channel ID for upload progress. */
         private const val CHANNEL_ID = "uploads"
-
-        /** Base ID offset for unique per-file notifications. */
         private const val NOTIF_BASE = 3200
-
-        /** Maximum number of retry attempts before final failure. */
         private const val MAX_ATTEMPTS = 5
-
-        /**
-         * Hint size limit for Contents API usage.
-         *
-         * Keep this aligned with the guard in GitHubUploader.
-         */
         private const val MAX_CONTENTS_API_BYTES_HINT = 900_000L
 
-        /** Extensions treated as UTF-8 text payloads. */
-        private val TEXT_EXTENSIONS = setOf(
-            "json",
-            "jsonl",
-            "txt",
-            "csv"
-        )
+        private val TEXT_EXTENSIONS = setOf("json", "jsonl", "txt", "csv")
+
+        // Modes
+        private const val MODE_FILE = "file"
+        private const val MODE_LOGCAT = "logcat"
 
         // Progress keys
         const val PROGRESS_PCT = "pct"
-        const val PROGRESS_FILE = "file"
+        const val PROGRESS_MODE = "mode"
 
-        // Input keys
+        // Common input keys
         const val KEY_OWNER = "owner"
         const val KEY_REPO = "repo"
         const val KEY_TOKEN = "token"
         const val KEY_BRANCH = "branch"
         const val KEY_PATH_PREFIX = "pathPrefix"
+        const val KEY_MODE = "mode"
+
+        // File input keys
         const val KEY_FILE_PATH = "filePath"
         const val KEY_FILE_NAME = "fileName"
 
+        // Logcat input keys
+        const val KEY_LOG_REMOTE_DIR = "log.remoteDir"
+        const val KEY_LOG_ADD_DATE = "log.addDate"
+        const val KEY_LOG_INCLUDE_HEADER = "log.includeHeader"
+        const val KEY_LOG_INCLUDE_CRASH = "log.includeCrash"
+        const val KEY_LOG_MAX_UNCOMPRESSED = "log.maxUncompressed"
+
         // Output keys
+        const val OUT_MODE = "out.mode"
         const val OUT_FILE_NAME = "out.fileName"
         const val OUT_REMOTE_PATH = "out.remotePath"
         const val OUT_COMMIT_SHA = "out.commitSha"
         const val OUT_FILE_URL = "out.fileUrl"
+        const val OUT_BYTES_RAW = "out.bytesRaw"
+        const val OUT_BYTES_GZ = "out.bytesGz"
 
-        /** Output key for human-readable error messages. */
         const val ERROR_MESSAGE = "error"
 
         /**
          * Enqueue a work request to upload an existing file.
-         *
-         * - Unique per file name to prevent duplicate uploads.
-         * - Requires a connected network.
-         * - Exponential backoff with a 30s initial delay.
-         * - Runs expedited when quota allows.
          */
         fun enqueueExistingPayload(
             context: Context,
@@ -458,6 +453,7 @@ class GitHubUploadWorker(
                 OneTimeWorkRequestBuilder<GitHubUploadWorker>()
                     .setInputData(
                         workDataOf(
+                            KEY_MODE to MODE_FILE,
                             KEY_OWNER to cfg.owner,
                             KEY_REPO to cfg.repo,
                             KEY_TOKEN to cfg.token,
@@ -472,70 +468,64 @@ class GitHubUploadWorker(
                             .setRequiredNetworkType(NetworkType.CONNECTED)
                             .build()
                     )
-                    .setBackoffCriteria(
-                        BackoffPolicy.EXPONENTIAL,
-                        30,
-                        TimeUnit.SECONDS
-                    )
-                    .setExpedited(
-                        OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST
-                    )
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                     .addTag(TAG)
                     .addTag("$TAG:file:$name")
                     .build()
 
             WorkManager.getInstance(context)
-                .enqueueUniqueWork(
-                    "upload_$name",
-                    ExistingWorkPolicy.KEEP,
-                    req
-                )
+                .enqueueUniqueWork("upload_$name", ExistingWorkPolicy.KEEP, req)
         }
 
         /**
-         * Write JSON content into `/files/pending_uploads` and schedule an upload.
+         * Enqueue a work request to collect and upload logcat.
          *
-         * If a file with the same name already exists, a numeric suffix is appended.
+         * Note: We use a timestamped unique name so each request is distinct.
          */
-        fun enqueue(
+        fun enqueueLogcatUpload(
             context: Context,
             cfg: GitHubUploader.GitHubConfig,
-            fileName: String,
-            jsonContent: String
+            remoteDir: String = "diagnostics/logs",
+            addDateSubdir: Boolean = true,
+            includeDeviceHeader: Boolean = true,
+            includeCrashBuffer: Boolean = true,
+            maxUncompressedBytes: Int = 850_000,
         ) {
-            require(fileName.isNotBlank()) { "fileName is blank." }
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val uniqueName = "upload_logcat_$stamp"
 
-            val safeName = sanitizeName(fileName)
-                .let { if (it.endsWith(".json", ignoreCase = true)) it else "$it.json" }
+            val req: OneTimeWorkRequest =
+                OneTimeWorkRequestBuilder<GitHubUploadWorker>()
+                    .setInputData(
+                        workDataOf(
+                            KEY_MODE to MODE_LOGCAT,
+                            KEY_OWNER to cfg.owner,
+                            KEY_REPO to cfg.repo,
+                            KEY_TOKEN to cfg.token,
+                            KEY_BRANCH to cfg.branch,
+                            KEY_PATH_PREFIX to cfg.pathPrefix,
 
-            val dir = File(context.filesDir, "pending_uploads").apply { mkdirs() }
-            val target = uniqueIfExists(File(dir, safeName))
+                            KEY_LOG_REMOTE_DIR to remoteDir,
+                            KEY_LOG_ADD_DATE to addDateSubdir,
+                            KEY_LOG_INCLUDE_HEADER to includeDeviceHeader,
+                            KEY_LOG_INCLUDE_CRASH to includeCrashBuffer,
+                            KEY_LOG_MAX_UNCOMPRESSED to maxUncompressedBytes,
+                        )
+                    )
+                    .setConstraints(
+                        Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build()
+                    )
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                    .addTag(TAG)
+                    .addTag("$TAG:logcat")
+                    .build()
 
-            target.writeText(jsonContent, Charsets.UTF_8)
-            enqueueExistingPayload(context, cfg, target)
-        }
-
-        /**
-         * Replace all non `[A-Za-z0-9_.-]` characters with underscores.
-         */
-        private fun sanitizeName(name: String): String =
-            name.replace(Regex("""[^\w\-.]"""), "_")
-
-        /**
-         * Append a numeric suffix until a non-existing file name is found.
-         */
-        private fun uniqueIfExists(file: File): File {
-            if (!file.exists()) return file
-
-            val base = file.nameWithoutExtension
-            val ext = file.extension.takeIf { it.isNotEmpty() }?.let { ".$it" } ?: ""
-
-            var idx = 1
-            while (true) {
-                val candidate = File(file.parentFile, "${base}_$idx$ext")
-                if (!candidate.exists()) return candidate
-                idx++
-            }
+            WorkManager.getInstance(context)
+                .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
         }
     }
 }

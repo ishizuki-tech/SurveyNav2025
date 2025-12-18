@@ -60,8 +60,8 @@ data class UploadItemUi(
  * - Provides an optional HUD visibility flow for global overlays.
  *
  * Design note:
- * - WorkInfo does NOT expose inputData in many WorkManager versions.
- *   Therefore filename inference must rely on progress/output/tags.
+ * - WorkInfo does NOT reliably expose inputData across WorkManager versions.
+ *   Therefore filename inference must rely on tags, progress, or outputData.
  */
 class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -110,6 +110,7 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
     private fun WorkInfo.toUploadItemUi(): UploadItemUi {
         val name = extractFileName(this)
         val pct = extractPercent(this)
+
         val url = outputData
             .getString(GitHubUploadWorker.OUT_FILE_URL)
             ?.takeIf { it.isNotBlank() }
@@ -157,27 +158,44 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
      * Resolve the best-available filename for display.
      *
      * Resolution order:
-     *  1. `progress[PROGRESS_FILE]` during upload.
-     *  2. `outputData[OUT_FILE_NAME]` after completion.
+     *  1. `outputData[OUT_FILE_NAME]` after completion (file mode).
+     *  2. `outputData[OUT_REMOTE_PATH]` (logcat mode or generic success).
      *  3. A tag formatted as `"${GitHubUploadWorker.TAG}:file:<name>"`.
-     *  4. `input_file` from progress or output (optional convention).
+     *  4. Mode-based fallback (logcat vs file).
      *  5. Fallback `"upload-<4chars>.json"` using work ID prefix.
      *
      * Note:
      * - WorkInfo does not reliably expose inputData.
      */
     private fun extractFileName(wi: WorkInfo): String {
-        progressName(wi)?.let { return it }
         outputName(wi)?.let { return it }
+        remotePathName(wi)?.let { return it }
         tagName(wi)?.let { return it }
-        inputName(wi)?.let { return it }
+
+        val mode = extractMode(wi)
+        if (mode == MODE_LOGCAT) {
+            return "logcat-${wi.id.toString().take(4).lowercase(Locale.ROOT)}.log.gz"
+        }
+
         return "upload-${wi.id.toString().take(4).lowercase(Locale.ROOT)}.json"
     }
 
-    private fun progressName(wi: WorkInfo): String? =
-        wi.progress
-            .getString(GitHubUploadWorker.PROGRESS_FILE)
+    /**
+     * Extract mode from progress/output.
+     */
+    private fun extractMode(wi: WorkInfo): String? {
+        wi.progress.getString(GitHubUploadWorker.PROGRESS_MODE)
             ?.takeIf { it.isNotBlank() }
+            ?.lowercase(Locale.ROOT)
+            ?.let { return it }
+
+        wi.outputData.getString(GitHubUploadWorker.OUT_MODE)
+            ?.takeIf { it.isNotBlank() }
+            ?.lowercase(Locale.ROOT)
+            ?.let { return it }
+
+        return null
+    }
 
     private fun outputName(wi: WorkInfo): String? =
         wi.outputData
@@ -185,36 +203,39 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
             ?.takeIf { it.isNotBlank() }
 
     /**
-     * Optional convention-based name inference from progress/output.
+     * Derive a display name from remote path when available.
      *
-     * This is useful when another uploader implementation writes:
-     * - progress["input_file"]
-     * - outputData["input_file"]
+     * Example:
+     *  - diagnostics/logs/2025-12-16/logcat_20251216_120102.log.gz -> logcat_20251216_120102.log.gz
      */
-    private fun inputName(wi: WorkInfo): String? {
-        wi.progress
-            .getString(KEY_INPUT_FILE)
+    private fun remotePathName(wi: WorkInfo): String? {
+        val path = wi.outputData
+            .getString(GitHubUploadWorker.OUT_REMOTE_PATH)
             ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
+            ?: return null
 
-        wi.outputData
-            .getString(KEY_INPUT_FILE)
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-
-        return null
+        val base = path.substringAfterLast('/', path)
+        return base.takeIf { it.isNotBlank() }
     }
 
     /**
      * Extract filename from a structured tag.
      *
-     * Expected tag format:
+     * Expected tag formats:
      *  - "${GitHubUploadWorker.TAG}:file:<name>"
+     *  - "${GitHubUploadWorker.TAG}:logcat"
      */
     private fun tagName(wi: WorkInfo): String? {
-        val tag = wi.tags.firstOrNull { it.startsWith(FILE_TAG_PREFIX) } ?: return null
-        val name = tag.removePrefix(FILE_TAG_PREFIX)
-        return name.takeIf { it.isNotBlank() }
+        wi.tags.firstOrNull { it.startsWith(FILE_TAG_PREFIX) }?.let { tag ->
+            val name = tag.removePrefix(FILE_TAG_PREFIX)
+            return name.takeIf { it.isNotBlank() }
+        }
+
+        if (wi.tags.any { it == LOGCAT_TAG }) {
+            return "logcat.log.gz"
+        }
+
+        return null
     }
 
     /**
@@ -267,10 +288,13 @@ class UploadQueueViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
-        private const val KEY_INPUT_FILE = "input_file"
+        private const val MODE_LOGCAT = "logcat"
 
         private val FILE_TAG_PREFIX: String =
             "${GitHubUploadWorker.TAG}:file:"
+
+        private val LOGCAT_TAG: String =
+            "${GitHubUploadWorker.TAG}:logcat"
 
         /**
          * Compose-friendly factory.
