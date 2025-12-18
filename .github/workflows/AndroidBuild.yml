@@ -35,8 +35,8 @@ on:
         required: true
 
       tag_datetime_format:
-        description: "date(1) format for tag suffix when version_name is empty (default: %Y%m%d-%H%M)"
-        default: "%Y%m%d-%H%M"
+        description: "date(1) format for tag suffix when version_name is empty (default: %Y%m%d-%H%M%S)"
+        default: "%Y%m%d-%H%M%S"
         required: true
 
       ndk_version:
@@ -93,6 +93,7 @@ jobs:
       tag: ${{ steps.ver.outputs.tag }}
       base_version: ${{ steps.ver.outputs.base_version }}
       version_code: ${{ steps.ver.outputs.version_code }}
+      build_sha: ${{ steps.gitdebug.outputs.sha }}
 
     steps:
       - name: Checkout (with submodules)
@@ -100,6 +101,24 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          persist-credentials: true
+
+      - name: Debug git context (branch/sha)
+        id: gitdebug
+        run: |-
+          set -euo pipefail
+          echo "::group::GitHub context"
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          echo "::endgroup::"
+
+          echo "::group::Git state"
+          echo "branch=$(git branch --show-current || true)"
+          echo "sha=$(git rev-parse HEAD)"
+          git log -1 --oneline --decorate --no-color
+          echo "::endgroup::"
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Ensure gradlew is executable
         run: chmod +x ./gradlew
@@ -324,6 +343,40 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Create and push git tag (ensures GitHub “Source code” matches this build)
+        id: tagpush
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          REPO: ${{ env.REPO }}
+        run: |-
+          set -euo pipefail
+
+          # Fail-fast if tag already exists (prevents “old Source code” accidents).
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag '${TAG}' already exists locally."
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+            echo "::error::Tag '${TAG}' already exists on origin. Refusing to reuse it."
+            echo "::error::Delete the old tag/release or change tag_datetime_format to be unique."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${TAG}" -m "Release ${TAG}"
+
+          # Ensure authenticated push (uses GITHUB_TOKEN).
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git push origin "refs/tags/${TAG}"
+
+          echo "::group::Tag pushed"
+          echo "tag=${TAG}"
+          echo "sha=$(git rev-parse HEAD)"
+          echo "::endgroup::"
+
       - name: Upload APK artifacts
         if: ${{ steps.collect.outputs.apk_count != '0' }}
         uses: actions/upload-artifact@v4
@@ -374,6 +427,10 @@ jobs:
             echo "- versionName(tag): ${TAG}"
             echo "- versionCode     : ${VCODE}"
             echo
+            echo "## Build Source"
+            echo "- commit: $(git rev-parse HEAD)"
+            echo "- ref   : ${GITHUB_REF}"
+            echo
             echo "## What's Changed"
             echo "$NOTES"
             echo
@@ -397,6 +454,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           body: ${{ steps.notes.outputs.body }}
           files: |
             ${{ steps.collect.outputs.apk_list }}
@@ -418,10 +476,11 @@ jobs:
       VERSION_CODE: ${{ needs.build.outputs.version_code }}
 
     steps:
-      - name: Checkout
+      - name: Checkout (tagged source for consistency)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.build.outputs.tag }}
 
       - name: Resolve TAG/DATE/BASE
         id: info
