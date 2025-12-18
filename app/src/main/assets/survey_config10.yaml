@@ -3,77 +3,68 @@ graph:
   nodes:
     - id: Start
       type: START
-      title: Anza
-      question: Anza
+      title: Start
+      question: Start
       nextId: Q1
-
     - id: Q1
       type: AI
-      title: Hasara ya Mavuno kutokana na Funza wa Jeshi Vamizi (Misimu 3)
+      title: FAW Yield Loss (3 Seasons)
       question: >-
-        Unapoteza mavuno kiasi gani kutokana na funza wa jeshi vamizi (FAW)? Tafadhali fikiria misimu mitatu iliyopita. (Asilimia au magunia kwa ekari ni sawa.)
+        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
       nextId: Q2
-
     - id: Q2
       type: AI
-      title: Ubadilishanaji kwa Kuvuna Mapema kwa Siku 10
+      title: Trade-off for 10-Day Earlier Harvest
       question: >-
-        Ikiwa ungeweza kuvuna siku 10 mapema, ungekuwa tayari kupunguza mavuno kiasi gani? (Asilimia au magunia kwa ekari.)
+        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
       nextId: Q3
-
     - id: Q3
       type: AI
-      title: Kizingiti cha Uharibifu cha Kubadili Aina ya Mahindi
+      title: Damage Threshold to Switch Variety
       question: >-
-        Ni kiwango gani cha uharibifu wa wadudu au magonjwa kingekufanya uache kutumia aina yako ya sasa ya mahindi na ubadilishe kwenda aina mpya? (Toa kigezo wazi, kwa mfano: asilimia ya mimea au masikio yaliyoharibika, au kiwango cha ukali.)
+        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
       nextId: Q4
-
     - id: Q4
       type: AI
-      title: Matarajio ya Aina Mpya ya Kuchukua Nafasi
+      title: Expectations for Replacement Variety
       question: >-
-        Ungetarajia nini kutoka kwa aina mpya ya mahindi ili kuchukua nafasi ya ile unayolima sasa? Tafadhali toa maelezo kwa undani kadiri inavyowezekana (kwa mfano, muda wa kukomaa (DTM), uvumilivu wa FAW, uvumilivu wa ukame katika hatua fulani, mavuno ya kawaida).
+        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
       nextId: Q5
-
     - id: Q5
       type: AI
-      title: Mavuno ya Chini Yanayokubalika Katika Mwaka Mbaya
+      title: Minimum Acceptable Harvest in Bad Year
       question: >-
-        Katika mwaka mbaya, ni mavuno madogo kiasi gani ambayo ungeyakubali na bado ukapande mahindi haya tena msimu unaofuata? (Asilimia ya mavuno ya kawaida au magunia kwa ekari.)
+        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
       nextId: Q6
-
     - id: Q6
       type: AI
-      title: Wakati wa Ukame Unaoharibu Zaidi
+      title: Most Damaging Drought Timing
       question: >-
-        Ni kipindi gani katika msimu ambapo ukame unaathiri mazao yako kwa kiwango kikubwa zaidi? Ni wakati gani wa ukame ambao ni mgumu zaidi kwako? (Kwa mfano, kabla ya kutoa maua, wakati wa kutoa maua/kuchanua, kujaza punje, kabla ya kuvuna.)
+        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
       nextId: Review
-
     - id: Review
       type: REVIEW
-      title: Kagua
+      title: Review
       question: ''
       nextId: Done
-
     - id: Done
       type: DONE
-      title: Imekamilika
+      title: Done
       question: ''
 
 slm:
   accelerator: "GPU"
-  max_tokens: 4096
-  top_k: 10
-  top_p: 0.2
-  temperature: 0.3
+  max_tokens: 1024
+  top_k: 20
+  top_p: 0.9
+  temperature: 0.2
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
-  turn_end: "<end_of_turn>"
   empty_json_instruction: "Respond with an empty JSON object: {}"
   preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
   key_contract: |
     OUTPUT FORMAT:
-    - All Values in Swahili.
+    - In English.
     - Keys:
       • "analysis": short string
       • "expected answer": short string
@@ -93,18 +84,6 @@ slm:
     - RAW JSON only, ONE LINE.
     - Use COMPACT JSON (no spaces around ':' and ',').
     - No extra text.
-
-whisper:
-  enabled: true
-#  asset_model_path: "models/ggml-small-q5_1.bin"
-#  language: "en" # "auto", "en", "ja", "sw"
-  asset_model_path: "models/ggml-model-q4_0.bin"
-  language: "sw" # "auto", "en", "ja", "sw"
-  translate: false
-  print_timestamp: false
-  target_sample_rate: 16000
-  record_sample_rates: [16000, 48000, 44100]
-  compute_checksum: true
 
 prompts:
   - nodeId: Q1
@@ -175,10 +154,19 @@ prompts:
 
 model_defaults:
   # Model download UI defaults
-  model_name: "Gemma3n4B"
   default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
   default_file_name: "Gemma3n4B.litertlm"
-
+  # Optional tuning knobs (keep same defaults as code)
   timeout_ms: 1800000          # 30 minutes
   ui_throttle_ms: 250
   ui_min_delta_bytes: 1048576  # 1 MiB
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-small-q5_1.bin"
+  language: "en" # "auto", "en", "ja", "sw"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true
