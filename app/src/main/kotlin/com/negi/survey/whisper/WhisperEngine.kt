@@ -17,15 +17,20 @@ import android.content.Context
 import android.os.Debug
 import android.os.SystemClock
 import android.util.Log
+import com.negi.survey.whisper.WhisperEngine.detach
+import com.negi.survey.whisper.WhisperEngine.engineMutex
+import com.negi.survey.whisper.WhisperEngine.ensureInitializedFromFile
+import com.negi.survey.whisper.WhisperEngine.release
+import com.negi.survey.whisper.WhisperEngine.whisperContext
 import com.negi.whispers.media.decodeWaveFile
 import com.whispercpp.whisper.WhisperContext
-import java.io.File
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.sqrt
 
 private const val LOG_TAG = "WhisperEngine"
 private const val DEFAULT_TARGET_SAMPLE_RATE = 16_000
@@ -856,8 +861,8 @@ object WhisperEngine {
             logMemory("[$requestId][asr]")
 
             when {
-                lastEmptySuccess != null -> Result.success(lastEmptySuccess!!)
-                lastFailure != null -> Result.failure(lastFailure!!)
+                lastEmptySuccess != null -> Result.success(lastEmptySuccess)
+                lastFailure != null -> Result.failure(lastFailure)
                 else -> Result.failure(IllegalStateException("Transcription produced no usable result."))
             }
         }

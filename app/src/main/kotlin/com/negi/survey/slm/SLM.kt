@@ -40,6 +40,8 @@ import android.os.SystemClock
 import android.util.Log
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
+import com.negi.survey.slm.SLM.ensureInitialized
+import com.negi.survey.slm.SLM.initialize
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong

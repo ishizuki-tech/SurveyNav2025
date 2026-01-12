@@ -86,6 +86,9 @@ import com.negi.survey.utils.ExportUtils
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.Node
 import com.negi.survey.vm.SurveyViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -94,9 +97,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 private const val REMOTE_VOICE_DIR = "voice"
 

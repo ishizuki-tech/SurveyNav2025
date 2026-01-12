@@ -28,14 +28,16 @@ package com.negi.survey.config
 import android.content.Context
 import com.charleskorn.kaml.Yaml
 import com.charleskorn.kaml.YamlConfiguration
-import java.io.File
-import java.nio.charset.Charset
+import com.negi.survey.config.ConfigFormat.AUTO
+import com.negi.survey.config.ConfigFormat.JSON
+import com.negi.survey.config.ConfigFormat.YAML
+import com.negi.survey.config.NodeType.UNKNOWN
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.File
+import java.nio.charset.Charset
 
 /**
  * Top-level configuration model for a survey.

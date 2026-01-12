@@ -32,10 +32,10 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -45,6 +45,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -53,6 +54,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
@@ -60,10 +62,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,7 +79,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
@@ -107,7 +113,8 @@ data class ConfigOptionUi(
  *  - Optionally show a “Restart” button to reset an engine/session upstream.
  *
  * @param restartEpoch A monotonically increasing token. When this value changes,
- *        internal UI state (e.g., selectedId) is re-initialized deterministically.
+ *        internal UI state (e.g., selectedId / dialog state) is re-initialized.
+ * @param debug Optional callback for emitting UI diagnostics without a Log dependency.
  */
 @Composable
 fun IntroScreen(
@@ -118,18 +125,27 @@ fun IntroScreen(
     showRestart: Boolean = false,
     isRestarting: Boolean = false,
     onRestart: (() -> Unit)? = null,
+    debug: ((String) -> Unit)? = null,
 ) {
-    val bgBrush = animatedMonotoneBackground()
-
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(bgBrush)
             .semantics { contentDescription = "Survey intro screen" }
             .testTag("IntroScreenRoot")
     ) {
+        val density = LocalDensity.current
+        val widthPx = with(density) { maxWidth.toPx() }
+        val heightPx = with(density) { maxHeight.toPx() }
+
+        val bgBrush = animatedMonotoneBackground(
+            widthPx = widthPx,
+            heightPx = heightPx
+        )
+
         Box(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .background(bgBrush),
             contentAlignment = Alignment.Center
         ) {
             IntroCardMono(
@@ -141,7 +157,8 @@ fun IntroScreen(
                 restartEpoch = restartEpoch,
                 showRestart = showRestart,
                 isRestarting = isRestarting,
-                onRestart = onRestart
+                onRestart = onRestart,
+                debug = debug
             )
         }
     }
@@ -149,12 +166,6 @@ fun IntroScreen(
 
 /* ──────────────────────────── Card & Typography ─────────────────────────── */
 
-/**
- * Centered intro card for monotone survey selection.
- *
- * This card expects at least one option. If you want a softer failure mode,
- * replace the require() with a simple empty-state UI.
- */
 @Composable
 private fun IntroCardMono(
     title: String,
@@ -166,35 +177,28 @@ private fun IntroCardMono(
     showRestart: Boolean,
     isRestarting: Boolean,
     onRestart: (() -> Unit)?,
+    debug: ((String) -> Unit)?,
 ) {
-    require(options.isNotEmpty()) {
-        "IntroCardMono requires at least one ConfigOptionUi."
-    }
-
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
     val optionIds = remember(options) { options.map { it.id } }
 
-    /**
-     * Resolve the initial selection safely.
-     *
-     * If the requested default ID does not exist in the current options,
-     * fall back to the first option to avoid an unselected initial UI.
-     */
     val initialId = remember(optionIds, defaultOptionId, restartEpoch) {
-        val def = defaultOptionId?.takeIf { it.isNotBlank() }
-        if (def != null && optionIds.contains(def)) def else options.first().id
+        val def = defaultOptionId?.trim()?.takeIf { it.isNotEmpty() }
+        val resolved = if (def != null && optionIds.contains(def)) def else optionIds.firstOrNull()
+        resolved.orEmpty()
     }
 
-    /**
-     * Selected option state.
-     *
-     * Keying by restartEpoch ensures a deterministic reset when the upstream
-     * "Restart" flow is triggered (engine reset, nav re-entry, etc.).
-     */
-    var selectedId by remember(optionIds, defaultOptionId, restartEpoch) {
+    var selectedId by rememberSaveable(optionIds, defaultOptionId, restartEpoch) {
         mutableStateOf(initialId)
+    }
+
+    // If options changed and selectedId is no longer valid, snap deterministically.
+    if (options.isNotEmpty() && selectedId.isNotBlank() && optionIds.contains(selectedId).not()) {
+        val fallback = initialId.ifBlank { options.first().id }
+        debug?.invoke("IntroScreen: selectedId='$selectedId' missing; fallback='$fallback'")
+        selectedId = fallback
     }
 
     ElevatedCard(
@@ -218,6 +222,7 @@ private fun IntroCardMono(
                     cornerRadius = CornerRadius(corner.toPx(), corner.toPx())
                 )
             }
+            .testTag("IntroCard")
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 22.dp, vertical = 20.dp),
@@ -245,19 +250,44 @@ private fun IntroCardMono(
                     .padding(bottom = 6.dp)
             )
 
+            if (options.isEmpty()) {
+                EmptyOptionsMono()
+                Spacer(Modifier.height(14.dp))
+
+                HorizontalDivider(
+                    thickness = DividerDefaults.Thickness,
+                    color = cs.outlineVariant.copy(alpha = 0.25f)
+                )
+
+                Spacer(Modifier.height(14.dp))
+
+                CtaRowMono(
+                    onStart = null,
+                    showRestart = showRestart,
+                    isRestarting = isRestarting,
+                    onRestart = onRestart,
+                    restartEpoch = restartEpoch,
+                    debug = debug
+                )
+                return@Column
+            }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("ConfigSelectorColumn"),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                options.forEach { option ->
+                options.forEachIndexed { idx, option ->
                     MonoConfigOptionChip(
                         option = option,
                         selected = option.id == selectedId,
-                        onClick = { selectedId = option.id }
+                        onClick = {
+                            selectedId = option.id
+                            debug?.invoke("IntroScreen: selectedId='${option.id}'")
+                        }
                     )
-                    Spacer(Modifier.height(6.dp))
+                    if (idx != options.lastIndex) Spacer(Modifier.height(6.dp))
                 }
             }
 
@@ -274,27 +304,63 @@ private fun IntroCardMono(
                 options.firstOrNull { it.id == selectedId } ?: options.first()
 
             CtaRowMono(
-                onStart = { onStart(selectedOption) },
+                onStart = {
+                    debug?.invoke("IntroScreen: start optionId='${selectedOption.id}'")
+                    onStart(selectedOption)
+                },
                 showRestart = showRestart,
                 isRestarting = isRestarting,
-                onRestart = onRestart
+                onRestart = onRestart,
+                restartEpoch = restartEpoch,
+                debug = debug
             )
         }
     }
 }
 
-/**
- * CTA row that hosts the primary Start button and an optional Restart button.
- */
+@Composable
+private fun EmptyOptionsMono() {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(lerp(Color(0xFF181818), cs.surface, 0.40f))
+            .border(
+                BorderStroke(1.dp, Color(0xFF6A6A6A).copy(alpha = 0.60f)),
+                RoundedCornerShape(14.dp)
+            )
+            .padding(horizontal = 12.dp, vertical = 12.dp)
+            .testTag("EmptyOptionsState"),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "No configurations found",
+            style = MaterialTheme.typography.labelLarge,
+            color = Color.White
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = "Add at least one config option to start.",
+            style = MaterialTheme.typography.bodySmall,
+            color = lerp(cs.onSurface, Color(0xFF9B9B9B), 0.30f),
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+/* ─────────────────────────────── CTA Row ─────────────────────────────── */
+
 @Composable
 private fun CtaRowMono(
-    onStart: () -> Unit,
+    onStart: (() -> Unit)?,
     showRestart: Boolean,
     isRestarting: Boolean,
     onRestart: (() -> Unit)?,
+    restartEpoch: Long,
+    debug: ((String) -> Unit)?,
 ) {
-    val cs = MaterialTheme.colorScheme
-    var confirmRestart by remember { mutableStateOf(false) }
+    var confirmRestart by rememberSaveable(restartEpoch) { mutableStateOf(false) }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -302,11 +368,14 @@ private fun CtaRowMono(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Button(
-            onClick = onStart,
+            enabled = (onStart != null),
+            onClick = { onStart?.invoke() },
             shape = CircleShape,
             colors = ButtonDefaults.buttonColors(
-                containerColor = lerp(Color(0xFF1F1F1F), cs.surface, 0.25f),
-                contentColor = Color.White
+                containerColor = lerp(Color(0xFF1F1F1F), MaterialTheme.colorScheme.surface, 0.25f),
+                contentColor = Color.White,
+                disabledContainerColor = Color(0xFF2A2A2A),
+                disabledContentColor = Color(0xFFB0B0B0)
             ),
             modifier = Modifier.testTag("StartButton")
         ) {
@@ -329,14 +398,22 @@ private fun CtaRowMono(
                 onClick = { confirmRestart = true },
                 border = BorderStroke(1.dp, Color(0xFF7A7A7A).copy(alpha = 0.65f)),
                 colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = Color.White
+                    contentColor = Color.White,
+                    disabledContentColor = Color(0xFF9B9B9B)
                 ),
                 modifier = Modifier.testTag("RestartButton")
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Refresh,
-                    contentDescription = null
-                )
+                if (isRestarting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = null
+                    )
+                }
                 Spacer(Modifier.width(6.dp))
                 Text(
                     text = if (isRestarting) "Restarting..." else "Restart",
@@ -352,10 +429,11 @@ private fun CtaRowMono(
             title = { Text("Restart engine?") },
             text = { Text("This cancels current work and recreates the engine/session.") },
             confirmButton = {
-                Button(
+                TextButton(
                     enabled = !isRestarting,
                     onClick = {
                         confirmRestart = false
+                        debug?.invoke("IntroScreen: restart confirmed")
                         onRestart?.invoke()
                     }
                 ) {
@@ -363,7 +441,12 @@ private fun CtaRowMono(
                 }
             },
             dismissButton = {
-                Button(onClick = { confirmRestart = false }) {
+                TextButton(
+                    onClick = {
+                        confirmRestart = false
+                        debug?.invoke("IntroScreen: restart canceled")
+                    }
+                ) {
                     Text("Cancel")
                 }
             }
@@ -371,9 +454,8 @@ private fun CtaRowMono(
     }
 }
 
-/**
- * Monotone headline with a subtle vertical gradient.
- */
+/* ──────────────────────────── Headline ─────────────────────────── */
+
 @Composable
 private fun GradientHeadlineMono(text: String) {
     val brush = Brush.verticalGradient(
@@ -392,9 +474,8 @@ private fun GradientHeadlineMono(text: String) {
     )
 }
 
-/**
- * Single monotone configuration chip.
- */
+/* ──────────────────────────── Option Chip ─────────────────────────── */
+
 @Composable
 private fun MonoConfigOptionChip(
     option: ConfigOptionUi,
@@ -419,24 +500,29 @@ private fun MonoConfigOptionChip(
     }
     val descriptionColor = lerp(cs.onSurface, Color(0xFF9B9B9B), 0.30f)
 
+    val interaction = remember { MutableInteractionSource() }
+    val tagSafeId = remember(option.id) { option.id.replace(Regex("[^A-Za-z0-9._-]"), "_") }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
             .background(background)
             .border(BorderStroke(1.dp, borderColor), RoundedCornerShape(14.dp))
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() },
-                onClick = onClick
+            .selectable(
+                selected = selected,
+                onClick = onClick,
+                enabled = true,
+                role = Role.RadioButton,
+                interactionSource = interaction,
+                indication = null
             )
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .testTag("ConfigOption_$tagSafeId"),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(
-            modifier = Modifier
-                .weight(1f)
-                .testTag("ConfigOption_${option.id}")
+            modifier = Modifier.weight(1f)
         ) {
             Text(
                 text = option.label,
@@ -476,9 +562,15 @@ private fun MonoConfigOptionChip(
 
 /**
  * Animated monotone background brush for the intro screen.
+ *
+ * @param widthPx Current viewport width in pixels.
+ * @param heightPx Current viewport height in pixels.
  */
 @Composable
-private fun animatedMonotoneBackground(): Brush {
+private fun animatedMonotoneBackground(
+    widthPx: Float,
+    heightPx: Float
+): Brush {
     val t = rememberInfiniteTransition(label = "mono-bg")
     val p by t.animateFloat(
         initialValue = 0f,
@@ -495,8 +587,9 @@ private fun animatedMonotoneBackground(): Brush {
     val c2 = Color(0xFF1E1E1E)
     val c3 = Color(0xFF272727)
 
-    val endX = 900f + 280f * p
-    val endY = 720f - 220f * p
+    // Scale with viewport to avoid "fixed px" artifacts on tablets / small phones.
+    val endX = widthPx * (0.95f + 0.20f * p)
+    val endY = heightPx * (0.90f - 0.18f * p)
 
     return Brush.linearGradient(
         colors = listOf(c0, c1, c2, c3),

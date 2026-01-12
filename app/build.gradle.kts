@@ -1,8 +1,16 @@
-// file: app/build.gradle.kts
-import java.io.ByteArrayOutputStream
-import java.util.Properties
+// =============================================================================
+// IshizukiTech LLC — SLM Integration Framework
+// File: app/build.gradle.kts
+// Author: Shu Ishizuki (石附 支)
+// License: MIT License
+// © 2026 IshizukiTech LLC. All rights reserved.
+// =============================================================================
+
 import org.gradle.api.GradleException
 import org.gradle.api.tasks.Exec
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.io.ByteArrayOutputStream
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -34,33 +42,33 @@ val localProps: Properties = Properties().apply {
  *  1) Gradle project property: -Pname=value  OR  ~/.gradle/gradle.properties
  *  2) local.properties (developer-local)
  *  3) default
- *
- * This keeps CI reproducible while allowing local convenience overrides.
  */
-fun prop(name: String, default: String = ""): String =
-    (project.findProperty(name) as String?)
-        ?.takeIf { it.isNotBlank() }
-        ?: localProps.getProperty(name)
-            ?.takeIf { it.isNotBlank() }
-        ?: default
+fun prop(name: String, default: String = ""): String {
+    val fromGradle = project.findProperty(name)?.toString()?.trim().orEmpty()
+    if (fromGradle.isNotBlank()) return fromGradle
+
+    val fromLocal = localProps.getProperty(name)?.trim().orEmpty()
+    if (fromLocal.isNotBlank()) return fromLocal
+
+    return default
+}
 
 /**
  * Escape a string literal for BuildConfig fields.
  *
- * This is required because buildConfigField takes a raw Java literal string,
- * not a Kotlin string.
+ * buildConfigField expects a Java literal (quoted), not a Kotlin string.
  */
 fun quote(v: String): String = "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
 /**
  * Sanitize versionName for Android + Git tags:
  * - Must not contain spaces
- * - Keep it short and predictable for log aggregation
+ * - Keep it short and predictable
  */
 fun sanitizeVersionName(raw: String): String =
     raw.trim()
-        .replace("\\s+".toRegex(), "") // versionName must be tag-safe
-        .take(64) // defensive bound to avoid insane strings
+        .replace("\\s+".toRegex(), "")
+        .take(64)
 
 /**
  * Resolve versionName with explicit precedence:
@@ -70,7 +78,7 @@ fun sanitizeVersionName(raw: String): String =
  *  4) fallback
  */
 fun resolveVersionName(): String {
-    val fromGradle = (project.findProperty("app.versionName") as String?)?.trim()
+    val fromGradle = project.findProperty("app.versionName")?.toString()?.trim()
     val fromEnv = System.getenv("CI_APP_VERSION_NAME")?.trim()
     val fromLocal = prop("app.versionName").trim()
 
@@ -87,11 +95,11 @@ fun resolveVersionName(): String {
  * Resolve versionCode with explicit precedence:
  *  1) -Papp.versionCode=...
  *  2) env CI_VERSION_CODE
- *  3) env GITHUB_RUN_NUMBER (nice CI default)
+ *  3) env GITHUB_RUN_NUMBER
  *  4) fallback
  */
 fun resolveVersionCode(): Int {
-    val fromGradle = (project.findProperty("app.versionCode") as String?)?.toIntOrNull()
+    val fromGradle = project.findProperty("app.versionCode")?.toString()?.toIntOrNull()
     val fromEnv = System.getenv("CI_VERSION_CODE")?.toIntOrNull()
     val fromRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
     return fromGradle ?: fromEnv ?: fromRunNumber ?: 1
@@ -101,24 +109,10 @@ fun resolveVersionCode(): Int {
  * Setup tasks (Submodule / Model download)
  * ========================================================================== */
 
-/**
- * Initialize git submodules recursively.
- *
- * Behavior:
- * - Only runs when the expected submodule directory is missing/empty.
- * - Fails in CI (so you immediately see the root cause).
- * - Warns locally (so devs can still open the project even if git is weird).
- *
- * Notes:
- * - IMPORTANT: Use rootProject paths (submodules usually live at repo root).
- * - IMPORTANT: Always ignore exit value so we can print captured output,
- *   then fail with a clear GradleException.
- */
 tasks.register<Exec>("checkSubmodule") {
     description = "Recursively initialize the native submodule if not yet set up"
     group = "setup"
 
-    // Root-based path (NOT app/).
     val subDir = rootProject.layout.projectDirectory.dir("nativelib/whisper_core").asFile
 
     val out = ByteArrayOutputStream()
@@ -130,13 +124,16 @@ tasks.register<Exec>("checkSubmodule") {
         missing
     }
 
+    doFirst {
+        out.reset()
+        err.reset()
+    }
+
     workingDir = rootProject.projectDir
     commandLine("git", "submodule", "update", "--init", "--recursive")
     environment("GIT_TERMINAL_PROMPT", "0")
 
-    // Always ignore so doLast can print buffered logs.
     isIgnoreExitValue = true
-
     standardOutput = out
     errorOutput = err
 
@@ -157,19 +154,6 @@ tasks.register<Exec>("checkSubmodule") {
     }
 }
 
-/**
- * Download models via a project-local script.
- *
- * Controls:
- * - Skip via -PskipModelDownload=true (recommended for CI if already handled)
- * - Skip via env SKIP_MODEL_DOWNLOAD=1
- *
- * Notes:
- * - The script should be idempotent (download only missing files).
- * - Token can be forwarded via env HF_TOKEN when needed.
- * - We look for the script in app/ first, then repo root as a fallback.
- * - Always ignore exit value so we can print captured output, then fail clearly.
- */
 tasks.register<Exec>("downloadModel") {
     description = "Run the model download script safely"
     group = "setup"
@@ -179,7 +163,7 @@ tasks.register<Exec>("downloadModel") {
     val script = when {
         scriptInModule.exists() -> scriptInModule
         scriptInRoot.exists() -> scriptInRoot
-        else -> scriptInModule // placeholder; onlyIf will skip
+        else -> scriptInModule
     }
 
     val out = ByteArrayOutputStream()
@@ -201,28 +185,24 @@ tasks.register<Exec>("downloadModel") {
     }
 
     doFirst {
+        out.reset()
+        err.reset()
+
         if (!script.canExecute()) {
             logger.lifecycle("🔧 Adding execute permission to download_models.sh")
             script.setExecutable(true)
         }
 
-        /**
-         * Forward tokens as environment variables if your script expects them.
-         * This keeps the script logic simple and CI-friendly.
-         */
         val hfToken = prop("HF_TOKEN").trim()
         if (hfToken.isNotBlank()) {
             environment("HF_TOKEN", hfToken)
         }
     }
 
-    // Run from the directory that contains the script.
     workingDir = script.parentFile
     commandLine("bash", script.absolutePath)
 
-    // Always ignore so doLast can print buffered logs.
     isIgnoreExitValue = true
-
     standardOutput = out
     errorOutput = err
 
@@ -243,12 +223,30 @@ tasks.register<Exec>("downloadModel") {
 /**
  * Ensure setup tasks run before Android preBuild.
  *
- * This guarantees:
- * - native submodule is present
- * - model assets are available (unless explicitly skipped)
+ * Note:
+ * - preBuild is broad. If you want tighter control, also wire to
+ *   preDebugBuild / preReleaseBuild, but preBuild is enough for most cases.
  */
 tasks.named("preBuild").configure {
     dependsOn("checkSubmodule", "downloadModel")
+}
+
+/* ============================================================================
+ * Kotlin compiler settings (Kotlin 2.3+ safe)
+ * ========================================================================== */
+
+kotlin {
+    // Use the toolchain to keep Gradle/Kotlin consistent on all machines/CI.
+    jvmToolchain(17)
+
+    // Kotlin 2.0+ recommended DSL; avoids kotlinOptions { jvmTarget = "17" } errors.
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+
+        // Optional (leave commented unless you want strictness):
+        // allWarningsAsErrors.set(true)
+        // freeCompilerArgs.addAll(listOf("-Xjsr305=strict"))
+    }
 }
 
 /* ============================================================================
@@ -256,10 +254,6 @@ tasks.named("preBuild").configure {
  * ========================================================================== */
 
 android {
-    /**
-     * Single source of truth for appId (override via local.properties: appId=...).
-     * Keep namespace aligned unless you have a deliberate reason to split them.
-     */
     val appId = prop("appId", "com.negi.survey")
 
     namespace = appId
@@ -270,50 +264,26 @@ android {
         minSdk = 26
         targetSdk = 36
 
-        /**
-         * Versioning:
-         * - versionName is a tag-safe string intended to match CI release tags.
-         * - versionCode is a monotonically increasing int (Play Store requirement).
-         */
         val resolvedVersionName = resolveVersionName()
         val resolvedVersionCode = resolveVersionCode()
 
         versionName = resolvedVersionName
         versionCode = resolvedVersionCode
 
-        /**
-         * Human-readable display version for UI/logs.
-         * Always use quote(...) to avoid breaking BuildConfig on special chars.
-         */
         val displayVersion = "$resolvedVersionName with WhisperCpp"
         buildConfigField("String", "DISPLAY_VERSION", quote(displayVersion))
 
-        /** AndroidX Test Runner (required for Orchestrator). */
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        /**
-         * Instrumentation args to reduce flakiness on Android 14+:
-         * - clearPackageData: isolates state between tests (good with Orchestrator)
-         * - useTestStorageService: avoids legacy external storage behavior
-         * - numShards=1: prevents accidental parallel sharding unless explicitly overridden
-         */
         testInstrumentationRunnerArguments["clearPackageData"] = "true"
         testInstrumentationRunnerArguments["useTestStorageService"] = "true"
         testInstrumentationRunnerArguments["numShards"] = "1"
     }
 
-    /** Always run androidTest against the debug build (stable applicationId). */
     testBuildType = "debug"
 
     testOptions {
-        /**
-         * ANDROIDX_TEST_ORCHESTRATOR:
-         * - each test runs in its own Instrumentation instance
-         * - drastically reduces shared-state flakiness
-         */
         execution = "ANDROIDX_TEST_ORCHESTRATOR"
         animationsDisabled = true
-        // unitTests.isIncludeAndroidResources = true
     }
 
     buildFeatures {
@@ -321,52 +291,51 @@ android {
         compose = true
     }
 
+    // Keep Java 17 aligned with Kotlin toolchain.
     compileOptions {
-        /** Keep Java 17 toolchain consistent with Kotlin jvmTarget. */
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-        // freeCompilerArgs += listOf("-Xjvm-default=all", "-Xjsr305=strict")
-    }
-
     buildTypes {
+        val ghOwner = prop("gh.owner")
+        val ghRepo = "SurveyExports"
+        val ghBranch = "main"
+        val ghPathPrefix = ""
+
         debug {
-            /** Avoid applicationIdSuffix to keep MediaStore ownership stable. */
-            buildConfigField("String", "GH_OWNER", quote(prop("gh.owner")))
-            buildConfigField("String", "GH_REPO", quote("SurveyExports"))
-            buildConfigField("String", "GH_BRANCH", quote("main"))
-            buildConfigField("String", "GH_PATH_PREFIX", quote(""))
+            buildConfigField("String", "GH_OWNER", quote(ghOwner))
+            buildConfigField("String", "GH_REPO", quote(ghRepo))
+            buildConfigField("String", "GH_BRANCH", quote(ghBranch))
+            buildConfigField("String", "GH_PATH_PREFIX", quote(ghPathPrefix))
+
+            // WARNING: Debug-only secrets. Do not ship these in release APKs.
             buildConfigField("String", "GH_TOKEN", quote(prop("gh.token")))
             buildConfigField("String", "HF_TOKEN", quote(prop("HF_TOKEN")))
         }
+
         release {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            buildConfigField("String", "GH_OWNER", quote(prop("gh.owner")))
-            buildConfigField("String", "GH_REPO", quote("SurveyExports"))
-            buildConfigField("String", "GH_BRANCH", quote("main"))
-            buildConfigField("String", "GH_PATH_PREFIX", quote(""))
-            buildConfigField("String", "GH_TOKEN", quote(prop("gh.token")))
-            buildConfigField("String", "HF_TOKEN", quote(prop("HF_TOKEN")))
 
-            /**
-             * Debug signing for CI/dev convenience.
-             * For production distribution, switch to a proper release keystore.
-             */
+            buildConfigField("String", "GH_OWNER", quote(ghOwner))
+            buildConfigField("String", "GH_REPO", quote(ghRepo))
+            buildConfigField("String", "GH_BRANCH", quote(ghBranch))
+            buildConfigField("String", "GH_PATH_PREFIX", quote(ghPathPrefix))
+
+            // SECURITY DEFAULT:
+            // Keep release tokens empty unless you deliberately ship upload in release.
+            buildConfigField("String", "GH_TOKEN", quote(prop("gh.token", "")))
+            buildConfigField("String", "HF_TOKEN", quote(prop("HF_TOKEN", "")))
+
+            // Debug signing for CI/dev convenience.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
 
-    /**
-     * Broad META-INF excludes to avoid conflicts among OkHttp/Coroutines/Media3/MediaPipe, etc.
-     * Prefer excludes over pickFirst to reduce hidden runtime surprises.
-     */
     packaging {
         resources {
             excludes += setOf(
@@ -454,7 +423,7 @@ dependencies {
     // SAF (androidTest uses DocumentFile)
     androidTestImplementation(libs.androidx.documentfile)
 
-    // Test libs
+    // Unit tests
     testImplementation(libs.junit)
     testImplementation(libs.mockk)
     testImplementation(libs.kotlinx.coroutines.test)
@@ -517,7 +486,7 @@ tasks.register("checkSingleConnectedDevice") {
         process.waitFor()
 
         val lines = out.lineSequence()
-            .drop(1) // skip header
+            .drop(1)
             .map { it.trim() }
             .filter { it.isNotEmpty() && it.contains("\tdevice") }
             .toList()

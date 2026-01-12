@@ -32,13 +32,13 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.negi.survey.BuildConfig
 import com.negi.survey.utils.HeavyInitializer
-import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /* ───────────────────────────── Download State ───────────────────────────── */
 
@@ -398,6 +398,25 @@ class AppViewModel(
 /* ───────────────────────────── UI Gate ───────────────────────────── */
 
 /**
+ * Format bytes into a compact human-readable string (KiB/MiB/GiB).
+ */
+private fun formatBytes(bytes: Long): String {
+    val b = bytes.coerceAtLeast(0L).toDouble()
+    val units = arrayOf("B", "KiB", "MiB", "GiB", "TiB")
+    var v = b
+    var i = 0
+    while (v >= 1024.0 && i < units.lastIndex) {
+        v /= 1024.0
+        i++
+    }
+    return if (i == 0) {
+        "${v.toLong()} ${units[i]}"
+    } else {
+        String.format(java.util.Locale.US, "%.1f %s", v, units[i])
+    }
+}
+
+/**
  * UI gate that blocks entry into the SLM-dependent flow until
  * the model file is available locally.
  *
@@ -429,11 +448,16 @@ fun DownloadGate(
         }
 
         is DlState.Downloading -> {
-            val got = state.downloaded
-            val total = state.total
+            val got = state.downloaded.coerceAtLeast(0L)
+            val total = state.total?.takeIf { it > 0L }
 
-            val pct: Int? = total?.let { t ->
-                if (t > 0L) ((got * 100.0) / t.toDouble()).toInt().coerceIn(0, 100) else null
+            // Compute progress once; derive pct from it.
+            val progress: Float? = total?.let { t ->
+                (got.toDouble() / t.toDouble()).toFloat().coerceIn(0f, 1f)
+            }
+
+            val pct: Int? = progress?.let { p ->
+                (p * 100f).toInt().coerceIn(0, 100)
             }
 
             Column(
@@ -445,19 +469,21 @@ fun DownloadGate(
                 Text("Downloading the target SLM…")
                 Spacer(Modifier.height(12.dp))
 
-                if (pct != null && total != null) {
+                if (progress != null && pct != null) {
+                    // Material3: use lambda overload (progress: () -> Float)
                     LinearProgressIndicator(
-                        progress = (pct / 100f).coerceIn(0f, 1f),
+                        progress = { progress },
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
-                    Text("$pct%  ($got / $total bytes)")
+                    Text("$pct%  (${formatBytes(got)} / ${formatBytes(total)})")
                 } else {
+                    // Indeterminate when total is unknown
                     LinearProgressIndicator(
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
-                    Text("$got bytes")
+                    Text(formatBytes(got))
                 }
             }
         }

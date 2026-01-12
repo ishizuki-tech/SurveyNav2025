@@ -42,11 +42,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.material.icons.Icons
@@ -80,11 +85,9 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
@@ -93,6 +96,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.NavBackStack
@@ -136,6 +140,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.GZIPOutputStream
+import kotlin.system.exitProcess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -143,7 +148,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.system.exitProcess
 
 /**
  * Root activity of the SurveyNav app.
@@ -169,20 +173,22 @@ class MainActivity : ComponentActivity() {
 
         /**
          * Prefer the modern edge-to-edge API.
-         * Fall back to legacy insets handling on older or vendor-modified devices.
+         *
+         * NOTE:
+         * - On Android 15+, setting statusBarColor/navigationBarColor is deprecated and often ignored.
+         * - We keep system bars transparent and draw the desired "backplate" behind them in Compose.
          */
         try {
             enableEdgeToEdge(
-                statusBarStyle = SystemBarStyle.dark("#000000".toColorInt()),
-                navigationBarStyle = SystemBarStyle.dark("#000000".toColorInt())
+                statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+                navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
             )
         } catch (_: Throwable) {
+            // Legacy fallback: still keep edge-to-edge and control icon appearance via insets controller.
             WindowCompat.setDecorFitsSystemWindows(window, false)
             val controller = WindowInsetsControllerCompat(window, window.decorView)
             controller.isAppearanceLightStatusBars = false
             controller.isAppearanceLightNavigationBars = false
-            window.statusBarColor = 0xFF000000.toInt()
-            window.navigationBarColor = 0xFF000000.toInt()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 runCatching { window.isNavigationBarContrastEnforced = false }
             }
@@ -190,13 +196,70 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme {
-                AppNav()
+                SystemBarsBackplate(
+                    statusBarColor = Color.Black,
+                    navigationBarColor = Color.Black
+                ) {
+                    AppNav()
+                }
             }
         }
     }
 }
 
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
+
+/**
+ * Draw a solid background behind the system bar insets.
+ *
+ * This avoids deprecated status/navigation bar color APIs and matches the Android 15+ edge-to-edge model:
+ * keep system bars transparent, and render your own backplate behind them.
+ */
+@Composable
+private fun SystemBarsBackplate(
+    statusBarColor: Color,
+    navigationBarColor: Color,
+    content: @Composable () -> Unit
+) {
+    // Compute inset heights without windowInsetsHeight() (works on older Compose versions).
+    val statusBarHeight = WindowInsets.statusBars
+        .asPaddingValues()
+        .calculateTopPadding()
+
+    val navBarHeight = WindowInsets.navigationBars
+        .asPaddingValues()
+        .calculateBottomPadding()
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Status bar backplate.
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(statusBarHeight)
+                .background(statusBarColor)
+                .align(Alignment.TopCenter)
+        )
+
+        // Navigation bar backplate.
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(navBarHeight)
+                .background(navigationBarColor)
+                .align(Alignment.BottomCenter)
+        )
+
+        // App content.
+        // Use systemBars padding for maximum compatibility across Compose versions.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(WindowInsets.systemBars.asPaddingValues())
+        ) {
+            content()
+        }
+    }
+}
 
 /**
  * A simple vertical gradient used as a dark backplate behind loading/error cards.
@@ -878,6 +941,9 @@ fun SurveyNavHost(
 
     val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
 
+    // IMPORTANT:
+    // Avoid Kotlin inferring an intersection type (ViewModel & SpeechController) for reified viewModel().
+    // Always request the concrete ViewModel type explicitly, then upcast to SpeechController.
     val speechController: SpeechController = if (voiceEnabled) {
         val assetPath = remember(whisperMeta.assetModelPath) {
             whisperMeta.assetModelPath?.ifBlank { null } ?: DEFAULT_WHISPER_ASSET_MODEL
@@ -886,7 +952,7 @@ fun SurveyNavHost(
             whisperMeta.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_WHISPER_LANGUAGE
         }
 
-        viewModel(
+        val speechVm: WhisperSpeechController = viewModel(
             viewModelStoreOwner = owner,
             key = "WhisperSpeechController_${vmSurvey.hashCode()}_${assetPath}_$lang",
             factory = WhisperSpeechController.provideFactory(
@@ -920,6 +986,8 @@ fun SurveyNavHost(
                 }
             )
         )
+
+        speechVm
     } else {
         remember { NoOpSpeechController() }
     }

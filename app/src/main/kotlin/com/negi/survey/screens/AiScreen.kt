@@ -33,11 +33,12 @@
  */
 
 @file:Suppress("MemberVisibilityCanBePrivate")
+@file:OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
 
 package com.negi.survey.screens
 
 import android.annotation.SuppressLint
-import android.util.Log
+import android.content.ClipData
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -57,20 +58,21 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -117,16 +119,16 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
 import kotlinx.coroutines.delay
@@ -134,10 +136,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
-import kotlin.collections.ArrayDeque
+import kotlinx.serialization.json.JsonObject
 
 /* =============================================================================
  * AI Evaluation Screen — Monotone × Glass × Chat
@@ -146,13 +147,6 @@ import kotlin.collections.ArrayDeque
 
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
- *
- * Implementations are expected to:
- *  - Expose recording state, transcription state, and latest recognized text
- *    as [StateFlow]s.
- *  - Provide [startRecording] and [stopRecording] controls.
- *  - Optionally rely on [toggleRecording] as a convenience entry point.
- *  - Accept optional context for export naming/correlation.
  */
 interface SpeechController {
 
@@ -170,14 +164,6 @@ interface SpeechController {
 
     /**
      * Update the context used for correlating speech with the survey run.
-     *
-     * Implementations that export voice files may embed these values into
-     * file names or sidecar metadata.
-     *
-     * Default implementation is a no-op so non-export controllers remain valid.
-     *
-     * @param surveyId UUID of the active survey run.
-     * @param questionId Node ID for the current question.
      */
     fun updateContext(
         surveyId: String?,
@@ -194,9 +180,6 @@ interface SpeechController {
 
     /**
      * Convenience toggle that switches between start/stop.
-     *
-     * This method reads [isRecording.value] directly. Implementations should
-     * ensure their [StateFlow] values are updated promptly to avoid UI drift.
      */
     fun toggleRecording() {
         if (isRecording.value) stopRecording() else startRecording()
@@ -206,25 +189,12 @@ interface SpeechController {
 /**
  * Full-screen AI evaluation screen bound to a single survey node.
  *
- * This composable:
- *  - Reads the question text and persisted answer for [nodeId] from [vmSurvey].
- *  - Streams AI evaluation and renders it as chat bubbles via [vmAI].
- *  - Updates survey answer and follow-up questions back into [vmSurvey].
- *  - Manages IME focus, background tap-to-dismiss, and auto-scrolling.
- *  - Optionally integrates a [SpeechController] to allow microphone-based
- *    answer input.
- *
- * The screen does not perform any AI logic itself; all evaluation is delegated
- * to [AiViewModel.evaluateAsync].
- *
- * @param nodeId Graph node identifier for the current AI question.
- * @param vmSurvey Survey-level ViewModel providing questions and answers.
- * @param vmAI AI-specific ViewModel for streaming and chat state.
- * @param onNext Callback invoked when the user presses the "Next" button.
- * @param onBack Callback invoked when the user presses the "Back" button.
- * @param speechController Optional speech controller backing the composer mic.
+ * IME stability notes:
+ * - Do NOT apply imePadding to both Scaffold content and bottomBar.
+ * - Apply imePadding only once to the composer container.
+ * - Keep chat area in a weight(1f) container so it naturally shrinks.
  */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalSerializationApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AiScreen(
     nodeId: String,
@@ -243,35 +213,13 @@ fun AiScreen(
     // Survey state
     // ---------------------------------------------------------------------
 
-    /**
-     * Question text stream for this node.
-     *
-     * We default the initial state to the ViewModel snapshot to avoid a
-     * transient blank state when the Flow is still cold.
-     */
     val question by remember(vmSurvey, nodeId) {
         vmSurvey.questions.map { it[nodeId].orEmpty() }
     }.collectAsState(initial = vmSurvey.getQuestion(nodeId))
 
-    /**
-     * Session id increments when the survey is reset. Used to scope local UI
-     * memory so previous run artifacts do not leak into a new run.
-     */
     val sessionId by vmSurvey.sessionId.collectAsState()
-
-    /**
-     * Stable UUID for the active survey run.
-     *
-     * This is the preferred identifier for export correlation and should
-     * be propagated to any speech controller that writes voice files.
-     */
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
 
-    /**
-     * Keep speech controller context in sync with the active survey run + node.
-     *
-     * This allows voice exports to embed a stable UUID/question association.
-     */
     LaunchedEffect(nodeId, sessionId, surveyUuid, speechController) {
         speechController?.updateContext(
             surveyId = surveyUuid,
@@ -293,12 +241,6 @@ fun AiScreen(
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
 
-    /**
-     * Text field should be disabled while recording or transcribing.
-     *
-     * This prevents the user from fighting with live STT updates and keeps
-     * the state machine simple: either the user types or the mic owns input.
-     */
     val textFieldEnabled = !speechRecording && !speechTranscribing
 
     val speechStatusText: String? = when {
@@ -319,12 +261,6 @@ fun AiScreen(
     val error by vmAI.error.collectAsState()
     val followup by vmAI.followupQuestion.collectAsState()
 
-    /**
-     * Chat history for this node.
-     *
-     * This is a ViewModel-backed stream to ensure chat remains stable across
-     * recompositions and survives configuration changes.
-     */
     val chat by remember(vmAI, nodeId) { vmAI.chatFlow(nodeId) }.collectAsState()
 
     // ---------------------------------------------------------------------
@@ -340,10 +276,8 @@ fun AiScreen(
     }
 
     /**
-     * Local composer value scoped by (nodeId, sessionId).
-     *
-     * This ensures a brand-new survey run does not inherit draft input from
-     * a previous run, even if the screen object is still in memory.
+     * Composer is scoped by (nodeId, sessionId) to prevent state leakage
+     * across survey resets.
      */
     var composer by remember(nodeId, sessionId) {
         mutableStateOf(vmSurvey.getAnswer(nodeId))
@@ -353,7 +287,7 @@ fun AiScreen(
     val scroll = rememberScrollState()
 
     /**
-     * Sync composer with persisted Survey answers at node/session boundaries.
+     * Keep composer aligned with persisted answers on node/session changes.
      */
     LaunchedEffect(nodeId, sessionId) {
         composer = vmSurvey.getAnswer(nodeId)
@@ -363,21 +297,15 @@ fun AiScreen(
     // Seed and focus behavior
     // ---------------------------------------------------------------------
 
-    /**
-     * Ensure the first AI bubble contains the question and request focus.
-     *
-     * We intentionally keep the keyboard open to support rapid iterative
-     * answering when the AI asks follow-up questions.
-     */
     LaunchedEffect(nodeId, question) {
         vmAI.chatEnsureSeedQuestion(nodeId, question)
+    }
+
+    LaunchedEffect(nodeId, sessionId) {
         focusRequester.requestFocus()
         keyboard?.show()
     }
 
-    /**
-     * Surface AI errors as snackbars.
-     */
     LaunchedEffect(error) {
         error?.let { snack.showSnackbar(it) }
     }
@@ -387,7 +315,7 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     /**
-     * Maintain/update typing bubble during streaming.
+     * Update typing bubble while streaming.
      */
     LaunchedEffect(loading, stream) {
         if (loading) {
@@ -405,7 +333,7 @@ fun AiScreen(
     }
 
     /**
-     * Replace typing bubble with pretty JSON when the final result arrives.
+     * Replace typing bubble with final JSON when raw arrives and loading ends.
      */
     LaunchedEffect(raw, loading) {
         if (!raw.isNullOrBlank() && !loading) {
@@ -422,8 +350,7 @@ fun AiScreen(
     }
 
     /**
-     * If streaming stops without a final raw result (cancel/error),
-     * ensure the typing bubble is removed to avoid "stuck typing" UX.
+     * If we stop loading without raw (cancel/error), ensure typing bubble is removed.
      */
     LaunchedEffect(loading, raw) {
         if (!loading && raw.isNullOrBlank()) {
@@ -435,15 +362,8 @@ fun AiScreen(
     // Follow-up persistence
     // ---------------------------------------------------------------------
 
-    /**
-     * Track the last follow-up appended by this screen instance to avoid
-     * re-appending a stable follow-up on recomposition.
-     */
     var lastFollowupLocal by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
 
-    /**
-     * Append follow-up question when AI is idle; also persist to SurveyViewModel.
-     */
     LaunchedEffect(followup, loading) {
         val fu = followup
         if (fu != null && !loading && fu != lastFollowupLocal) {
@@ -469,26 +389,18 @@ fun AiScreen(
     var wasTranscribing by remember(nodeId, sessionId) { mutableStateOf(false) }
     var lastCommitted by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
 
-    /**
-     * Commit recognized speech only when an utterance finishes.
-     *
-     * Design choice:
-     * - When a new utterance begins, we clear the current composer and
-     *   persisted answer for this node. This favors "speech owns the answer"
-     *   semantics and prevents accidental concatenation of multiple utterances.
-     *
-     * If you want a "speech appends to typed draft" experience instead,
-     * remove the clear step and append the final text to [composer].
-     */
     LaunchedEffect(speechRecording, speechTranscribing, speechPartial) {
         if (speechController == null) return@LaunchedEffect
 
         val startedThisUtterance =
-            (!wasRecording && !wasTranscribing) &&
-                    (speechRecording || speechTranscribing)
+            (!wasRecording && !wasTranscribing) && (speechRecording || speechTranscribing)
 
         if (startedThisUtterance) {
             composer = ""
+            /**
+             * Keep the persisted answer aligned with speech ownership.
+             * This is safe because it only happens when speech starts.
+             */
             vmSurvey.clearAnswer(nodeId)
             lastCommitted = null
         }
@@ -516,7 +428,7 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     /**
-     * Auto-scroll to bottom when chat size changes.
+     * Animate to bottom when chat grows (new bubbles).
      */
     LaunchedEffect(chat.size) {
         delay(16)
@@ -524,10 +436,10 @@ fun AiScreen(
     }
 
     /**
-     * Keep view pinned to the bottom while streaming grows.
+     * While streaming, keep pinned (non-animated) to reduce jank.
      */
     LaunchedEffect(stream, loading) {
-        if (loading) {
+        if (loading && stream.isNotBlank()) {
             delay(24)
             scroll.scrollTo(scroll.maxValue)
         }
@@ -538,10 +450,18 @@ fun AiScreen(
     // ---------------------------------------------------------------------
 
     /**
-     * Submit current answer and trigger AI evaluation.
-     *
-     * This keeps IME open for rapid back-and-forth rounds.
+     * Avoid persisting the "post-send clear" into Survey answers.
      */
+    var suppressNextPersist by remember(nodeId, sessionId) { mutableStateOf(false) }
+
+    fun persistComposerIfAllowed(text: String) {
+        if (suppressNextPersist) {
+            suppressNextPersist = false
+            return
+        }
+        vmSurvey.setAnswer(text, nodeId)
+    }
+
     fun submit() {
         val answer = composer.trim()
         if (answer.isBlank() || loading) return
@@ -562,11 +482,10 @@ fun AiScreen(
         scope.launch {
             val q = vmSurvey.getQuestion(nodeId)
             val prompt = vmSurvey.getPrompt(nodeId, q, answer)
-            Log.d("AiScreen", "Submitting: $prompt")
             vmAI.evaluateAsync(prompt)
         }
 
-        // Clear only the local composer to show immediate "sent" feedback.
+        suppressNextPersist = true
         composer = ""
     }
 
@@ -576,32 +495,80 @@ fun AiScreen(
 
     val bgBrush = animatedMonotoneBackplate()
 
+    /**
+     * IME-safe layout:
+     * - No Scaffold bottomBar (avoids double insets)
+     * - Composer is part of content and receives imePadding exactly once
+     */
     Scaffold(
         topBar = { CompactTopBar(title = "Question • $nodeId") },
-        snackbarHost = { SnackbarHost(snack) },
-        /**
-         * Keep window inset handling centralized so different Compose versions
-         * can be supported by swapping this value if needed.
-         */
-        contentWindowInsets = zeroInsetsSafe(),
-        bottomBar = {
+        snackbarHost = { SnackbarHost(snack) }
+    ) { pad ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(bgBrush)
+                // Apply Scaffold padding ONCE for this screen.
+                .padding(pad)
+                .pointerInput(Unit) {
+                    detectTapGestures {
+                        focusManager.clearFocus(force = true)
+                        keyboard?.hide()
+                    }
+                }
+        ) {
+            // Chat area: occupies remaining space and shrinks naturally on IME.
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                    .verticalScroll(scroll),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                chat.forEach { m ->
+                    val isAi = m.sender != AiViewModel.ChatSender.USER
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
+                    ) {
+                        if (m.json != null) {
+                            JsonBubbleMono(pretty = m.json, snack = snack)
+                        } else {
+                            BubbleMono(
+                                text = m.text.orEmpty(),
+                                isAi = isAi,
+                                isTyping = m.isTyping
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Composer area: apply IME + navigation bars padding here only.
             Surface(
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
                 tonalElevation = 4.dp,
                 shadowElevation = 8.dp,
-                modifier = Modifier.neutralEdge(alpha = 0.14f, corner = 16.dp, stroke = 1.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .neutralEdge(alpha = 0.14f, corner = 16.dp, stroke = 1.dp)
+                    .imePadding()
+                    .navigationBarsPadding()
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .windowInsetsPadding(WindowInsets.ime)
                         .padding(top = 6.dp)
                 ) {
                     ChatComposer(
                         value = composer,
                         onValueChange = {
                             composer = it
-                            vmSurvey.setAnswer(it, nodeId)
+                            /**
+                             * Persist draft input unless the clear was initiated by submit().
+                             */
+                            persistComposerIfAllowed(it)
                         },
                         onSend = ::submit,
                         enabled = textFieldEnabled && !loading,
@@ -632,9 +599,7 @@ fun AiScreen(
                                 vmAI.resetStates()
                                 onBack()
                             }
-                        ) {
-                            Text("Back")
-                        }
+                        ) { Text("Back") }
 
                         Spacer(Modifier.weight(1f))
 
@@ -643,60 +608,13 @@ fun AiScreen(
                                 vmAI.resetStates()
                                 onNext()
                             }
-                        ) {
-                            Text("Next")
-                        }
-                    }
-                }
-            }
-        }
-    ) { pad ->
-        Column(
-            modifier = Modifier
-                .padding(pad)
-                .fillMaxSize()
-                .background(bgBrush)
-                .pointerInput(Unit) {
-                    detectTapGestures {
-                        focusManager.clearFocus(force = true)
-                        keyboard?.hide()
-                    }
-                }
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .verticalScroll(scroll),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                chat.forEach { m ->
-                    val isAi = m.sender != AiViewModel.ChatSender.USER
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
-                    ) {
-                        if (m.json != null) {
-                            JsonBubbleMono(pretty = m.json, snack = snack)
-                        } else {
-                            BubbleMono(
-                                text = m.text.orEmpty(),
-                                isAi = isAi,
-                                isTyping = m.isTyping
-                            )
-                        }
+                        ) { Text("Next") }
                     }
                 }
             }
         }
     }
 
-    /**
-     * Clear transient AI state when leaving this screen.
-     *
-     * Chat history is intentionally preserved inside [AiViewModel].
-     */
     DisposableEffect(Unit) {
         onDispose { vmAI.resetStates() }
     }
@@ -704,12 +622,6 @@ fun AiScreen(
 
 /* ───────────────────────────── Top bar ─────────────────────────────────── */
 
-/**
- * Minimal top bar for the AI screen.
- *
- * @param title Display title for the current node.
- * @param height Height of the bar content area.
- */
 @Composable
 private fun CompactTopBar(
     title: String,
@@ -727,7 +639,7 @@ private fun CompactTopBar(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(topBrush)
-                .windowInsetsPadding(WindowInsets.statusBars)
+                .statusBarsPadding()
                 .height(height)
                 .padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -744,14 +656,6 @@ private fun CompactTopBar(
 
 /* ───────────────────────────── Chat bubbles ─────────────────────────────── */
 
-/**
- * Monotone chat bubble with a subtle glass edge and micro-tail.
- *
- * @param text Bubble text content.
- * @param isAi True for AI/system bubbles, false for user bubbles.
- * @param isTyping True when this bubble is a typing indicator.
- * @param maxWidth Maximum visual width for a bubble.
- */
 @Composable
 private fun BubbleMono(
     text: String,
@@ -856,8 +760,6 @@ private fun BubbleMono(
 
 /**
  * Three-dot typing indicator for AI bubbles.
- *
- * @param color Base color for dots.
  */
 @Composable
 private fun TypingDots(color: Color) {
@@ -897,10 +799,7 @@ private fun TypingDots(color: Color) {
 }
 
 /**
- * Single dot for the typing indicator.
- *
- * @param alpha Current animated alpha.
- * @param color Base color.
+ * Single dot for typing indicator.
  */
 @Composable
 private fun Dot(alpha: Float, color: Color) {
@@ -913,13 +812,6 @@ private fun Dot(alpha: Float, color: Color) {
 
 /* ───────────────────────────── JSON bubble ──────────────────────────────── */
 
-/**
- * Compact JSON result bubble with expand/collapse and copy action.
- *
- * @param pretty Pretty-printed JSON, or raw fallback text.
- * @param collapsedMaxHeight Max height for the collapsed preview.
- * @param snack Optional snackbar host for UX feedback on copy.
- */
 @Composable
 private fun JsonBubbleMono(
     pretty: String,
@@ -928,11 +820,15 @@ private fun JsonBubbleMono(
 ) {
     var expanded by remember { mutableStateOf(false) }
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboardManager.current
-    val scope = rememberCoroutineScope()
-    val clip = RoundedCornerShape(10.dp)
 
-    val headerScore = remember(pretty) { FollowupExtractor.extractScore(pretty) }
+    /**
+     * Clipboard API (suspend-friendly).
+     */
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+
+    val clip = RoundedCornerShape(10.dp)
+    val score = remember(pretty) { extractScoreFallback(pretty) }
     val previewText = remember(pretty) { buildJsonPreview(pretty) }
 
     Surface(
@@ -965,7 +861,7 @@ private fun JsonBubbleMono(
                     .padding(horizontal = 10.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val scoreText = headerScore?.let { "$it / 100" } ?: "—"
+                val scoreText = score?.let { "$it / 100" } ?: "—"
                 Text(
                     text = if (expanded) {
                         "Result JSON  •  Score $scoreText  (tap to collapse)"
@@ -976,10 +872,21 @@ private fun JsonBubbleMono(
                     color = cs.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
                 )
+
                 IconButton(
                     onClick = {
-                        clipboard.setText(AnnotatedString(pretty))
-                        scope.launch { snack?.showSnackbar("JSON copied") }
+                        scope.launch {
+                            val ok = runCatching {
+                                clipboard.setPlainText(label = "json", text = pretty)
+                                true
+                            }.getOrElse { false }
+
+                            if (ok) {
+                                snack?.showSnackbar("JSON copied")
+                            } else {
+                                snack?.showSnackbar("Copy failed")
+                            }
+                        }
                     },
                     modifier = Modifier.size(28.dp)
                 ) {
@@ -1022,21 +929,6 @@ private fun JsonBubbleMono(
 
 /* ───────────────────────────── Composer ─────────────────────────────────── */
 
-/**
- * Chat composer row with optional microphone control.
- *
- * @param value Current composer text.
- * @param onValueChange Text change callback.
- * @param onSend Submit callback.
- * @param enabled Global enable state for user input.
- * @param focusRequester Focus requester for the text field.
- * @param speechEnabled True when a [SpeechController] is supplied.
- * @param speechRecording True while microphone capture is running.
- * @param speechTranscribing True while STT decoding is running.
- * @param speechStatusText Optional status line under the composer.
- * @param speechStatusIsError True when the status line should use the error color.
- * @param onToggleSpeech Recorder toggle callback.
- */
 @Composable
 private fun ChatComposer(
     value: String,
@@ -1085,6 +977,8 @@ private fun ChatComposer(
                 minLines = 1,
                 maxLines = 5,
                 enabled = enabled,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
                 colors = OutlinedTextFieldDefaults.colors(
                     unfocusedContainerColor = Color.Transparent,
                     focusedContainerColor = Color.Transparent,
@@ -1097,10 +991,6 @@ private fun ChatComposer(
 
             if (speechEnabled && onToggleSpeech != null) {
                 val tint = cs.onSurfaceVariant
-                /**
-                 * Mic button is disabled while transcribing to avoid overlapping
-                 * utterance sessions in controllers that do not support re-entrancy.
-                 */
                 val micEnabled = (enabled || speechRecording) && !speechTranscribing
 
                 IconButton(
@@ -1155,12 +1045,6 @@ private fun ChatComposer(
 
 /* ─────────────────────────── Visual utilities ───────────────────────────── */
 
-/**
- * Animated monotone backplate.
- *
- * This creates slow, neutral gradients that keep the screen firmly in
- * grayscale territory while still providing subtle motion cues.
- */
 @Composable
 private fun animatedMonotoneBackplate(): Brush {
     val cs = MaterialTheme.colorScheme
@@ -1192,12 +1076,7 @@ private fun animatedMonotoneBackplate(): Brush {
 
 /**
  * Draw a subtle monochrome edge highlight around a surface.
- *
- * @param alpha Base alpha of the edge gradient.
- * @param corner Corner radius used to compute the stroke rounding.
- * @param stroke Stroke width.
  */
-@Composable
 private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
     corner: Dp = 12.dp,
@@ -1220,49 +1099,41 @@ private fun Modifier.neutralEdge(
     }
 )
 
+/* ───────────────────────────── Clipboard helpers ────────────────────────── */
+
 /**
- * Provide a "zero insets" value for Scaffold in a single place.
+ * Set clipboard content as plain text using the new Clipboard API.
  *
- * Some Compose versions offer a direct constructor. If your build complains,
- * replace this with a version-appropriate alternative.
+ * The new API uses suspend functions and ClipEntry.
  */
-private fun zeroInsetsSafe(): WindowInsets {
-    return WindowInsets(0, 0, 0, 0)
+private suspend fun androidx.compose.ui.platform.Clipboard.setPlainText(label: String, text: String) {
+    setClipEntry(
+        ClipData
+            .newPlainText(label, text)
+            .toClipEntry()
+    )
 }
 
 /* ───────────────────────────── JSON helpers ─────────────────────────────── */
 
-/**
- * Try to pretty-print a JSON-like response; fall back to raw text.
- *
- * The model sometimes wraps JSON in Markdown fences or emits extra natural
- * language around it. We attempt lenient extraction of the first valid JSON
- * object/array found in the text.
- */
 private fun prettyOrRaw(json: Json, raw: String): String {
     val stripped = stripCodeFence(raw)
-    val element = parseJsonLenient(json, stripped)
-    return if (element != null) {
+    val element = parseJsonLenient(json, stripped) ?: return raw
+
+    return runCatching {
         json.encodeToString(JsonElement.serializer(), element)
-    } else {
-        raw
+    }.getOrElse {
+        // Fallback keeps a valid JSON-ish payload even if serializer variants differ.
+        element.toString()
     }
 }
 
-/**
- * Build a compact preview string for the collapsed JSON bubble.
- *
- * We prefer the three high-signal keys used by the evaluation contract:
- * - "analysis"
- * - "expected answer"
- * - "follow-up question"
- */
 private fun buildJsonPreview(pretty: String): String {
     val json = Json { ignoreUnknownKeys = true }
     val stripped = stripCodeFence(pretty)
     val element = parseJsonLenient(json, stripped)
 
-    val obj = element as? kotlinx.serialization.json.JsonObject
+    val obj = element as? JsonObject
     if (obj != null) {
         val analysis = obj["analysis"]?.toString()?.trim('"')
         val fu = obj["follow-up question"]?.toString()?.trim('"')
@@ -1273,20 +1144,13 @@ private fun buildJsonPreview(pretty: String): String {
             if (!expected.isNullOrBlank()) add("expected: $expected")
             if (!fu.isNullOrBlank()) add("follow-up: $fu")
         }
-
-        if (lines.isNotEmpty()) {
-            return lines.joinToString("\n")
-        }
+        if (lines.isNotEmpty()) return lines.joinToString("\n")
     }
 
     val t = stripped.trim()
     return if (t.length <= 180) t else t.take(180).trimEnd() + "…"
 }
 
-/**
- * Lenient JSON parser that attempts to locate the first valid JSON payload
- * in a mixed string.
- */
 private fun parseJsonLenient(json: Json, text: String): JsonElement? {
     val trimmed = text.trim()
     if (trimmed.isEmpty()) return null
@@ -1313,14 +1177,6 @@ private fun parseJsonLenient(json: Json, text: String): JsonElement? {
 private fun parseOrNull(json: Json, value: String): JsonElement? =
     runCatching { json.parseToJsonElement(value) }.getOrNull()
 
-/**
- * Strip a single Markdown code fence layer if present.
- *
- * Supports:
- *  ```json
- *  { ... }
- *  ```
- */
 private fun stripCodeFence(text: String): String {
     val t = text.trim()
     if (!t.startsWith("```")) return t
@@ -1331,11 +1187,6 @@ private fun stripCodeFence(text: String): String {
     return t.substring(contentStart, closing).trim()
 }
 
-/**
- * Find the matching closing boundary for a JSON object or array.
- *
- * This is a lightweight parser that respects string escaping rules.
- */
 private fun findMatchingJsonBoundary(text: String, start: Int): Int {
     if (start !in text.indices) return -1
     val open = text[start]
@@ -1368,80 +1219,106 @@ private fun findMatchingJsonBoundary(text: String, start: Int): Int {
     return -1
 }
 
+/**
+ * Fallback score extractor that does not rely on external helpers.
+ *
+ * Supported JSON keys:
+ * - "score": 88
+ * - "score": "88"
+ */
+private fun extractScoreFallback(text: String): Int? {
+    val t = stripCodeFence(text)
+    val regex = Regex("""(?i)"score"\s*:\s*"?(\d{1,3})"?""")
+    val m = regex.find(t) ?: return null
+    val v = m.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
+    return v.coerceIn(0, 100)
+}
+
 /* ───────────────────────────── Preview ─────────────────────────────────── */
 
 @SuppressLint("RememberInComposition")
-@Preview(showBackground = true, name = "Chat — Monotone Chic Preview")
+@Preview(showBackground = true, name = "Monotone Chat Preview")
 @Composable
 private fun ChatPreview() {
     MaterialTheme {
+        val scroll = rememberScrollState()
+        val bg = animatedMonotoneBackplate()
+
         val fake = listOf(
-            AiViewModel.ChatMsgVm(
-                id = "q",
-                sender = AiViewModel.ChatSender.AI,
-                text = "How much yield do you lose because of FAW?"
-            ),
-            AiViewModel.ChatMsgVm(
-                id = "u1",
-                sender = AiViewModel.ChatSender.USER,
-                text = "About 10% over 3 seasons."
-            ),
-            AiViewModel.ChatMsgVm(
-                id = "r1",
-                sender = AiViewModel.ChatSender.AI,
+            FakeMsg(senderAi = true, text = "How much yield do you lose because of FAW?"),
+            FakeMsg(senderAi = false, text = "About 10% over 3 seasons."),
+            FakeMsg(
+                senderAi = true,
                 json = """
-                    {
-                      "analysis": "Clear unit",
-                      "expected answer": "~10% avg loss over 3 seasons",
-                      "follow-up question": "Is 10% per season or overall?",
-                      "score": 88
-                    }
+                {
+                  "analysis": "Clear unit",
+                  "expected answer": "~10% avg loss over 3 seasons",
+                  "follow-up question": "Is 10% per season or overall?",
+                  "score": 88
+                }
                 """.trimIndent()
             ),
-            AiViewModel.ChatMsgVm(
-                id = "fu",
-                sender = AiViewModel.ChatSender.AI,
-                text = "Is that 10% per season or overall?"
-            )
+            FakeMsg(senderAi = true, text = "Is that 10% per season or overall?")
         )
-        val scroll = rememberScrollState()
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(animatedMonotoneBackplate())
-                .padding(16.dp)
-        ) {
+
+        Scaffold(
+            topBar = { CompactTopBar(title = "Question • Q1") }
+        ) { pad ->
             Column(
                 modifier = Modifier
-                    .weight(1f)
-                    .verticalScroll(scroll),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                    .fillMaxSize()
+                    .background(bg)
+                    .padding(pad)
             ) {
-                fake.forEach { m ->
-                    val isAi = m.sender != AiViewModel.ChatSender.USER
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
-                    ) {
-                        if (m.json != null) {
-                            JsonBubbleMono(pretty = m.json)
-                        } else {
-                            BubbleMono(
-                                text = m.text.orEmpty(),
-                                isAi = isAi,
-                                isTyping = false
-                            )
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                        .verticalScroll(scroll),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    fake.forEach { m ->
+                        val isAi = m.senderAi
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
+                        ) {
+                            if (m.json != null) {
+                                JsonBubbleMono(pretty = m.json)
+                            } else {
+                                BubbleMono(text = m.text.orEmpty(), isAi = isAi, isTyping = false)
+                            }
                         }
                     }
                 }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                    shadowElevation = 8.dp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .neutralEdge(alpha = 0.14f, corner = 16.dp, stroke = 1.dp)
+                ) {
+                    ChatComposer(
+                        value = "",
+                        onValueChange = {},
+                        onSend = {},
+                        enabled = true,
+                        focusRequester = FocusRequester(),
+                        speechEnabled = true,
+                        speechRecording = false,
+                        speechTranscribing = false,
+                        onToggleSpeech = {}
+                    )
+                }
             }
-            ChatComposer(
-                value = "",
-                onValueChange = {},
-                onSend = {},
-                enabled = true,
-                focusRequester = FocusRequester()
-            )
         }
     }
 }
+
+private data class FakeMsg(
+    val senderAi: Boolean,
+    val text: String? = null,
+    val json: String? = null
+)

@@ -44,7 +44,6 @@ import java.net.URL
 import java.security.MessageDigest
 import kotlin.math.max
 import kotlin.math.pow
-import kotlin.coroutines.coroutineContext
 
 /**
  * Coroutine-safe downloader for large, resumable HTTP transfers.

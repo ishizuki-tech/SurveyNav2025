@@ -27,18 +27,24 @@ import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
-import java.io.ByteArrayOutputStream
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import com.negi.survey.slm.LiteRtLM.cleanUp
+import com.negi.survey.slm.LiteRtLM.generateText
+import com.negi.survey.slm.LiteRtLM.mutex
+import com.negi.survey.slm.LiteRtLM.resetConversation
+import com.negi.survey.slm.LiteRtLM.runInference
+import com.negi.survey.slm.LiteRtLM.runtimeKey
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 private const val TAG = "LiteRtLM"
 
@@ -269,7 +275,7 @@ object LiteRtLM {
                         Log.w(TAG, "GPU init failed. Falling back to CPU: ${first.message}")
                         engineConfig = buildConfig(Backend.CPU)
                         engine = Engine(engineConfig)
-                        engine!!.initialize()
+                        engine.initialize()
                     } else {
                         throw first
                     }
@@ -301,7 +307,7 @@ object LiteRtLM {
 
                     val conversation = engine!!.createConversation(conversationConfig)
                     instances[key] = LiteRtLmInstance(
-                        engine = engine!!,
+                        engine = engine,
                         conversation = conversation,
                         supportImage = supportImage,
                         supportAudio = supportAudio,

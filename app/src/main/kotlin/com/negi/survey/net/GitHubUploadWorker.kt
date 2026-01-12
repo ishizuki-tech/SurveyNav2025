@@ -29,7 +29,6 @@ import android.content.Context
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -73,9 +72,7 @@ class GitHubUploadWorker(
         )
 
         if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
-            return Result.failure(
-                workDataOf(ERROR_MESSAGE to "Invalid GitHub configuration (owner/repo/token).")
-            )
+            return Result.failure(workDataOf(ERROR_MESSAGE to "Invalid GitHub configuration (owner/repo/token)."))
         }
 
         val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
@@ -92,7 +89,7 @@ class GitHubUploadWorker(
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val notifId = NOTIF_BASE + (abs((mode + stamp).hashCode()) % 8000)
 
-        setForegroundAsync(
+        safeSetForeground(
             foregroundInfo(
                 notificationId = notifId,
                 pct = 0,
@@ -106,14 +103,14 @@ class GitHubUploadWorker(
             if (clamped == lastPct) return@progressCallback
             lastPct = clamped
 
-            setProgressAsync(
+            safeSetProgress(
                 workDataOf(
                     PROGRESS_PCT to clamped,
                     PROGRESS_MODE to mode
                 )
             )
 
-            setForegroundAsync(
+            safeSetForeground(
                 foregroundInfo(
                     notificationId = notifId,
                     pct = clamped,
@@ -157,19 +154,20 @@ class GitHubUploadWorker(
         if (fileSize > MAX_CONTENTS_API_BYTES_HINT) {
             return Result.failure(
                 workDataOf(
-                    ERROR_MESSAGE to
-                            "File too large for GitHub Contents API " +
-                            "(size=$fileSize, limit~$MAX_CONTENTS_API_BYTES_HINT)."
+                    ERROR_MESSAGE to "File too large for GitHub Contents API (size=$fileSize, limit~$MAX_CONTENTS_API_BYTES_HINT)."
                 )
             )
         }
 
-        val remotePathForUi = buildDatedRemotePath(cfg.pathPrefix, fileName)
+        // IMPORTANT:
+        // Make the remote path deterministic and consistent with what we actually upload.
+        // We upload into: <cfg.pathPrefix>/<yyyy-MM-dd>/<fileName>
+        val relativePath = buildDatedRelativePath(cfg.pathPrefix, fileName)
 
         Log.d(
             TAG,
             "doFileUpload: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
-                    "prefix='${cfg.pathPrefix}' filePath=$filePath fileName=$fileName size=$fileSize"
+                    "relativePath='$relativePath' filePath=$filePath fileName=$fileName size=$fileSize"
         )
 
         return try {
@@ -183,7 +181,7 @@ class GitHubUploadWorker(
 
                 GitHubUploader.uploadJson(
                     cfg = cfg,
-                    relativePath = fileName,
+                    relativePath = relativePath,
                     content = text,
                     message = "Upload $fileName (deferred)",
                     onProgress = onProgress
@@ -195,14 +193,14 @@ class GitHubUploadWorker(
 
                 GitHubUploader.uploadFile(
                     cfg = cfg,
-                    relativePath = fileName,
+                    relativePath = relativePath,
                     bytes = bytes,
                     message = "Upload $fileName (deferred)",
                     onProgress = onProgress
                 )
             }
 
-            setForegroundAsync(
+            safeSetForeground(
                 foregroundInfo(
                     notificationId = notifId,
                     pct = 100,
@@ -217,7 +215,7 @@ class GitHubUploadWorker(
                 workDataOf(
                     OUT_MODE to MODE_FILE,
                     OUT_FILE_NAME to fileName,
-                    OUT_REMOTE_PATH to remotePathForUi,
+                    OUT_REMOTE_PATH to relativePath,
                     OUT_COMMIT_SHA to (result.commitSha ?: ""),
                     OUT_FILE_URL to (result.fileUrl ?: "")
                 )
@@ -225,7 +223,7 @@ class GitHubUploadWorker(
         } catch (t: Throwable) {
             Log.w(TAG, "doFileUpload: upload failed for $filePath", t)
 
-            setForegroundAsync(
+            safeSetForeground(
                 foregroundInfo(
                     notificationId = notifId,
                     pct = max(0, inputData.getInt(PROGRESS_PCT, 0)),
@@ -268,7 +266,7 @@ class GitHubUploadWorker(
                 onProgress = onProgress,
             )
 
-            setForegroundAsync(
+            safeSetForeground(
                 foregroundInfo(
                     notificationId = notifId,
                     pct = 100,
@@ -290,7 +288,7 @@ class GitHubUploadWorker(
         } catch (t: Throwable) {
             Log.w(TAG, "doLogcatUpload: upload failed", t)
 
-            setForegroundAsync(
+            safeSetForeground(
                 foregroundInfo(
                     notificationId = notifId,
                     pct = max(0, inputData.getInt(PROGRESS_PCT, 0)),
@@ -307,10 +305,10 @@ class GitHubUploadWorker(
     }
 
     /**
-     * Build a date-based remote path consistent with GitHubUploader:
-     *   prefix + yyyy-MM-dd + fileName
+     * Build a date-based relative path:
+     *   <prefix>/<yyyy-MM-dd>/<fileName>
      */
-    private fun buildDatedRemotePath(prefix: String, fileName: String): String {
+    private fun buildDatedRelativePath(prefix: String, fileName: String): String {
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
         return listOf(prefix.trim('/'), date, fileName.trim('/'))
             .filter { it.isNotEmpty() }
@@ -345,8 +343,12 @@ class GitHubUploadWorker(
         finished: Boolean = false,
         error: Boolean = false
     ): ForegroundInfo {
+
+        // Prefer app icon if it exists; otherwise fall back to a system icon to avoid crashes.
+        val iconRes = runCatching { R.drawable.ic_upload }.getOrElse { android.R.drawable.stat_sys_upload }
+
         val builder = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_upload)
+            .setSmallIcon(iconRes)
             .setContentTitle(title)
             .setOnlyAlertOnce(true)
             .setOngoing(!finished && !error)
@@ -376,8 +378,9 @@ class GitHubUploadWorker(
     /**
      * Ensure the notification channel for upload progress exists.
      */
-    @RequiresApi(Build.VERSION_CODES.O)
     private fun ensureChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -388,6 +391,22 @@ class GitHubUploadWorker(
             setShowBadge(false)
         }
         nm.createNotificationChannel(channel)
+    }
+
+    /**
+     * Defensive wrapper: don't let foreground/progress updates crash the worker.
+     */
+    private fun safeSetForeground(info: ForegroundInfo) {
+        runCatching { setForegroundAsync(info) }
+            .onFailure { Log.w(TAG, "setForegroundAsync failed: ${it.message}", it) }
+    }
+
+    /**
+     * Defensive wrapper: don't let progress updates crash the worker.
+     */
+    private fun safeSetProgress(data: androidx.work.Data) {
+        runCatching { setProgressAsync(data) }
+            .onFailure { Log.w(TAG, "setProgressAsync failed: ${it.message}", it) }
     }
 
     companion object {

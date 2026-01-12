@@ -35,18 +35,18 @@ import android.content.Context
 import android.util.Log
 import com.negi.survey.BuildConfig
 import com.negi.survey.net.HttpUrlFileDownloader
-import java.io.File
-import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withTimeout
+import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.max
 
 /**
  * Manages single-flight initialization for heavy assets (e.g., model download).

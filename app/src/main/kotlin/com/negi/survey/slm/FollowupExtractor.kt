@@ -24,6 +24,11 @@
 
 package com.negi.survey.slm
 
+import com.negi.survey.slm.FollowupExtractor.QUESTION_FIELD_CANDIDATES
+import com.negi.survey.slm.FollowupExtractor.extractFollowupQuestion
+import com.negi.survey.slm.FollowupExtractor.extractScore
+import com.negi.survey.slm.FollowupExtractor.fromRaw
+import com.negi.survey.slm.FollowupExtractor.normKey
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.max

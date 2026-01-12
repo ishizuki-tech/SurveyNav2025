@@ -40,10 +40,6 @@ import com.negi.survey.screens.SpeechController
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.WhisperEngine
 import com.negi.whispers.recorder.Recorder
-import java.io.File
-import java.io.FileInputStream
-import java.security.MessageDigest
-import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,6 +54,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.security.MessageDigest
+import java.util.Locale
 
 /**
  * ViewModel-based [SpeechController] implementation backed by Whisper.cpp.
