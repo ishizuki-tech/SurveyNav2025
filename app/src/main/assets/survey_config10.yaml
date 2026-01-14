@@ -6,151 +6,275 @@ graph:
       title: Start
       question: Start
       nextId: Q1
+
     - id: Q1
       type: AI
       title: FAW Yield Loss (3 Seasons)
       question: >-
         How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
       nextId: Q2
+
     - id: Q2
       type: AI
       title: Trade-off for 10-Day Earlier Harvest
       question: >-
         If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
       nextId: Q3
+
     - id: Q3
       type: AI
       title: Damage Threshold to Switch Variety
       question: >-
         What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
       nextId: Q4
+
     - id: Q4
       type: AI
       title: Expectations for Replacement Variety
       question: >-
         What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
       nextId: Q5
+
     - id: Q5
       type: AI
       title: Minimum Acceptable Harvest in Bad Year
       question: >-
         In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
       nextId: Q6
+
     - id: Q6
       type: AI
       title: Most Damaging Drought Timing
       question: >-
         When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
       nextId: Review
+
     - id: Review
       type: REVIEW
       title: Review
-      question: ''
+      question: ""
       nextId: Done
+
     - id: Done
       type: DONE
       title: Done
-      question: ''
+      question: ""
 
 slm:
   accelerator: "GPU"
+
+  # IMPORTANT (MediaPipe/LiteRT-LM):
+  # max_tokens is total budget (prompt + output). Keep it high enough.
   max_tokens: 1024
+
   top_k: 20
   top_p: 0.9
   temperature: 0.2
+
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
+
+  # Used only when gating or model is instructed to return empty output.
   empty_json_instruction: "Respond with an empty JSON object: {}"
+
+  # ------------------------------------------------------------------
+  # STEP 1: EVAL (strict JSON with gating keys)
+  # ------------------------------------------------------------------
   preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
+
   key_contract: |
     OUTPUT FORMAT:
-    - In English.
-    - Keys:
+    - In English only.
+    - Keys (ALL REQUIRED):
       • "analysis": short string
-      • "expected answer": short string
-      • "follow-up question": a single short confirm/validate question (NOT an array)
+      • "expected_answer": short string
+      • "follow_up_question": a single short confirm/validate question (NOT an array)
+      • "needs_followup": boolean
+      • "missing": short string (what is missing / unclear; "" if nothing)
       • "score": integer 1–100
+
     FOLLOW-UP INTENT:
     - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
     - It must target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
     - Keep it single-scope (no multi-part), concrete, and answerable immediately.
     - Do not introduce new topics or additional objectives.
+
+    GATING RULE:
+    - Set "needs_followup": true if the answer is missing a key detail or is ambiguous enough that you cannot confidently validate it.
+    - Set "missing" to a short description (<=60 chars) of the biggest missing/unclear detail.
+    - If nothing is missing, set "needs_followup": false and "missing": "".
+
   length_budget: |
     LENGTH LIMITS:
-    - analysis<=60 chars; follow-up<=120; expected answer<=120.
+    - analysis<=60 chars
+    - expected_answer<=140 chars
+    - follow_up_question<=140 chars
+    - missing<=60 chars
+
   scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+
   strict_output: |-
     STRICT OUTPUT (NO MARKDOWN):
     - RAW JSON only, ONE LINE.
     - Use COMPACT JSON (no spaces around ':' and ',').
     - No extra text.
 
+  # ------------------------------------------------------------------
+  # STEP 2: FOLLOWUP (strict JSON containing only follow-up, OR {})
+  # ------------------------------------------------------------------
+  followup:
+    preamble: "You are a well-known farmer survey expert. Use EVAL_JSON to write one follow-up question."
+    strict_output: |-
+      STRICT OUTPUT (NO MARKDOWN):
+      - If EVAL_JSON says needs_followup=false, output {} exactly.
+      - Otherwise output RAW JSON only, ONE LINE, COMPACT JSON.
+      - Keys:
+        • "follow_up_question": a single short confirm/validate question (NOT an array)
+      - No extra text.
+
+two_step:
+  # App-side gating defaults (recommended).
+  eval_ok_score_threshold: 85
+  skip_followup_when_ok: true
+
 prompts:
   - nodeId: Q1
     prompt: |-
       Task:
       - Note weaknesses (e.g., unclear units, missing seasons, outliers).
-      - Provide ONE strong expected answer: avg FAW yield loss over last 3 seasons (% or bags/acre); note high variability if present.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming unit + baseline or per-season values if missing.
+      - Provide ONE strong expected_answer: avg FAW yield loss over last 3 seasons (% or bags/acre); note high variability if present.
+      - Ask exactly 1 follow_up_question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming unit + baseline or per-season values if missing.
+      - Set needs_followup + missing using the gating rule.
       - Score 1–100.
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+    followup_prompt: |-
+      Task:
+      - Read QUESTION, ANSWER, and EVAL_JSON.
+      - If EVAL_JSON.needs_followup is false, output {} exactly.
+      - Otherwise output {"follow_up_question":"..."} with ONE short confirm/validate question.
+      - The follow-up must target EVAL_JSON.missing (the biggest uncertainty) and stay on the same topic.
+
+      QUESTION: {{QUESTION}}
+      ANSWER: {{ANSWER}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q2
     prompt: |-
       Task:
       - Note weaknesses (e.g., vague trade-off, no units, no rationale).
-      - Provide a strong expected answer: willingness-to-accept yield loss to harvest 10 days earlier (% or bags/acre) with a one-clause reason (rain risk/price).
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer clarifying the unit/amount or rationale boundary (max acceptable loss).
+      - Provide a strong expected_answer: willingness-to-accept yield loss to harvest 10 days earlier (% or bags/acre) with a one-clause reason (rain risk/price).
+      - Ask exactly 1 follow_up_question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer clarifying unit/amount or max acceptable loss.
+      - Set needs_followup + missing using the gating rule.
       - Score 1–100 (integer).
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+    followup_prompt: |-
+      Task:
+      - Read QUESTION, ANSWER, and EVAL_JSON.
+      - If EVAL_JSON.needs_followup is false, output {} exactly.
+      - Otherwise output {"follow_up_question":"..."} with ONE short confirm/validate question.
+      - The follow-up must target EVAL_JSON.missing and stay on the same topic.
+
+      QUESTION: {{QUESTION}}
+      ANSWER: {{ANSWER}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q3
     prompt: |-
       Task:
       - Note weaknesses (e.g., no threshold, unclear measure, pest vs disease mixed).
-      - Provide a strong expected answer: a clear switching threshold (e.g., ≥X% plants/ears with moderate+ damage, or a severity level at tasseling).
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the metric/scale or growth stage window.
+      - Provide a strong expected_answer: a clear switching threshold (e.g., ≥X% plants/ears with moderate+ damage, or a severity level at tasseling).
+      - Ask exactly 1 follow_up_question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the metric/scale or growth stage window.
+      - Set needs_followup + missing using the gating rule.
       - Score 1–100 (integer).
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+    followup_prompt: |-
+      Task:
+      - Read QUESTION, ANSWER, and EVAL_JSON.
+      - If EVAL_JSON.needs_followup is false, output {} exactly.
+      - Otherwise output {"follow_up_question":"..."} with ONE short confirm/validate question.
+      - The follow-up must target EVAL_JSON.missing and stay on the same topic.
+
+      QUESTION: {{QUESTION}}
+      ANSWER: {{ANSWER}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q4
     prompt: |-
       Task:
       - Note weaknesses (e.g., generic traits, missing numbers).
-      - Provide a strong expected answer listing 2 compact replacement targets with numeric/categorical thresholds.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the top-priority trait or a numeric target.
+      - Provide a strong expected_answer listing 2 compact replacement targets with numeric/categorical thresholds.
+      - Ask exactly 1 follow_up_question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the top-priority trait or a numeric target.
+      - Set needs_followup + missing using the gating rule.
       - Score 1–100 (integer).
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+    followup_prompt: |-
+      Task:
+      - Read QUESTION, ANSWER, and EVAL_JSON.
+      - If EVAL_JSON.needs_followup is false, output {} exactly.
+      - Otherwise output {"follow_up_question":"..."} with ONE short confirm/validate question.
+      - The follow-up must target EVAL_JSON.missing and stay on the same topic.
+
+      QUESTION: {{QUESTION}}
+      ANSWER: {{ANSWER}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q5
     prompt: |-
       Task:
       - Note weaknesses (e.g., no baseline, no unit, no decision rule).
-      - Provide a strong expected answer: minimum acceptable harvest in a bad year (% or bags/acre) plus a terse rule.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming baseline average or a concrete bad-year example.
+      - Provide a strong expected_answer: minimum acceptable harvest in a bad year (% or bags/acre) plus a terse rule.
+      - Ask exactly 1 follow_up_question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming baseline average or a concrete bad-year example.
+      - Set needs_followup + missing using the gating rule.
       - Score 1–100 (integer).
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+    followup_prompt: |-
+      Task:
+      - Read QUESTION, ANSWER, and EVAL_JSON.
+      - If EVAL_JSON.needs_followup is false, output {} exactly.
+      - Otherwise output {"follow_up_question":"..."} with ONE short confirm/validate question.
+      - The follow-up must target EVAL_JSON.missing and stay on the same topic.
+
+      QUESTION: {{QUESTION}}
+      ANSWER: {{ANSWER}}
+      EVAL_JSON: {{EVAL_JSON}}
 
   - nodeId: Q6
     prompt: |-
       Task:
       - Note weaknesses (e.g., vague timing, no stage, no symptoms).
-      - Provide a strong expected answer: most damaging drought moment as a crop stage with a one-clause reason.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the stage definition or a concrete season example.
+      - Provide a strong expected_answer: most damaging drought moment as a crop stage with a one-clause reason.
+      - Ask exactly 1 follow_up_question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the stage definition or a concrete season example.
+      - Set needs_followup + missing using the gating rule.
       - Score 1–100 (integer).
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
+
+    followup_prompt: |-
+      Task:
+      - Read QUESTION, ANSWER, and EVAL_JSON.
+      - If EVAL_JSON.needs_followup is false, output {} exactly.
+      - Otherwise output {"follow_up_question":"..."} with ONE short confirm/validate question.
+      - The follow-up must target EVAL_JSON.missing and stay on the same topic.
+
+      QUESTION: {{QUESTION}}
+      ANSWER: {{ANSWER}}
+      EVAL_JSON: {{EVAL_JSON}}
 
 model_defaults:
   # Model download UI defaults

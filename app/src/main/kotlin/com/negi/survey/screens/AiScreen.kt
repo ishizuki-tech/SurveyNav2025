@@ -311,7 +311,7 @@ fun AiScreen(
     }
 
     // ---------------------------------------------------------------------
-    // Typing bubble orchestration
+    // Typing bubble orchestration (2-step safe)
     // ---------------------------------------------------------------------
 
     /**
@@ -334,10 +334,20 @@ fun AiScreen(
 
     /**
      * Replace typing bubble with final JSON when raw arrives and loading ends.
+     *
+     * 2-step note:
+     * - We guard with lastJsonRawKey to ensure stage2 does NOT re-trigger JSON replacement.
+     * - AiViewModel in 2-step clears raw before FOLLOWUP, but we still protect UI.
      */
+    var lastJsonRawKey by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+
     LaunchedEffect(raw, loading) {
-        if (!raw.isNullOrBlank() && !loading) {
-            val pretty = prettyOrRaw(prettyJson, raw!!)
+        val r = raw
+        if (!r.isNullOrBlank() && !loading) {
+            val key = stableKeyForJson(r)
+            if (key != null && key == lastJsonRawKey) return@LaunchedEffect
+
+            val pretty = prettyOrRaw(prettyJson, r)
             vmAI.chatReplaceTypingWith(
                 nodeId,
                 AiViewModel.ChatMsgVm(
@@ -346,11 +356,13 @@ fun AiScreen(
                     json = pretty
                 )
             )
+            lastJsonRawKey = key
         }
     }
 
     /**
-     * If we stop loading without raw (cancel/error), ensure typing bubble is removed.
+     * If we stop loading without raw (cancel/error, or stage2 completion),
+     * ensure typing bubble is removed.
      */
     LaunchedEffect(loading, raw) {
         if (!loading && raw.isNullOrBlank()) {
@@ -446,7 +458,7 @@ fun AiScreen(
     }
 
     // ---------------------------------------------------------------------
-    // Submit logic
+    // Submit logic (2-step)
     // ---------------------------------------------------------------------
 
     /**
@@ -460,6 +472,28 @@ fun AiScreen(
             return
         }
         vmSurvey.setAnswer(text, nodeId)
+    }
+
+    /**
+     * Build 2-step prompt templates from SurveyViewModel.
+     *
+     * - EVAL prompt: strict JSON with score + needs_followup (expected)
+     * - FOLLOWUP prompt: must include {{EVAL_JSON}} placeholder
+     *
+     * If SurveyViewModel does not yet provide a dedicated follow-up template,
+     * we fall back to a minimal wrapper around the same prompt.
+     */
+    fun buildFollowupTemplateFallback(evalPrompt: String): String {
+        return buildString {
+            appendLine(evalPrompt.trim())
+            appendLine()
+            appendLine("You already produced an EVAL JSON.")
+            appendLine("Given the EVAL_JSON below, output ONE follow-up question as strict JSON.")
+            appendLine("""Keys: "follow_up_question"""")
+            appendLine()
+            appendLine("EVAL_JSON:")
+            appendLine("{{EVAL_JSON}}")
+        }
     }
 
     fun submit() {
@@ -481,8 +515,27 @@ fun AiScreen(
 
         scope.launch {
             val q = vmSurvey.getQuestion(nodeId)
-            val prompt = vmSurvey.getPrompt(nodeId, q, answer)
-            vmAI.evaluateAsync(prompt)
+
+            // Stage1: EVAL prompt (existing API).
+            val evalPrompt = vmSurvey.getPrompt(nodeId, q, answer)
+
+            // Stage2: FOLLOWUP template.
+            // If your SurveyViewModel has a dedicated method, wire it here.
+            val followupTemplate = runCatching {
+                // Optional: user may add this method later.
+                // vmSurvey.getFollowupPromptTemplate(nodeId, q, answer)
+                null
+            }.getOrNull() ?: buildFollowupTemplateFallback(evalPrompt)
+
+            vmAI.evaluateTwoStepAsync(
+                evalPrompt = evalPrompt,
+                followupPromptTemplate = followupTemplate,
+                gating = AiViewModel.TwoStepGating(
+                    evalOkScoreThreshold = 85,
+                    skipFollowupWhenOk = true,
+                    forceFollowupWhenScoreBelowThreshold = true
+                )
+            )
         }
 
         suppressNextPersist = true
@@ -1136,8 +1189,10 @@ private fun buildJsonPreview(pretty: String): String {
     val obj = element as? JsonObject
     if (obj != null) {
         val analysis = obj["analysis"]?.toString()?.trim('"')
-        val fu = obj["follow-up question"]?.toString()?.trim('"')
-        val expected = obj["expected answer"]?.toString()?.trim('"')
+        val fu = obj["follow_up_question"]?.toString()?.trim('"')
+            ?: obj["follow-up question"]?.toString()?.trim('"')
+        val expected = obj["expected_answer"]?.toString()?.trim('"')
+            ?: obj["expected answer"]?.toString()?.trim('"')
 
         val lines = buildList {
             if (!analysis.isNullOrBlank()) add("analysis: $analysis")
@@ -1234,6 +1289,19 @@ private fun extractScoreFallback(text: String): Int? {
     return v.coerceIn(0, 100)
 }
 
+/**
+ * Create a stable key for guarding against duplicate JSON bubble replacement.
+ *
+ * The key uses a short prefix of the payload to avoid heavy hashing while
+ * still being stable enough for UI gating.
+ */
+private fun stableKeyForJson(raw: String): String? {
+    val t = stripCodeFence(raw).trim()
+    if (t.isBlank()) return null
+    val head = if (t.length <= 240) t else t.take(240)
+    return "${t.length}:${head.hashCode()}"
+}
+
 /* ───────────────────────────── Preview ─────────────────────────────────── */
 
 @SuppressLint("RememberInComposition")
@@ -1252,8 +1320,8 @@ private fun ChatPreview() {
                 json = """
                 {
                   "analysis": "Clear unit",
-                  "expected answer": "~10% avg loss over 3 seasons",
-                  "follow-up question": "Is 10% per season or overall?",
+                  "expected_answer": "~10% avg loss over 3 seasons",
+                  "follow_up_question": "Is 10% per season or overall?",
                   "score": 88
                 }
                 """.trimIndent()

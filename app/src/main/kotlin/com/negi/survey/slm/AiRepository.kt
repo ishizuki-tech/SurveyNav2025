@@ -25,12 +25,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
@@ -40,8 +35,8 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -58,41 +53,36 @@ interface Repository {
      *
      * Contract:
      * - Returns a cold [Flow]. Collection actually runs the inference.
-     * - Implementations may enforce process-wide serialization (e.g., via a semaphore).
-     * - Callers are expected to collect in a coroutine scope they control and cancel
-     *   collection to abort/cleanup the underlying engine call (best-effort).
+     * - Implementations must ensure no unsafe concurrent JNI calls happen.
+     * - Canceling the collection should stop the underlying engine best-effort.
      */
     suspend fun request(prompt: String): Flow<String>
 
     /**
-     * Build the full model-ready prompt string from a user-level [userPrompt].
+     * Best-effort cancellation of the currently running inference (if any).
      *
-     * Implementations are responsible for:
-     * - Applying YAML-based SLM metadata (preamble, key contract, etc.).
-     * - Inserting user/model turn markers and a turn-end token.
-     * - Handling the "empty prompt" case by emitting a valid JSON instruction.
+     * IMPORTANT:
+     * - Safe to call multiple times.
+     * - Must never crash even if already idle.
+     */
+    fun cancelActive()
+
+    /**
+     * Build the full model-ready prompt string from a user-level [userPrompt].
      */
     fun buildPrompt(userPrompt: String): String
 }
 
 /* ====================================================================== */
-/*  Shared process-wide inference gate                                    */
+/*  Process-wide inference serialization                                   */
 /* ====================================================================== */
 
 /**
- * Single process-wide gate used by both MediaPipe SLM and LiteRtLM backends.
+ * Global mutex to serialize ALL native/engine interactions process-wide.
  *
- * Rationale:
- * - Avoid running two heavy LLM engines (e.g., SLM .task + LiteRT .litertlm)
- *   at the same time in the same process.
- * - Greatly reduces peak memory and GPU usage on constrained devices.
- *
- * Semantics:
- * - At most one active inference flow (SLM or LiteRtLM) may run at once.
- * - The gate is held for the entire lifetime of the streaming [Flow] collected
- *   from [Repository.request].
+ * This is intentionally heavy-handed to avoid JNI races across different backends.
  */
-private val AI_INFERENCE_GATE = Semaphore(1)
+private val AI_PROCESS_LOCK = Mutex()
 
 /* ====================================================================== */
 /*  Logging / Trace utilities                                              */
@@ -138,7 +128,7 @@ private object AiTrace {
             sb.append(chunk)
             return true
         }
-        sb.append(chunk.substring(0, remaining))
+        sb.append(chunk.take(remaining))
         return false
     }
 
@@ -222,9 +212,6 @@ private fun compactJoin(vararg parts: String): String {
 
 /**
  * YAML-driven prompt builder used by all repositories.
- *
- * This avoids drift between backends and keeps prompt behavior identical
- * regardless of the inference engine.
  */
 private object PromptBuilder {
 
@@ -232,10 +219,7 @@ private object PromptBuilder {
     private const val DEF_MODEL_TURN_PREFIX = "<start_of_turn>model"
     private const val DEF_TURN_END = "<end_of_turn>"
     private const val DEF_EMPTY_JSON_INSTRUCTION = "Respond with an empty JSON object: {}"
-
-    private const val DEF_PREAMBLE =
-        "You are a well-known farmer survey expert. Read the Question and the Answer."
-
+    private const val DEF_PREAMBLE = "You are a well-known farmer survey expert. Read the Question and the Answer."
     private const val DEF_KEY_CONTRACT =
         "OUTPUT FORMAT:\n" +
                 "- In English.\n" +
@@ -248,18 +232,15 @@ private object PromptBuilder {
                 "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
                 "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
                 "- Keep it single-scope and answerable immediately."
-
     private const val DEF_LENGTH_BUDGET =
         "LENGTH LIMITS:\n" +
                 "- analysis<=80 chars\n" +
                 "- expected answer<=60 chars\n" +
                 "- follow-up question<=90 chars"
-
     private const val DEF_SCORING_RULE =
         "SCORING RULE:\n" +
                 "- Judge ONLY content relevance/completeness/accuracy.\n" +
                 "- Do NOT penalize style or formatting."
-
     private const val DEF_STRICT_OUTPUT =
         "STRICT OUTPUT (NO MARKDOWN):\n" +
                 "- RAW JSON only.\n" +
@@ -269,23 +250,17 @@ private object PromptBuilder {
 
     fun build(config: SurveyConfig, userPrompt: String): String {
         val slm = config.slm
-
         val userTurn = slm.user_turn_prefix ?: DEF_USER_TURN_PREFIX
         val modelTurn = slm.model_turn_prefix ?: DEF_MODEL_TURN_PREFIX
         val turnEnd = slm.turn_end ?: DEF_TURN_END
         val emptyJson = slm.empty_json_instruction ?: DEF_EMPTY_JSON_INSTRUCTION
-
         val preamble = slm.preamble ?: DEF_PREAMBLE
         val keyContract = slm.key_contract ?: DEF_KEY_CONTRACT
         val lengthBudget = slm.length_budget ?: DEF_LENGTH_BUDGET
         val scoringRule = slm.scoring_rule ?: DEF_SCORING_RULE
         val strictOutput = slm.strict_output ?: DEF_STRICT_OUTPUT
 
-        val effective = if (userPrompt.isBlank()) {
-            emptyJson
-        } else {
-            userPrompt.trimIndent().normalizePrompt()
-        }
+        val effective = if (userPrompt.isBlank()) emptyJson else userPrompt.trimIndent().normalizePrompt()
 
         val userBlock = compactJoin(
             preamble,
@@ -306,6 +281,224 @@ private object PromptBuilder {
 }
 
 /* ====================================================================== */
+/*  Shared streaming skeleton (single terminate path)                      */
+/* ====================================================================== */
+
+private object StreamRunner {
+
+    private const val TAG = "AiStreamRunner"
+
+    data class Params(
+        val backendTag: String,
+        val modelName: String,
+        val requestId: Long,
+        val prompt: String,
+        val gateWaitMs: Long,
+        val hardWatchdogMs: Long,
+        val progressStallMs: Long,
+        val progressPollMs: Long,
+        val postCloseQuiesceMs: Long,
+    )
+
+    /**
+     * Start an async stream.
+     *
+     * Implementations must:
+     * - Invoke [onChunk] any number of times.
+     * - Invoke [onTerminal] at most once (runner dedupes anyway).
+     * - Invoke [onError] at most once (runner dedupes anyway).
+     */
+    interface Starter {
+        fun startStream(
+            onChunk: (String) -> Unit,
+            onTerminal: () -> Unit,
+            onError: (Throwable) -> Unit,
+        )
+    }
+
+    /**
+     * Returns a cold Flow. Collection runs the stream.
+     *
+     * - All JNI/engine calls must be serialized by [AI_PROCESS_LOCK].
+     * - Termination is unified through terminateOnce().
+     */
+    fun run(
+        params: Params,
+        starter: Starter,
+        cancelActive: () -> Unit,
+        postCloseCleanup: suspend (reason: String) -> Unit,
+    ): Flow<String> = callbackFlow {
+        val out = this
+
+        val closed = AtomicBoolean(false)
+        val finalized = AtomicBoolean(false)
+
+        val startAt = AtomicLong(SystemClock.elapsedRealtime())
+        val lastProgressAt = AtomicLong(startAt.get())
+        val firstChunkAt = AtomicLong(-1L)
+
+        val chunks = AtomicLong(0L)
+        val capturedAll = AtomicBoolean(true)
+        val fullOut = StringBuilder(8 * 1024)
+
+        val normalizedPrompt = params.prompt.normalizePrompt()
+        val promptHash = AiTrace.sha256Short(normalizedPrompt)
+
+        fun markProgress() {
+            lastProgressAt.set(SystemClock.elapsedRealtime())
+        }
+
+        fun appendOutput(chunk: String) {
+            if (chunk.isEmpty()) return
+            if (firstChunkAt.get() < 0L) firstChunkAt.compareAndSet(-1L, SystemClock.elapsedRealtime())
+            chunks.incrementAndGet()
+            val ok = AiTrace.capAppend(fullOut, chunk)
+            if (!ok) capturedAll.set(false)
+        }
+
+        fun finalizeOnce(reason: String, cause: Throwable? = null) {
+            if (!finalized.compareAndSet(false, true)) return
+
+            val now = SystemClock.elapsedRealtime()
+            val elapsedMs = now - startAt.get()
+            val firstMs = firstChunkAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
+            val outText = fullOut.toString()
+
+            val stats = buildString {
+                appendLine("=== AI STREAM TRACE ===")
+                appendLine("backend=${params.backendTag} rid=${params.requestId} model='${params.modelName}' reason=$reason")
+                appendLine("prompt.sha256_8=$promptHash prompt.len=${normalizedPrompt.length}")
+                appendLine("gateWaitMs=${params.gateWaitMs} elapsedMs=$elapsedMs firstChunkMs=$firstMs")
+                appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
+                if (cause != null) {
+                    appendLine("--- exception ---")
+                    appendLine(Log.getStackTraceString(cause))
+                }
+                appendLine("=== PROMPT (FULL) ===")
+                appendLine(normalizedPrompt)
+                appendLine("=== OUTPUT (FULL) ===")
+                append(outText)
+                if (!capturedAll.get()) {
+                    appendLine()
+                    appendLine("... (output capture truncated by MAX_CAPTURE_CHARS)")
+                }
+            }
+
+            AiTrace.logLong(
+                tag = TAG,
+                level = if (cause != null) Log.WARN else Log.DEBUG,
+                header = "[${params.backendTag}][${params.requestId}] FINALIZE: $reason",
+                body = stats,
+            )
+
+            AiTrace.dumpToFile(params.backendTag, params.requestId, params.modelName, stats)
+        }
+
+        // The ONLY termination gateway.
+        fun terminateOnce(reason: String, cause: Throwable? = null) {
+            if (!closed.compareAndSet(false, true)) return
+
+            markProgress()
+            finalizeOnce(reason, cause)
+
+            out.close(cause)
+        }
+
+        // Watchdogs live inside the flow scope (cancelled automatically on close).
+        val watchdogJob = launch(Dispatchers.Default) {
+            while (isActive && !closed.get()) {
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - startAt.get()
+                val stalled = now - lastProgressAt.get()
+
+                if (elapsed >= params.hardWatchdogMs) {
+                    Log.w(TAG, "[${params.backendTag}][${params.requestId}] hard timeout (${elapsed}ms) → cancel/terminate")
+                    cancelActive()
+                    terminateOnce("hard-watchdog-timeout")
+                    break
+                }
+
+                if (stalled >= params.progressStallMs) {
+                    Log.w(TAG, "[${params.backendTag}][${params.requestId}] stall timeout (${stalled}ms) → cancel/terminate")
+                    cancelActive()
+                    terminateOnce("progress-stall-timeout")
+                    break
+                }
+
+                delay(params.progressPollMs)
+            }
+        }
+
+        // We must start the backend stream under the global process lock.
+        // IMPORTANT:
+        // - We do NOT "collect another flow inside callbackFlow".
+        // - We start the stream and return immediately.
+        // - The flow stays open until terminateOnce() is called.
+        launch(Dispatchers.IO) {
+            AI_PROCESS_LOCK.withLock {
+                if (closed.get()) return@withLock
+
+                runCatching {
+                    Log.d(
+                        TAG,
+                        "[${params.backendTag}][${params.requestId}] start model='${params.modelName}' prompt.len=${normalizedPrompt.length} gateWaitMs=${params.gateWaitMs}",
+                    )
+
+                    starter.startStream(
+                        onChunk = { chunk ->
+                            if (closed.get()) return@startStream
+                            if (chunk.isNotEmpty()) {
+                                markProgress()
+                                appendOutput(chunk)
+                                if (!out.isClosedForSend) out.trySend(chunk)
+                            }
+                        },
+                        onTerminal = {
+                            if (closed.get()) return@startStream
+                            terminateOnce("terminal")
+                        },
+                        onError = { t ->
+                            if (closed.get()) return@startStream
+                            cancelActive()
+                            terminateOnce("error", t)
+                        },
+                    )
+                }.onFailure { t ->
+                    cancelActive()
+                    terminateOnce("exception", t)
+                }
+            }
+        }
+
+        awaitClose {
+            runCatching { watchdogJob.cancel() }
+
+            // If collector cancels before terminal, best-effort cancel the backend.
+            if (!closed.get()) {
+                cancelActive()
+                terminateOnce("collector-cancel")
+            }
+
+            // Post-close cleanup (best-effort) happens after we close.
+            launch(Dispatchers.IO) {
+                runCatching {
+                    // Quiesce wait: reduces late-callback-vs-cleanup races for JNI backends.
+                    withTimeoutOrNull(params.postCloseQuiesceMs) {
+                        delay(params.postCloseQuiesceMs)
+                        true
+                    }
+                    postCloseCleanup("post-close")
+                }.onFailure { e ->
+                    Log.w(TAG, "[${params.backendTag}][${params.requestId}] postCloseCleanup failed: ${e.message}", e)
+                }
+            }
+        }
+    }
+        .buffer(Channel.BUFFERED)
+        .flowOn(Dispatchers.IO)
+}
+
+/* ====================================================================== */
 /*  SLM (MediaPipe) backend                                               */
 /* ====================================================================== */
 
@@ -316,23 +509,18 @@ class SlmDirectRepository(
 
     companion object {
         private const val TAG = "SlmDirectRepository"
-
         private val REQ_SEQ = AtomicLong(0L)
-
-        // Cleanup waiting is done in a coroutine (NO thread blocking)
-        private const val CLEAN_WAIT_MS = 5_000L
-        private const val CLEAN_POLL_MS = 250L
-
-        private const val FINISH_WATCHDOG_MS = 3_000L
-        private const val FINISH_WATCHDOG_STEP_MS = 100L
-        private const val FINISH_IDLE_GRACE_MS = 250L
 
         private const val HARD_WATCHDOG_MS = 20_000L
         private const val PROGRESS_STALL_MS = 6_000L
         private const val PROGRESS_POLL_MS = 250L
 
-        private const val PROMPT_HEADER_MAX = 8
-        private const val PROMPT_TAIL_MAX = 8
+        private const val POST_CLOSE_QUIESCE_MS = 250L
+    }
+
+    override fun cancelActive() {
+        runCatching { SLM.cancel(model) }
+            .onFailure { Log.w(TAG, "cancelActive: SLM.cancel failed: ${it.message}", it) }
     }
 
     override fun buildPrompt(userPrompt: String): String {
@@ -341,318 +529,58 @@ class SlmDirectRepository(
         return finalPrompt
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
-    override suspend fun request(prompt: String): Flow<String> =
-        callbackFlow {
-            val out = this
-            val requestId = REQ_SEQ.incrementAndGet()
+    override suspend fun request(prompt: String): Flow<String> {
+        val requestId = REQ_SEQ.incrementAndGet()
+        val gateReqAt = SystemClock.elapsedRealtime()
 
-            val gateReqAt = SystemClock.elapsedRealtime()
+        // gateWaitMs represents: how long we waited to ENTER the global process lock.
+        // We compute it when the stream actually starts (inside the lock).
+        // For trace, we compute a conservative approximation here too.
+        val optimisticGateWait = 0L
 
-            AI_INFERENCE_GATE.withPermit {
-                val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
+        val params = StreamRunner.Params(
+            backendTag = "slm",
+            modelName = model.name,
+            requestId = requestId,
+            prompt = prompt,
+            gateWaitMs = optimisticGateWait,
+            hardWatchdogMs = HARD_WATCHDOG_MS,
+            progressStallMs = PROGRESS_STALL_MS,
+            progressPollMs = PROGRESS_POLL_MS,
+            postCloseQuiesceMs = POST_CLOSE_QUIESCE_MS,
+        )
 
-                val anchorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-                val closed = AtomicBoolean(false)
-                val finalized = AtomicBoolean(false)
-                val seenFinished = AtomicBoolean(false)
-                val seenOnClean = AtomicBoolean(false)
-                val finishWatchdogStarted = AtomicBoolean(false)
-
-                val startAt = AtomicLong(SystemClock.elapsedRealtime())
-                val lastProgressAt = AtomicLong(startAt.get())
-                val firstChunkAt = AtomicLong(-1L)
-
-                val chunks = AtomicLong(0L)
-                val capturedAll = AtomicBoolean(true)
-                val fullOut = StringBuilder(8 * 1024)
-
-                val normalizedPrompt = prompt.normalizePrompt()
-
-                fun markProgress() {
-                    lastProgressAt.set(SystemClock.elapsedRealtime())
-                }
-
-                fun isBusyNow(): Boolean {
-                    return runCatching { SLM.isBusy(model) }
-                        .onFailure { Log.w(TAG, "[$requestId] SLM.isBusy threw: ${it.message}", it) }
-                        .getOrElse { true }
-                }
-
-                val emitCh = Channel<String>(capacity = Channel.BUFFERED)
-                val emitterJob = anchorScope.launch {
-                    for (chunk in emitCh) {
-                        if (chunk.isNotEmpty() && !out.isClosedForSend) {
-                            val r = out.trySend(chunk)
-                            if (r.isFailure) {
-                                Log.w(TAG, "[$requestId] trySend failed: ${r.exceptionOrNull()?.message}", r.exceptionOrNull())
-                            }
-                        }
-                    }
-                }
-
-                fun appendOutput(chunk: String) {
-                    if (chunk.isEmpty()) return
-                    if (firstChunkAt.get() < 0L) firstChunkAt.compareAndSet(-1L, SystemClock.elapsedRealtime())
-                    chunks.incrementAndGet()
-                    val ok = AiTrace.capAppend(fullOut, chunk)
-                    if (!ok) capturedAll.set(false)
-                }
-
-                fun buildPromptSummary(text: String): String {
-                    val lines = text.split('\n')
-                    val head = lines.take(PROMPT_HEADER_MAX).joinToString("\n")
-                    val tail = lines.takeLast(PROMPT_TAIL_MAX).joinToString("\n")
-                    val fp = AiTrace.sha256Short(text)
-                    return buildString {
-                        appendLine("rid=$requestId model='${model.name}' gateWaitMs=$gateWaitMs busy=${isBusyNow()}")
-                        appendLine("prompt.len=${text.length} lines=${lines.size} sha256_8=$fp")
-                        appendLine("--- prompt.head ---")
-                        appendLine(head)
-                        appendLine("--- prompt.tail ---")
-                        appendLine(tail)
-                    }
-                }
-
-                fun finalizeOnce(reason: String, cause: Throwable? = null) {
-                    if (!finalized.compareAndSet(false, true)) return
-
-                    val now = SystemClock.elapsedRealtime()
-                    val elapsedMs = now - startAt.get()
-                    val firstMs = firstChunkAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
-                    val outText = fullOut.toString()
-
-                    val stats = buildString {
-                        appendLine("=== SLM TRACE STATS ===")
-                        appendLine("rid=$requestId model='${model.name}' reason=$reason")
-                        appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstChunkMs=$firstMs")
-                        appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
-                        appendLine("busy_now=${isBusyNow()} finished=${seenFinished.get()} onClean=${seenOnClean.get()}")
-                        if (cause != null) {
-                            appendLine("--- exception ---")
-                            appendLine(Log.getStackTraceString(cause))
-                        }
-                        appendLine("=== OUTPUT (FULL) ===")
-                        append(outText)
-                        if (!capturedAll.get()) {
-                            appendLine()
-                            appendLine("... (output capture truncated by MAX_CAPTURE_CHARS)")
-                        }
-                    }
-
-                    AiTrace.logLong(
-                        tag = TAG,
-                        level = if (cause != null) Log.WARN else Log.DEBUG,
-                        header = "[$requestId] FINALIZE: $reason",
-                        body = stats
-                    )
-
-                    // Dump prompt+output only when tracing is enabled and context is installed.
-                    if (AiTrace.enabled) {
-                        val dump = buildString {
-                            appendLine("=== PROMPT+OUTPUT DUMP ===")
-                            appendLine("rid=$requestId model='${model.name}' reason=$reason")
-                            appendLine()
-                            appendLine("=== PROMPT ===")
-                            appendLine(normalizedPrompt)
-                            appendLine()
-                            appendLine("=== OUTPUT ===")
-                            appendLine(outText)
-                            if (!capturedAll.get()) appendLine("... (output capture truncated by MAX_CAPTURE_CHARS)")
-                        }
-                        val f = AiTrace.dumpToFile("slm", requestId, model.name, dump)
-                        if (f != null) Log.d(TAG, "[$requestId] Dumped full prompt/output to: ${f.absolutePath}")
-                    }
-                }
-
-                fun safeClose(reason: String, cause: Throwable? = null) {
-                    if (!closed.compareAndSet(false, true)) return
-                    finalizeOnce(reason, cause)
-
-                    if (cause != null) Log.w(TAG, "[$requestId] close: $reason", cause)
-                    else Log.d(TAG, "[$requestId] close: $reason")
-
-                    runCatching { emitCh.close() }
-                    out.close(cause)
-                }
-
-                /**
-                 * Coroutine-based idle/cleanup wait (NO blocking sleeps).
-                 */
-                suspend fun waitCleanOrIdle(tag: String) {
-                    val ok = withTimeoutOrNull(CLEAN_WAIT_MS) {
-                        while (isActive) {
-                            if (seenOnClean.get()) return@withTimeoutOrNull true
-                            if (!isBusyNow()) return@withTimeoutOrNull true
-                            delay(CLEAN_POLL_MS)
-                        }
-                        false
-                    } == true
-
-                    Log.d(
-                        TAG,
-                        "[$requestId] waitCleanOrIdle[$tag] done (ok=$ok cleaned=${seenOnClean.get()} busy=${isBusyNow()})"
-                    )
-                }
-
-                // Hard timeout + progress stall watchdog
-                anchorScope.launch {
-                    while (isActive && !closed.get()) {
-                        val now = SystemClock.elapsedRealtime()
-                        val elapsed = now - startAt.get()
-                        val stalled = now - lastProgressAt.get()
-
-                        if (elapsed >= HARD_WATCHDOG_MS) {
-                            Log.w(TAG, "[$requestId] hard timeout (${elapsed}ms) → cancel/reset/close")
-                            runCatching { SLM.cancel(model) }
-                            runCatching { SLM.resetSession(model) }
-                            safeClose("hard-watchdog-timeout")
-                            break
-                        }
-
-                        if (!seenFinished.get() && stalled >= PROGRESS_STALL_MS) {
-                            Log.w(TAG, "[$requestId] stall timeout (${stalled}ms) → cancel/reset/close")
-                            runCatching { SLM.cancel(model) }
-                            runCatching { SLM.resetSession(model) }
-                            safeClose("progress-stall-timeout")
-                            break
-                        }
-
-                        delay(PROGRESS_POLL_MS)
-                    }
-                }
-
-                try {
-                    Log.d(
-                        TAG,
-                        "[$requestId] start: model='${model.name}', prompt.len=${normalizedPrompt.length}, gateWaitMs=$gateWaitMs, busy=${isBusyNow()}"
-                    )
-
-                    AiTrace.logLong(
-                        tag = TAG,
-                        level = Log.DEBUG,
-                        header = "[$requestId] PROMPT (FULL)",
-                        body = normalizedPrompt
-                    )
-                    Log.d(TAG, "[$requestId] " + buildPromptSummary(normalizedPrompt))
-
-                    if (isBusyNow()) {
-                        Log.w(TAG, "[$requestId] pre-run: engine BUSY → cancel/resetSession")
-                        runCatching { SLM.cancel(model) }
-                        runCatching { SLM.resetSession(model) }
-                    }
-
+        return StreamRunner.run(
+            params = params.copy(gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt),
+            starter = object : StreamRunner.Starter {
+                override fun startStream(
+                    onChunk: (String) -> Unit,
+                    onTerminal: () -> Unit,
+                    onError: (Throwable) -> Unit,
+                ) {
+                    // IMPORTANT: Never close/reset here. Only signal terminal.
                     SLM.runInference(
                         model = model,
-                        input = normalizedPrompt,
+                        input = prompt.normalizePrompt(),
                         listener = { partial, finished ->
-                            markProgress()
-
-                            if (partial.isNotEmpty()) {
-                                appendOutput(partial)
-                                val rr = emitCh.trySend(partial)
-                                if (rr.isFailure) {
-                                    Log.w(TAG, "[$requestId] emitCh.trySend failed: ${rr.exceptionOrNull()?.message}", rr.exceptionOrNull())
-                                }
-                            }
-
-                            if (finished) {
-                                seenFinished.set(true)
-                                if (!finishWatchdogStarted.compareAndSet(false, true)) return@runInference
-
-                                Log.d(TAG, "[$requestId] finished=true observed")
-
-                                anchorScope.launch {
-                                    val ok = withTimeoutOrNull(FINISH_WATCHDOG_MS) {
-                                        var idleSince = -1L
-
-                                        while (isActive && !closed.get() && !seenOnClean.get()) {
-                                            val busy = isBusyNow()
-                                            val now = SystemClock.elapsedRealtime()
-
-                                            if (!busy) {
-                                                if (idleSince < 0) idleSince = now
-                                                val idleDur = now - idleSince
-                                                if (idleDur >= FINISH_IDLE_GRACE_MS) break
-                                            } else {
-                                                idleSince = -1L
-                                            }
-
-                                            delay(FINISH_WATCHDOG_STEP_MS)
-                                        }
-                                        true
-                                    } == true
-
-                                    if (!closed.get() && !seenOnClean.get()) {
-                                        if (ok) safeClose("finished-idle-grace")
-                                        else safeClose("finish-watchdog-timeout")
-                                    }
-                                }
-                            }
+                            if (partial.isNotEmpty()) onChunk(partial)
+                            if (finished) onTerminal()
                         },
                         onClean = {
-                            markProgress()
-                            seenOnClean.set(true)
-                            Log.d(TAG, "[$requestId] onClean")
-                            safeClose("onClean")
+                            // Treat onClean as terminal too, runner dedupes.
+                            onTerminal()
                         },
                     )
-                } catch (t: Throwable) {
-                    Log.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
-                    runCatching { SLM.cancel(model) }
-                    runCatching { SLM.resetSession(model) }
-                    safeClose("exception", t)
                 }
-
-                awaitClose {
-                    // IMPORTANT: Do NOT block here (no SystemClock.sleep).
-                    runCatching { emitCh.close() }
-                    runCatching { emitterJob.cancel() }
-
-                    // Cancel local scope to stop watchdog/emitter coroutines.
-                    anchorScope.cancel(CancellationException("callbackFlow closed"))
-
-                    // Cleanup is performed asynchronously so we never block the close handler.
-                    CoroutineScope(Dispatchers.Default).launch {
-                        val finished = seenFinished.get()
-                        val cleaned = seenOnClean.get()
-
-                        when {
-                            cleaned -> {
-                                waitCleanOrIdle("cleaned")
-                            }
-
-                            isBusyNow() -> {
-                                runCatching { SLM.cancel(model) }
-                                waitCleanOrIdle("after-cancel")
-
-                                if (finished && !isBusyNow() && !seenOnClean.get()) {
-                                    runCatching { SLM.resetSession(model) }
-                                }
-                            }
-
-                            finished -> {
-                                runCatching { SLM.resetSession(model) }
-                            }
-
-                            else -> {
-                                // Collector cancelled early: try to stop the engine if it is still busy.
-                                if (isBusyNow()) {
-                                    runCatching { SLM.cancel(model) }
-                                    waitCleanOrIdle("early-cancel")
-                                }
-                            }
-                        }
-
-                        // Ensure finalize runs once even if safeClose was never called.
-                        finalizeOnce("awaitClose(finalize)")
-                    }
-                }
-            }
-        }
-            .buffer(Channel.BUFFERED)
-            .flowOn(Dispatchers.IO)
+            },
+            cancelActive = { cancelActive() },
+            postCloseCleanup = { _ ->
+                // Reset session ONLY after flow is closed and after a short quiesce.
+                runCatching { SLM.resetSession(model) }
+                    .onFailure { Log.w(TAG, "[$requestId] resetSession failed: ${it.message}", it) }
+            },
+        )
+    }
 }
 
 /* ====================================================================== */
@@ -666,12 +594,21 @@ class LiteRtRepository(
 
     companion object {
         private const val TAG = "LiteRtRepository"
-
         private val REQ_SEQ = AtomicLong(0L)
 
         private const val HARD_WATCHDOG_MS = 20_000L
         private const val PROGRESS_STALL_MS = 6_000L
         private const val PROGRESS_POLL_MS = 250L
+
+        // Longer quiesce: LiteRT async callbacks can arrive slightly late.
+        private const val POST_CLOSE_QUIESCE_MS = 750L
+
+        private const val CLEANUP_WAIT_MS = 2_000L
+    }
+
+    override fun cancelActive() {
+        runCatching { LiteRtLM.cancel(model) }
+            .onFailure { Log.w(TAG, "cancelActive: LiteRtLM.cancel failed: ${it.message}", it) }
     }
 
     override fun buildPrompt(userPrompt: String): String {
@@ -680,205 +617,61 @@ class LiteRtRepository(
         return finalPrompt
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
-    override suspend fun request(prompt: String): Flow<String> =
-        callbackFlow {
-            val out = this
-            val requestId = REQ_SEQ.incrementAndGet()
+    override suspend fun request(prompt: String): Flow<String> {
+        val requestId = REQ_SEQ.incrementAndGet()
+        val gateReqAt = SystemClock.elapsedRealtime()
 
-            val gateReqAt = SystemClock.elapsedRealtime()
+        val params = StreamRunner.Params(
+            backendTag = "litert",
+            modelName = model.name,
+            requestId = requestId,
+            prompt = prompt,
+            gateWaitMs = 0L,
+            hardWatchdogMs = HARD_WATCHDOG_MS,
+            progressStallMs = PROGRESS_STALL_MS,
+            progressPollMs = PROGRESS_POLL_MS,
+            postCloseQuiesceMs = POST_CLOSE_QUIESCE_MS,
+        )
 
-            AI_INFERENCE_GATE.withPermit {
-                val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
-
-                val anchorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-                val closed = AtomicBoolean(false)
-                val finalized = AtomicBoolean(false)
-                val seenFinished = AtomicBoolean(false)
-                val cleanupTriggered = AtomicBoolean(false)
-
-                val startAt = AtomicLong(SystemClock.elapsedRealtime())
-                val lastProgressAt = AtomicLong(startAt.get())
-                val firstChunkAt = AtomicLong(-1L)
-
-                val chunks = AtomicLong(0L)
-                val capturedAll = AtomicBoolean(true)
-                val fullOut = StringBuilder(8 * 1024)
-
-                val normalizedPrompt = prompt.normalizePrompt()
-
-                val emitCh = Channel<String>(capacity = Channel.BUFFERED)
-                val emitterJob = anchorScope.launch {
-                    for (chunk in emitCh) {
-                        if (chunk.isNotEmpty() && !out.isClosedForSend) {
-                            val r = out.trySend(chunk)
-                            if (r.isFailure) {
-                                Log.w(TAG, "[$requestId] trySend failed: ${r.exceptionOrNull()?.message}", r.exceptionOrNull())
-                            }
-                        }
-                    }
-                }
-
-                fun markProgress() {
-                    lastProgressAt.set(SystemClock.elapsedRealtime())
-                }
-
-                fun appendOutput(chunk: String) {
-                    if (chunk.isEmpty()) return
-                    if (firstChunkAt.get() < 0L) firstChunkAt.compareAndSet(-1L, SystemClock.elapsedRealtime())
-                    chunks.incrementAndGet()
-                    val ok = AiTrace.capAppend(fullOut, chunk)
-                    if (!ok) capturedAll.set(false)
-                }
-
-                fun bestEffortCleanUp(tag: String) {
-                    if (!cleanupTriggered.compareAndSet(false, true)) return
-                    runCatching {
-                        LiteRtLM.cleanUp(model) {
-                            Log.d(TAG, "[$requestId] cleaned up ($tag)")
-                        }
-                    }.onFailure {
-                        Log.w(TAG, "[$requestId] cleanUp failed ($tag): ${it.message}", it)
-                    }
-                }
-
-                fun finalizeOnce(reason: String, cause: Throwable? = null) {
-                    if (!finalized.compareAndSet(false, true)) return
-
-                    val now = SystemClock.elapsedRealtime()
-                    val elapsedMs = now - startAt.get()
-                    val firstMs = firstChunkAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
-                    val outText = fullOut.toString()
-
-                    val stats = buildString {
-                        appendLine("=== LITERT TRACE STATS ===")
-                        appendLine("rid=$requestId model='${model.name}' reason=$reason")
-                        appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstChunkMs=$firstMs")
-                        appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
-                        if (cause != null) {
-                            appendLine("--- exception ---")
-                            appendLine(Log.getStackTraceString(cause))
-                        }
-                        appendLine("=== PROMPT (FULL) ===")
-                        appendLine(normalizedPrompt)
-                        appendLine("=== OUTPUT (FULL) ===")
-                        append(outText)
-                        if (!capturedAll.get()) {
-                            appendLine()
-                            appendLine("... (output capture truncated by MAX_CAPTURE_CHARS)")
-                        }
-                    }
-
-                    AiTrace.logLong(
-                        tag = TAG,
-                        level = if (cause != null) Log.WARN else Log.DEBUG,
-                        header = "[$requestId] FINALIZE: $reason",
-                        body = stats
-                    )
-
-                    val f = AiTrace.dumpToFile("litert", requestId, model.name, stats)
-                    if (f != null) Log.d(TAG, "[$requestId] Dumped full prompt/output to: ${f.absolutePath}")
-                }
-
-                fun safeClose(reason: String, cause: Throwable? = null) {
-                    if (!closed.compareAndSet(false, true)) return
-                    finalizeOnce(reason, cause)
-
-                    if (cause != null) Log.w(TAG, "[$requestId] close: $reason", cause)
-                    else Log.d(TAG, "[$requestId] close: $reason")
-
-                    runCatching { emitCh.close() }
-                    out.close(cause)
-                }
-
-                // Watchdog
-                anchorScope.launch {
-                    while (isActive && !closed.get()) {
-                        val now = SystemClock.elapsedRealtime()
-                        val elapsed = now - startAt.get()
-                        val stalled = now - lastProgressAt.get()
-
-                        if (elapsed >= HARD_WATCHDOG_MS) {
-                            Log.w(TAG, "[$requestId] hard timeout (${elapsed}ms) → cleanup/close")
-                            bestEffortCleanUp("hard-watchdog")
-                            safeClose("hard-watchdog-timeout")
-                            break
-                        }
-
-                        if (!seenFinished.get() && stalled >= PROGRESS_STALL_MS) {
-                            Log.w(TAG, "[$requestId] stall timeout (${stalled}ms) → cleanup/close")
-                            bestEffortCleanUp("progress-stall")
-                            safeClose("progress-stall-timeout")
-                            break
-                        }
-
-                        delay(PROGRESS_POLL_MS)
-                    }
-                }
-
-                try {
-                    Log.d(
-                        TAG,
-                        "[$requestId] start: model='${model.name}', prompt.len=${normalizedPrompt.length}, gateWaitMs=$gateWaitMs"
-                    )
-
-                    AiTrace.logLong(
-                        tag = TAG,
-                        level = Log.DEBUG,
-                        header = "[$requestId] PROMPT (FULL)",
-                        body = normalizedPrompt
-                    )
-
+        return StreamRunner.run(
+            params = params.copy(gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt),
+            starter = object : StreamRunner.Starter {
+                override fun startStream(
+                    onChunk: (String) -> Unit,
+                    onTerminal: () -> Unit,
+                    onError: (Throwable) -> Unit,
+                ) {
+                    // IMPORTANT:
+                    // - LiteRtLM.runInference guarantees terminal via resultListener(done=true).
+                    // - cleanUpListener is a hook only; do not treat it as terminal.
                     LiteRtLM.runInference(
                         model = model,
-                        input = normalizedPrompt,
-                        resultListener = { partial, finished ->
-                            markProgress()
-
-                            if (partial.isNotEmpty()) {
-                                appendOutput(partial)
-                                val rr = emitCh.trySend(partial)
-                                if (rr.isFailure) {
-                                    Log.w(TAG, "[$requestId] emitCh.trySend failed: ${rr.exceptionOrNull()?.message}", rr.exceptionOrNull())
-                                }
-                            }
-
-                            if (finished) {
-                                seenFinished.set(true)
-                                safeClose("finished")
-                            }
+                        input = prompt.normalizePrompt(),
+                        resultListener = { partial, done ->
+                            if (partial.isNotEmpty()) onChunk(partial)
+                            if (done) onTerminal()
                         },
                         cleanUpListener = {
-                            markProgress()
-                            safeClose("cleanup-listener")
+                            // Hook only.
                         },
                         onError = { message ->
-                            markProgress()
-                            safeClose("runInference error: $message", RuntimeException(message))
+                            onError(RuntimeException(message))
                         },
                     )
-                } catch (t: Throwable) {
-                    Log.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
-                    bestEffortCleanUp("exception")
-                    safeClose("exception", t)
                 }
+            },
+            cancelActive = { cancelActive() },
+            postCloseCleanup = { _ ->
+                // Cleanup ONLY once, after flow is closed and after quiesce.
+                // Best-effort wait for completion (non-blocking overall).
+                val done = AtomicBoolean(false)
+                LiteRtLM.cleanUp(model) { done.set(true) }
 
-                awaitClose {
-                    runCatching { emitCh.close() }
-                    runCatching { emitterJob.cancel() }
-                    anchorScope.cancel(CancellationException("callbackFlow closed"))
-
-                    // Avoid blocking close handler.
-                    CoroutineScope(Dispatchers.Default).launch {
-                        if (!seenFinished.get()) {
-                            bestEffortCleanUp("collector-cancel")
-                        }
-                        finalizeOnce("awaitClose(finalize)")
-                    }
+                withTimeoutOrNull(CLEANUP_WAIT_MS) {
+                    while (isActive && !done.get()) delay(50L)
+                    true
                 }
-            }
-        }
-            .buffer(Channel.BUFFERED)
-            .flowOn(Dispatchers.IO)
+            },
+        )
+    }
 }

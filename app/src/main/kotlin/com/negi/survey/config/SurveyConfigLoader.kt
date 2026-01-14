@@ -14,12 +14,16 @@
  *  Supports JSON and YAML formats, SLM metadata, model defaults,
  *  Whisper metadata, and structural validation for graph-based survey flows.
  *
- *  Features:
- *   • Typed prompts, graph, SLM runtime metadata, Whisper metadata, and model defaults
- *   • JSON/YAML auto-detection with BOM and newline normalization
- *   • Config-level graph/SLM/Whisper/model-defaults validation
- *   • Backward-compatible type aliases for legacy call sites
- *   • Convenience loader APIs that validate on load
+ *  Update (2-step prompt support):
+ *  ---------------------------------------------------------------------
+ *  This version adds first-class support for a 2-step prompting flow:
+ *    Step 1 (EVAL): produce strict JSON with gating keys (needs_followup, missing, score, etc.)
+ *    Step 2 (FOLLOWUP): optionally produce follow_up_question or {} based on EVAL_JSON
+ *
+ *  Backward compatibility:
+ *   • Legacy prompt-only entries still work.
+ *   • Legacy JSON keys like "expected answer" or "follow-up question" are not parsed here
+ *     (that belongs to output parsing), but config keys are stabilized via SerialName.
  * =====================================================================
  */
 
@@ -28,10 +32,6 @@ package com.negi.survey.config
 import android.content.Context
 import com.charleskorn.kaml.Yaml
 import com.charleskorn.kaml.YamlConfiguration
-import com.negi.survey.config.ConfigFormat.AUTO
-import com.negi.survey.config.ConfigFormat.JSON
-import com.negi.survey.config.ConfigFormat.YAML
-import com.negi.survey.config.NodeType.UNKNOWN
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
@@ -51,7 +51,13 @@ data class SurveyConfig(
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
     val whisper: WhisperMeta = WhisperMeta(),
-    @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
+    @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults(),
+
+    /**
+     * Optional 2-step app-side gating knobs (recommended defaults live in config).
+     * If omitted, the app should fall back to stable defaults.
+     */
+    @SerialName("two_step") val twoStep: TwoStepMeta = TwoStepMeta()
 ) {
 
     // ---------------------------------------------------------------------
@@ -63,11 +69,24 @@ data class SurveyConfig(
      *
      * The template string can contain placeholders such as {{QUESTION}},
      * {{ANSWER}}, and {{NODE_ID}} which will be resolved by the ViewModel.
+     *
+     * 2-step flow:
+     * - [prompt] is the EVAL prompt.
+     * - [followupPrompt] is the optional follow-up prompt template that consumes {{EVAL_JSON}}.
+     *
+     * Back-compat:
+     * - Configs that only define nodeId+prompt still deserialize fine.
      */
     @Serializable
     data class Prompt(
         val nodeId: String,
-        val prompt: String
+        val prompt: String,
+
+        /**
+         * Optional follow-up prompt template for Step 2.
+         * Expected placeholder: {{EVAL_JSON}}.
+         */
+        @SerialName("followup_prompt") val followupPrompt: String? = null
     )
 
     // ---------------------------------------------------------------------
@@ -84,6 +103,23 @@ data class SurveyConfig(
     data class Graph(
         val startId: String,
         val nodes: List<NodeDTO> = emptyList()
+    )
+
+    // ---------------------------------------------------------------------
+    // 2-step meta (app-side gating)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Optional 2-step prompting configuration knobs.
+     *
+     * Typical logic:
+     * - If skipFollowupWhenOk=true and score>=evalOkScoreThreshold, skip step 2.
+     * - Otherwise, step 2 may still be gated by needs_followup from EVAL JSON.
+     */
+    @Serializable
+    data class TwoStepMeta(
+        @SerialName("eval_ok_score_threshold") val evalOkScoreThreshold: Int? = null,
+        @SerialName("skip_followup_when_ok") val skipFollowupWhenOk: Boolean? = null
     )
 
     // ---------------------------------------------------------------------
@@ -104,7 +140,10 @@ data class SurveyConfig(
         /** Preferred accelerator type, "CPU" or "GPU". */
         @SerialName("accelerator") val accelerator: String? = null,
 
-        /** Maximum number of tokens to generate per call. */
+        /**
+         * IMPORTANT (MediaPipe/LiteRT-LM):
+         * This is the total context budget (prompt + output), not output-only.
+         */
         @SerialName("max_tokens") val maxTokens: Int? = null,
 
         /** Top-k sampling parameter. */
@@ -143,8 +182,29 @@ data class SurveyConfig(
         @SerialName("scoring_rule") val scoring_rule: String? = null,
 
         /** Extra constraints to enforce strict output formats. */
-        @SerialName("strict_output") val strict_output: String? = null
-    )
+        @SerialName("strict_output") val strict_output: String? = null,
+
+        /**
+         * Step 2 prompt metadata (optional).
+         *
+         * YAML example:
+         * slm:
+         *   followup:
+         *     preamble: "..."
+         *     strict_output: "..."
+         */
+        @SerialName("followup") val followup: FollowupMeta? = null
+    ) {
+        /**
+         * Metadata for the follow-up step prompt contract.
+         * This is optional and may be absent in 1-step configs.
+         */
+        @Serializable
+        data class FollowupMeta(
+            @SerialName("preamble") val preamble: String? = null,
+            @SerialName("strict_output") val strict_output: String? = null
+        )
+    }
 
     // ---------------------------------------------------------------------
     // Whisper metadata
@@ -195,29 +255,19 @@ data class SurveyConfig(
      */
     @Serializable
     data class ModelDefaults(
-        /**
-         * Default model URL for the download UI.
-         */
+        /** Default model URL for the download UI. */
         @SerialName("default_model_url") val defaultModelUrl: String? = null,
 
-        /**
-         * Default file name to use when saving the model locally.
-         */
+        /** Default file name to use when saving the model locally. */
         @SerialName("default_file_name") val defaultFileName: String? = null,
 
-        /**
-         * Optional timeout override for model loading/inference, in milliseconds.
-         */
+        /** Optional timeout override for model loading/inference, in milliseconds. */
         @SerialName("timeout_ms") val timeoutMs: Long? = null,
 
-        /**
-         * Optional UI throttling interval for streaming updates, in milliseconds.
-         */
+        /** Optional UI throttling interval for streaming updates, in milliseconds. */
         @SerialName("ui_throttle_ms") val uiThrottleMs: Long? = null,
 
-        /**
-         * Optional minimum number of streamed bytes before pushing a UI update.
-         */
+        /** Optional minimum number of streamed bytes before pushing a UI update. */
         @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
     )
 
@@ -256,9 +306,7 @@ data class SurveyConfig(
 
         // --- startId existence ---
         if (graph.startId.isNotBlank() && graph.startId !in idSet) {
-            issues += "graph.startId='${graph.startId}' not found in node ids: ${
-                idSet.joinToString(",")
-            }"
+            issues += "graph.startId='${graph.startId}' not found in node ids: ${idSet.joinToString(",")}"
         }
 
         // --- duplicate node id check ---
@@ -301,9 +349,7 @@ data class SurveyConfig(
             .distinct()
             .toList()
         if (unknownPromptTargets.isNotEmpty()) {
-            issues += "prompts contain unknown nodeIds: ${
-                unknownPromptTargets.joinToString(",")
-            }"
+            issues += "prompts contain unknown nodeIds: ${unknownPromptTargets.joinToString(",")}"
         }
 
         // --- prompt target duplication check ---
@@ -314,9 +360,7 @@ data class SurveyConfig(
             .filterValues { it > 1 }
             .keys
         if (duplicatePromptTargets.isNotEmpty()) {
-            issues += "multiple prompts defined for nodeIds: ${
-                duplicatePromptTargets.joinToString(",")
-            }"
+            issues += "multiple prompts defined for nodeIds: ${duplicatePromptTargets.joinToString(",")}"
         }
 
         // --- nextId reference existence check ---
@@ -358,43 +402,47 @@ data class SurveyConfig(
             }
         }
         slm.maxTokens?.let {
-            if (it <= 0) {
-                issues += "slm.max_tokens must be > 0 (got $it)"
-            }
+            if (it <= 0) issues += "slm.max_tokens must be > 0 (got $it)"
         }
         slm.topK?.let {
-            if (it < 0) {
-                issues += "slm.top_k must be >= 0 (got $it)"
-            }
+            if (it < 0) issues += "slm.top_k must be >= 0 (got $it)"
         }
         slm.topP?.let {
-            if (it !in 0.0..1.0) {
-                issues += "slm.top_p must be in [0.0,1.0] (got $it)"
-            }
+            if (it !in 0.0..1.0) issues += "slm.top_p must be in [0.0,1.0] (got $it)"
         }
         slm.temperature?.let {
-            if (it < 0.0) {
-                issues += "slm.temperature must be >= 0.0 (got $it)"
+            if (it < 0.0) issues += "slm.temperature must be >= 0.0 (got $it)"
+        }
+
+        // --- 2-step config sanity (optional) ---
+        twoStep.evalOkScoreThreshold?.let { th ->
+            if (th !in 1..100) {
+                issues += "two_step.eval_ok_score_threshold must be in [1,100] (got $th)"
+            }
+        }
+
+        // If any prompt defines followupPrompt, we *recommend* slm.followup exists (soft rule).
+        val anyFollowupPrompt = prompts.any { !it.followupPrompt.isNullOrBlank() }
+        if (anyFollowupPrompt) {
+            val hasFollowupMeta = slm.followup != null &&
+                    (!slm.followup.preamble.isNullOrBlank() || !slm.followup.strict_output.isNullOrBlank())
+            if (!hasFollowupMeta) {
+                issues += "2-step detected (prompts.followup_prompt present) but slm.followup is missing or blank"
             }
         }
 
         // --- Whisper param sanity (optional, only if given) ---
         whisper.assetModelPath?.let { p ->
-            if (p.isBlank()) {
-                issues += "whisper.asset_model_path is blank"
-            }
+            if (p.isBlank()) issues += "whisper.asset_model_path is blank"
         }
         whisper.language?.let { lang ->
             val norm = lang.trim().lowercase()
-            val ok = norm in setOf("auto", "en", "ja", "sw")
-            if (!ok) {
+            if (norm !in setOf("auto", "en", "ja", "sw")) {
                 issues += "whisper.language should be one of 'auto','en','ja','sw' (got '$lang')"
             }
         }
         whisper.targetSampleRate?.let { sr ->
-            if (sr <= 0) {
-                issues += "whisper.target_sample_rate must be > 0 (got $sr)"
-            }
+            if (sr <= 0) issues += "whisper.target_sample_rate must be > 0 (got $sr)"
         }
         whisper.recordSampleRates?.let { rs ->
             if (rs.isEmpty()) {
@@ -409,29 +457,19 @@ data class SurveyConfig(
 
         // --- Model defaults sanity (optional, only if given) ---
         modelDefaults.defaultModelUrl?.let { url ->
-            if (url.isBlank()) {
-                issues += "model_defaults.default_model_url is blank"
-            }
+            if (url.isBlank()) issues += "model_defaults.default_model_url is blank"
         }
         modelDefaults.defaultFileName?.let { name ->
-            if (name.isBlank()) {
-                issues += "model_defaults.default_file_name is blank"
-            }
+            if (name.isBlank()) issues += "model_defaults.default_file_name is blank"
         }
         modelDefaults.timeoutMs?.let { ms ->
-            if (ms <= 0L) {
-                issues += "model_defaults.timeout_ms must be > 0 (got $ms)"
-            }
+            if (ms <= 0L) issues += "model_defaults.timeout_ms must be > 0 (got $ms)"
         }
         modelDefaults.uiThrottleMs?.let { ms ->
-            if (ms < 0L) {
-                issues += "model_defaults.ui_throttle_ms must be >= 0 (got $ms)"
-            }
+            if (ms < 0L) issues += "model_defaults.ui_throttle_ms must be >= 0 (got $ms)"
         }
         modelDefaults.uiMinDeltaBytes?.let { bytes ->
-            if (bytes < 0L) {
-                issues += "model_defaults.ui_min_delta_bytes must be >= 0 (got $bytes)"
-            }
+            if (bytes < 0L) issues += "model_defaults.ui_min_delta_bytes must be >= 0 (got $bytes)"
         }
 
         return issues
@@ -451,8 +489,7 @@ data class SurveyConfig(
      * Export the prompt table as JSON Lines.
      *
      * Each list element is a single JSON-encoded [Prompt] record.
-     * This is useful for feeding prompts into offline tools or logging
-     * pipelines.
+     * This is useful for feeding prompts into offline tools or logging pipelines.
      */
     fun toJsonl(): List<String> =
         SurveyConfigLoader.jsonCompact.let { json ->
@@ -478,7 +515,7 @@ data class SurveyConfig(
         SurveyConfigLoader.yaml(strict).encodeToString(serializer(), this)
 
     /**
-     * Compose a single system prompt string from the SLM metadata fields.
+     * Compose a single Step-1 (EVAL) system prompt string from the SLM metadata fields.
      *
      * Only non-blank fields are appended, separated by line breaks, in the
      * following order:
@@ -499,6 +536,26 @@ data class SurveyConfig(
             slm.scoring_rule,
             slm.strict_output,
             slm.empty_json_instruction
+        ).filterNot { it.isNullOrBlank() }
+            .map { it!!.trim() }
+
+        return parts.joinToString("\n")
+    }
+
+    /**
+     * Compose a single Step-2 (FOLLOWUP) system prompt string.
+     *
+     * This uses:
+     *  - slm.followup.preamble
+     *  - slm.followup.strict_output
+     *
+     * Returns empty string if follow-up metadata is not defined.
+     */
+    fun composeFollowupSystemPrompt(): String {
+        val fu = slm.followup ?: return ""
+        val parts = listOf(
+            fu.preamble,
+            fu.strict_output
         ).filterNot { it.isNullOrBlank() }
             .map { it!!.trim() }
 
@@ -621,6 +678,7 @@ object SurveyConfigLoader {
         ignoreUnknownKeys = true
         prettyPrint = false
         isLenient = true
+        explicitNulls = false
     }
 
     /**
@@ -630,6 +688,7 @@ object SurveyConfigLoader {
         ignoreUnknownKeys = true
         prettyPrint = true
         isLenient = true
+        explicitNulls = false
     }
 
     /**
@@ -753,15 +812,13 @@ object SurveyConfigLoader {
         } catch (ex: SerializationException) {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
-                "Parsing error (format=${chosen.name}). First 200 chars: " +
-                        "$preview :: ${ex.message}",
+                "Parsing error (format=${chosen.name}). First 200 chars: $preview :: ${ex.message}",
                 ex
             )
         } catch (ex: Exception) {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
-                "Unexpected error while parsing SurveyConfig (format=${chosen.name}). " +
-                        "First 200 chars: $preview :: ${ex.message}",
+                "Unexpected error while parsing SurveyConfig (format=${chosen.name}). First 200 chars: $preview :: ${ex.message}",
                 ex
             )
         }

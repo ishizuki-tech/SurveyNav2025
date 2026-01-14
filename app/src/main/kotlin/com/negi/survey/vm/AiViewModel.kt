@@ -64,7 +64,24 @@ class AiViewModel(
         private const val TAG = "AiViewModel"
         private const val DEBUG_LOGS = true
         private const val DEFAULT_TIMEOUT_MS = 120_000L
+
+        /** Placeholder used in FOLLOWUP prompt template to inject EVAL JSON. */
+        private const val EVAL_JSON_PLACEHOLDER = "{{EVAL_JSON}}"
     }
+
+    /**
+     * Two-step gating knobs.
+     *
+     * - EVAL returns strict JSON containing:
+     *   - score (0..100)
+     *   - needs_followup (boolean)
+     * - FOLLOWUP runs only when gating decides it is necessary.
+     */
+    data class TwoStepGating(
+        val evalOkScoreThreshold: Int = 85,
+        val skipFollowupWhenOk: Boolean = true,
+        val forceFollowupWhenScoreBelowThreshold: Boolean = true
+    )
 
     // ───────────────────────── UI state ─────────────────────────
 
@@ -85,7 +102,7 @@ class AiViewModel(
 
     private val _raw = MutableStateFlow<String?>(null)
 
-    /** Final raw output used for parsing follow-ups and score. */
+    /** Final raw output used for JSON bubble (EVAL stage). */
     val raw: StateFlow<String?> = _raw.asStateFlow()
 
     private val _followupQuestion = MutableStateFlow<String?>(null)
@@ -251,16 +268,7 @@ class AiViewModel(
     /**
      * Evaluate the given [prompt] and return the parsed score (0..100) or null.
      *
-     * Design:
-     * - This is a suspend wrapper that:
-     *   1) prepares UI state
-     *   2) starts a single evaluation job
-     *   3) awaits its completion
-     *
-     * Timeout semantics:
-     * - A timeout still attempts to parse whatever was streamed so far.
-     * - [AiEvent.Final] is emitted at most once per call.
-     * - [AiEvent.Timeout] is emitted in addition when applicable.
+     * This is the legacy single-step evaluation API.
      */
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
         if (prompt.isBlank()) {
@@ -284,10 +292,16 @@ class AiViewModel(
         prepareUiForNewRun()
 
         val elapsed = measureTimeMillis {
-            val job = startEvaluationInternal(
+            val job = startSingleStageInternal(
+                stageName = "single",
                 originalPrompt = prompt,
                 fullPrompt = fullPrompt,
-                timeoutMs = timeoutMs
+                timeoutMs = timeoutMs,
+                publishRaw = true,
+                parseScore = true,
+                parseFollowups = true,
+                clearRawAtStart = true,
+                emitFinalEvent = true
             )
             evalJob = job
             job.join()
@@ -302,6 +316,8 @@ class AiViewModel(
     /**
      * Fire-and-forget variant of [evaluate].
      *
+     * Legacy single-step evaluation API.
+     *
      * @return [Job] representing the launched evaluation.
      */
     fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
@@ -310,13 +326,13 @@ class AiViewModel(
             return viewModelScope.launch { }
         }
 
-        Log.d("AiViewModel", "prompt: $prompt")
+        Log.d(TAG, "prompt: $prompt")
 
         val fullPrompt = runCatching { repo.buildPrompt(prompt) }
             .onFailure { t -> Log.e(TAG, "evaluateAsync: buildPrompt failed", t) }
             .getOrElse { prompt }
 
-        Log.d("AiViewModel", "fullPrompt: $fullPrompt")
+        Log.d(TAG, "fullPrompt: $fullPrompt")
 
         if (!running.compareAndSet(false, true)) {
             Log.w(TAG, "evaluateAsync: already running -> returning existing job")
@@ -328,10 +344,16 @@ class AiViewModel(
 
         prepareUiForNewRun()
 
-        val job = startEvaluationInternal(
+        val job = startSingleStageInternal(
+            stageName = "single",
             originalPrompt = prompt,
             fullPrompt = fullPrompt,
-            timeoutMs = timeoutMs
+            timeoutMs = timeoutMs,
+            publishRaw = true,
+            parseScore = true,
+            parseFollowups = true,
+            clearRawAtStart = true,
+            emitFinalEvent = true
         )
         evalJob = job
 
@@ -339,6 +361,156 @@ class AiViewModel(
             finalizeRunFlags()
         }
 
+        return job
+    }
+
+    /**
+     * Two-step prompting API (fire-and-forget).
+     *
+     * Stage 1 (EVAL):
+     * - Must return strict JSON containing:
+     *   - "score": int 0..100
+     *   - "needs_followup": boolean (or tolerant variants)
+     * - Publishes [raw] so UI can render JSON bubble.
+     *
+     * Stage 2 (FOLLOWUP):
+     * - Runs only if gating decides it is needed.
+     * - Uses [followupPromptTemplate] which should contain {{EVAL_JSON}} placeholder.
+     * - Does NOT publish [raw] (to avoid duplicate JSON bubble replacement in UI).
+     * - Publishes [followupQuestion].
+     *
+     * IMPORTANT UI COMPAT NOTE:
+     * - We intentionally drop loading=false between stages so existing AiScreen can
+     *   finalize the JSON bubble after EVAL.
+     * - We clear raw before FOLLOWUP so stage2 completion does not re-trigger
+     *   "replace typing with JSON" logic in UI.
+     */
+    fun evaluateTwoStepAsync(
+        evalPrompt: String,
+        followupPromptTemplate: String,
+        gating: TwoStepGating = TwoStepGating(),
+        timeoutMsEval: Long = defaultTimeoutMs,
+        timeoutMsFollowup: Long = defaultTimeoutMs
+    ): Job {
+        if (evalPrompt.isBlank()) {
+            resetStates(keepError = false)
+            return viewModelScope.launch { }
+        }
+
+        if (!running.compareAndSet(false, true)) {
+            Log.w(TAG, "evaluateTwoStepAsync: already running -> returning existing job")
+            return evalJob ?: viewModelScope.launch { }
+        }
+
+        evalJob?.cancel()
+        evalJob = null
+
+        // Prepare run state (EVAL stage).
+        prepareUiForNewRun()
+
+        val job = viewModelScope.launch(ioDispatcher) {
+            try {
+                // Build full prompt for EVAL.
+                val fullEval = runCatching { repo.buildPrompt(evalPrompt) }
+                    .onFailure { t -> Log.e(TAG, "twoStep: buildPrompt(EVAL) failed", t) }
+                    .getOrElse { evalPrompt }
+
+                // ---- Stage 1: EVAL ----
+                val evalOutcome = runStageStreaming(
+                    stageName = "eval",
+                    originalPrompt = evalPrompt,
+                    fullPrompt = fullEval,
+                    timeoutMs = timeoutMsEval
+                )
+
+                val evalRaw = evalOutcome.rawText
+
+                // Publish EVAL output for JSON bubble.
+                if (evalRaw.isNotBlank()) {
+                    _raw.value = evalRaw
+                    _score.value = clampScore(extractScoreFromJson(evalRaw) ?: FollowupExtractor.extractScore(evalRaw))
+                    _followups.value = emptyList()
+                    _followupQuestion.value = null
+
+                    // Emit Final ONCE for the EVAL stage (preserves legacy semantics).
+                    _events.tryEmit(AiEvent.Final(evalRaw, _score.value, emptyList()))
+                } else {
+                    _raw.value = ""
+                    _score.value = null
+                    _followups.value = emptyList()
+                    _followupQuestion.value = null
+                    _events.tryEmit(AiEvent.Final("", null, emptyList()))
+                }
+
+                if (evalOutcome.timedOut) {
+                    _error.value = "timeout"
+                    _events.tryEmit(AiEvent.Timeout)
+                    return@launch
+                }
+
+                // Drop loading=false so UI can finalize JSON bubble after stage1.
+                _loading.value = false
+                _stream.value = ""
+
+                // Decide whether to run follow-up.
+                val runFollowup = decideFollowupFromEval(evalRaw, gating)
+
+                if (!runFollowup) {
+                    return@launch
+                }
+
+                // ---- Stage 2: FOLLOWUP ----
+                // Clear raw so stage2 completion does not re-trigger JSON bubble replacement in UI.
+                _raw.value = null
+                _followupQuestion.value = null
+                _followups.value = emptyList()
+
+                _loading.value = true
+
+                val injected = injectEvalJson(
+                    template = followupPromptTemplate,
+                    evalJson = evalRaw
+                )
+
+                val fullFollow = runCatching { repo.buildPrompt(injected) }
+                    .onFailure { t -> Log.e(TAG, "twoStep: buildPrompt(FOLLOWUP) failed", t) }
+                    .getOrElse { injected }
+
+                val followOutcome = runStageStreaming(
+                    stageName = "followup",
+                    originalPrompt = injected,
+                    fullPrompt = fullFollow,
+                    timeoutMs = timeoutMsFollowup
+                )
+
+                val followRaw = followOutcome.rawText
+
+                val q = extractFollowupQuestion(followRaw)
+                if (!q.isNullOrBlank()) {
+                    _followupQuestion.value = q
+                    _followups.value = listOf(q)
+                }
+
+                if (followOutcome.timedOut) {
+                    _error.value = "timeout"
+                    _events.tryEmit(AiEvent.Timeout)
+                }
+            } catch (ce: CancellationException) {
+                _error.value = "cancelled"
+                _events.tryEmit(AiEvent.Cancelled)
+                throw ce
+            } catch (t: Throwable) {
+                val msg = t.message ?: "error"
+                _error.value = msg
+                _events.tryEmit(AiEvent.Error(msg))
+                Log.e(TAG, "evaluateTwoStepAsync: error", t)
+            } finally {
+                // End of the full 2-step pipeline.
+                finalizeRunFlags()
+            }
+        }
+
+        evalJob = job
         return job
     }
 
@@ -398,116 +570,156 @@ class AiViewModel(
     // ───────────────────────── Internal evaluation core ─────────────────────────
 
     /**
-     * Starts the evaluation coroutine that:
-     * - streams text
-     * - finalizes raw output
-     * - parses score & follow-ups
-     * - emits terminal events
-     *
-     * This function must be called only after [prepareUiForNewRun]
-     * and after [running] has been set to true.
+     * Single-step evaluation runner that matches legacy behavior.
      */
-    private fun startEvaluationInternal(
+    private fun startSingleStageInternal(
+        stageName: String,
         originalPrompt: String,
         fullPrompt: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        publishRaw: Boolean,
+        parseScore: Boolean,
+        parseFollowups: Boolean,
+        clearRawAtStart: Boolean,
+        emitFinalEvent: Boolean
     ): Job = viewModelScope.launch(ioDispatcher) {
+        try {
+            val outcome = runStageStreaming(
+                stageName = stageName,
+                originalPrompt = originalPrompt,
+                fullPrompt = fullPrompt,
+                timeoutMs = timeoutMs,
+                clearRawAtStart = clearRawAtStart,
+                clearFollowupsAtStart = true,
+                clearScoreAtStart = true
+            )
 
+            val rawText = outcome.rawText.ifBlank { _stream.value }
+
+            if (publishRaw) {
+                _raw.value = rawText
+            }
+
+            if (parseScore) {
+                val parsedScore = clampScore(FollowupExtractor.extractScore(rawText))
+                _score.value = parsedScore
+            }
+
+            if (parseFollowups) {
+                val top3 = FollowupExtractor.fromRaw(rawText, max = 3)
+                _followups.value = top3
+                _followupQuestion.value = top3.firstOrNull()
+            }
+
+            if (emitFinalEvent) {
+                _events.tryEmit(AiEvent.Final(rawText, _score.value, _followups.value))
+            }
+
+            if (outcome.timedOut) {
+                _error.value = "timeout"
+                _events.tryEmit(AiEvent.Timeout)
+            }
+        } catch (ce: CancellationException) {
+            _error.value = "cancelled"
+            _events.tryEmit(AiEvent.Cancelled)
+            Log.w(TAG, "startSingleStageInternal: cancelled", ce)
+            throw ce
+        } catch (t: Throwable) {
+            val msg = t.message ?: "error"
+            _error.value = msg
+            _events.tryEmit(AiEvent.Error(msg))
+            Log.e(TAG, "startSingleStageInternal: error", t)
+        }
+    }
+
+    /**
+     * Streaming stage runner (shared by single-step and two-step).
+     *
+     * - Streams chunks via [repo.request].
+     * - Updates [_stream] and emits [AiEvent.Stream].
+     * - Applies timeout but still returns best-effort buffer.
+     */
+    private suspend fun runStageStreaming(
+        stageName: String,
+        originalPrompt: String,
+        fullPrompt: String,
+        timeoutMs: Long,
+        clearRawAtStart: Boolean = false,
+        clearFollowupsAtStart: Boolean = false,
+        clearScoreAtStart: Boolean = false
+    ): StageOutcome {
         val buf = StringBuilder()
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
 
-        var finalEmitted = false
+        if (clearRawAtStart) _raw.value = null
+        if (clearFollowupsAtStart) {
+            _followupQuestion.value = null
+            _followups.value = emptyList()
+        }
+        if (clearScoreAtStart) _score.value = null
 
-        try {
+        // Ensure loading is true while running this stage (caller may toggle between stages).
+        _loading.value = true
+        _stream.value = ""
+
+        val elapsed = measureTimeMillis {
             try {
-                withTimeout(timeoutMs) {
-                    repo.request(fullPrompt).collect { part ->
-                        if (part.isNotEmpty()) {
-                            chunkCount++
-                            buf.append(part)
-                            totalChars += part.length
+                try {
+                    withTimeout(timeoutMs) {
+                        repo.request(fullPrompt).collect { part ->
+                            if (part.isNotEmpty()) {
+                                chunkCount++
+                                buf.append(part)
+                                totalChars += part.length
 
-                            _stream.update { it + part }
-                            _events.tryEmit(AiEvent.Stream(part))
+                                _stream.update { it + part }
+                                _events.tryEmit(AiEvent.Stream(part))
+                            }
                         }
                     }
-                }
-            } catch (e: TimeoutCancellationException) {
-                timedOut = true
-                Log.w(TAG, "evaluate: timeout after ${timeoutMs}ms", e)
-            } catch (e: CancellationException) {
-                // Treat only timeout-like cancellations as soft timeouts.
-                // For user-driven cancellation, rethrow and let the outer catch handle events.
-                if (looksLikeTimeout(e)) {
+                } catch (e: TimeoutCancellationException) {
                     timedOut = true
-                    Log.w(TAG, "evaluate: timeout-like cancellation (${e.javaClass.name})")
-                } else {
-                    throw e
+                    Log.w(TAG, "runStage[$stageName]: timeout after ${timeoutMs}ms", e)
+                } catch (e: CancellationException) {
+                    if (looksLikeTimeout(e)) {
+                        timedOut = true
+                        Log.w(TAG, "runStage[$stageName]: timeout-like cancellation (${e.javaClass.name})")
+                    } else {
+                        throw e
+                    }
                 }
-            }
-
-            val rawText = buf.toString().ifBlank { _stream.value }
-
-            if (DEBUG_LOGS) {
-                Log.d(
-                    TAG,
-                    "Evaluate[stats]: prompt.len=${originalPrompt.length}, full.len=${fullPrompt.length}, chunks=$chunkCount, chars=$totalChars"
-                )
-                Log.d(
-                    TAG,
-                    "Evaluate[sha]: prompt=${sha256Hex(originalPrompt)}, full=${sha256Hex(fullPrompt)}, raw=${sha256Hex(rawText)}"
-                )
-            }
-
-            if (rawText.isNotBlank()) {
-                val parsedScore = clampScore(FollowupExtractor.extractScore(rawText))
-                val top3 = FollowupExtractor.fromRaw(rawText, max = 3)
-                val q0 = top3.firstOrNull()
-
-                _raw.value = rawText
-                _score.value = parsedScore
-                _followups.value = top3
-                _followupQuestion.value = q0
-
-                _events.tryEmit(AiEvent.Final(rawText, parsedScore, top3))
-                finalEmitted = true
-
-                if (DEBUG_LOGS) {
-                    Log.i(TAG, "Score=$parsedScore, FU[0]=${q0 ?: "<none>"} FU[1..]=${top3.drop(1)}")
-                }
-            } else {
-                Log.w(TAG, "evaluate: no output produced (stream & buffer empty)")
-                _events.tryEmit(AiEvent.Final("", null, emptyList()))
-                finalEmitted = true
-            }
-
-            if (timedOut) {
-                _error.value = "timeout"
-                _events.tryEmit(AiEvent.Timeout)
-            }
-        } catch (e: CancellationException) {
-            _error.value = "cancelled"
-
-            if (!finalEmitted) {
-                // Best-effort terminal snapshot for UI that expects a final signal.
-                _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
-            }
-
-            _events.tryEmit(AiEvent.Cancelled)
-            Log.w(TAG, "evaluate: cancelled", e)
-            throw e
-        } catch (t: Throwable) {
-            val msg = t.message ?: "error"
-            _error.value = msg
-            _events.tryEmit(AiEvent.Error(msg))
-            Log.e(TAG, "evaluate: error", t)
-
-            if (!finalEmitted) {
-                _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
+            } catch (ce: CancellationException) {
+                Log.w(TAG, "runStage[$stageName]: cancelled", ce)
+                throw ce
+            } catch (t: Throwable) {
+                Log.e(TAG, "runStage[$stageName]: error", t)
+                throw t
             }
         }
+
+        val rawText = buf.toString().ifBlank { _stream.value }
+
+        if (DEBUG_LOGS) {
+            Log.d(
+                TAG,
+                "Stage[$stageName][stats]: elapsed=${elapsed}ms, prompt.len=${originalPrompt.length}, full.len=${fullPrompt.length}, chunks=$chunkCount, chars=$totalChars"
+            )
+            Log.d(
+                TAG,
+                "Stage[$stageName][sha]: prompt=${sha256Hex(originalPrompt)}, full=${sha256Hex(fullPrompt)}, raw=${sha256Hex(rawText)}"
+            )
+        }
+
+        // Caller decides whether to keep loading true or false after this stage.
+        // We do not finalize flags here to support multi-stage pipelines.
+        _stream.value = ""
+
+        return StageOutcome(
+            rawText = rawText,
+            timedOut = timedOut
+        )
     }
 
     /**
@@ -540,7 +752,145 @@ class AiViewModel(
         evalJob = null
     }
 
+    // ───────────────────────── two-step helpers ─────────────────────────
+
+    /**
+     * Decide whether FOLLOWUP should run based on the EVAL JSON + gating.
+     *
+     * Supported keys (tolerant):
+     * - score / "score"
+     * - needs_followup / "needs_followup" / "needs followup" / "needs-followup"
+     */
+    private fun decideFollowupFromEval(evalRaw: String, gating: TwoStepGating): Boolean {
+        val s = clampScore(extractScoreFromJson(evalRaw) ?: FollowupExtractor.extractScore(evalRaw)) ?: 0
+        val needs = extractBoolFromJson(evalRaw, "needs_followup")
+            ?: extractBoolFromJson(evalRaw, "needs followup")
+            ?: extractBoolFromJson(evalRaw, "needs-followup")
+            ?: false
+
+        val ok = s >= gating.evalOkScoreThreshold
+
+        if (ok && gating.skipFollowupWhenOk && !needs) return false
+        if (!ok && gating.forceFollowupWhenScoreBelowThreshold) return true
+        return needs
+    }
+
+    /**
+     * Inject EVAL JSON into the FOLLOWUP prompt template.
+     */
+    private fun injectEvalJson(template: String, evalJson: String): String {
+        val t = template
+        return if (t.contains(EVAL_JSON_PLACEHOLDER)) {
+            t.replace(EVAL_JSON_PLACEHOLDER, evalJson.trim())
+        } else {
+            // Fallback: append at the end so it still works even if placeholder was forgotten.
+            buildString {
+                append(t.trim())
+                append("\n\nEVAL_JSON:\n")
+                append(evalJson.trim())
+            }
+        }
+    }
+
+    /**
+     * Extract follow-up question from strict JSON, with fallbacks.
+     *
+     * Supported keys (tolerant):
+     * - follow_up_question
+     * - follow-up question
+     * - followupQuestion
+     */
+    private fun extractFollowupQuestion(text: String): String? {
+        val raw = stripCodeFence(text).trim()
+        if (raw.isBlank()) return null
+
+        val fromJson = extractStringFromJson(raw, "follow_up_question")
+            ?: extractStringFromJson(raw, "follow-up question")
+            ?: extractStringFromJson(raw, "followupQuestion")
+
+        if (!fromJson.isNullOrBlank()) return fromJson.trim()
+
+        // Fallback: treat as plain text.
+        return raw.ifBlank { null }
+    }
+
+    // ───────────────────────── JSON extraction (lenient regex) ─────────────────────────
+
+    /**
+     * Extract integer value for a JSON key.
+     *
+     * Example matches:
+     * - "score": 88
+     * - "score": "88"
+     */
+    private fun extractIntFromJson(text: String, key: String): Int? {
+        val t = stripCodeFence(text)
+        val regex = Regex("""(?i)"${Regex.escape(key)}"\s*:\s*"?(\d{1,3})"?""")
+        val m = regex.find(t) ?: return null
+        val v = m.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
+        return v.coerceIn(0, 100)
+    }
+
+    /**
+     * Extract boolean value for a JSON key.
+     *
+     * Example matches:
+     * - "needs_followup": true
+     * - "needs_followup": "false"
+     */
+    private fun extractBoolFromJson(text: String, key: String): Boolean? {
+        val t = stripCodeFence(text)
+        val regex = Regex("""(?i)"${Regex.escape(key)}"\s*:\s*"?\s*(true|false)\s*"?""")
+        val m = regex.find(t) ?: return null
+        return when (m.groupValues.getOrNull(1)?.lowercase()) {
+            "true" -> true
+            "false" -> false
+            else -> null
+        }
+    }
+
+    /**
+     * Extract string value for a JSON key (best-effort, non-escaping).
+     *
+     * Example match:
+     * - "follow_up_question": "Je, ...?"
+     */
+    private fun extractStringFromJson(text: String, key: String): String? {
+        val t = stripCodeFence(text)
+        // Non-greedy string capture that tolerates basic escapes.
+        val regex = Regex("""(?is)"${Regex.escape(key)}"\s*:\s*"(.*?)"""")
+        val m = regex.find(t) ?: return null
+        val v = m.groupValues.getOrNull(1) ?: return null
+        return v
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\\"", "\"")
+            .trim()
+            .ifBlank { null }
+    }
+
+    /**
+     * Prefer strict score from EVAL JSON. Falls back to extractor if missing.
+     */
+    private fun extractScoreFromJson(text: String): Int? =
+        extractIntFromJson(text, "score")
+
+    private fun stripCodeFence(text: String): String {
+        val t = text.trim()
+        if (!t.startsWith("```")) return t
+        val closing = t.indexOf("```", startIndex = 3)
+        if (closing == -1) return t
+        val newline = t.indexOf('\n', startIndex = 3)
+        val contentStart = if (newline in 4 until closing) newline + 1 else 3
+        return t.substring(contentStart, closing).trim()
+    }
+
     // ───────────────────────── helpers ─────────────────────────
+
+    private data class StageOutcome(
+        val rawText: String,
+        val timedOut: Boolean
+    )
 
     /**
      * Clamp score into the expected UI range.
