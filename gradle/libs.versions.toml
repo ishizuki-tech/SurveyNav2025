@@ -1,5 +1,5 @@
 [versions]
-agp = "8.13.0"
+agp = "8.13.2"
 
 # Kotlin
 kotlin = "2.1.21"
@@ -41,7 +41,7 @@ media3Ui = "1.8.0"
 
 # MediaPipe / LiteRT-LM
 mediapipeTasksGenai = "0.10.29"
-litertlm = "0.8.0"
+litertlm = "0.9.0-alpha01"
 
 # Networking
 okhttp = "4.12.0"
