@@ -17,6 +17,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.AssetManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -69,6 +70,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -80,7 +82,6 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -93,6 +94,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.NavBackStack
@@ -128,9 +130,11 @@ import com.negi.survey.vm.FlowReview
 import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -144,6 +148,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.system.exitProcess
+
+// IMPORTANT:
+// We alias ConfigDetails to avoid any accidental name collision with local types.
+import com.negi.survey.screens.ConfigDetails as ScreenConfigDetails
 
 /**
  * Root activity of the SurveyNav app.
@@ -198,9 +206,6 @@ class MainActivity : ComponentActivity() {
 
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
-/**
- * A simple vertical gradient used as a dark backplate behind loading/error cards.
- */
 @Composable
 private fun animatedBackplate(): Brush =
     Brush.verticalGradient(
@@ -208,12 +213,6 @@ private fun animatedBackplate(): Brush =
         1f to Color(0xFF040404)
     )
 
-/**
- * An ultra-thin neon-like edge glow for cards.
- *
- * This uses a radial gradient centered on the composable surface to create
- * a subtle halo that remains readable on a monochrome palette.
- */
 @Composable
 private fun Modifier.neonEdgeThin(
     color: Color = MaterialTheme.colorScheme.primary,
@@ -251,13 +250,6 @@ fun InitGate(
     var initJob by remember(key) { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
-    /**
-     * Starts or restarts the initialization coroutine.
-     *
-     * Defensive:
-     * - Cancels any in-flight init job to avoid concurrent init races.
-     * - Keeps UI state coherent even when cancellation happens mid-flight.
-     */
     fun kick() {
         initJob?.cancel()
         isLoading = true
@@ -267,7 +259,6 @@ fun InitGate(
                 init()
                 isLoading = false
             } catch (ce: CancellationException) {
-                // Cancellation is expected when key changes or composable disposes.
                 throw ce
             } catch (t: Throwable) {
                 error = t
@@ -276,18 +267,10 @@ fun InitGate(
         }
     }
 
-    /**
-     * Cancel running init if this gate leaves composition.
-     */
     DisposableEffect(key) {
-        onDispose {
-            initJob?.cancel()
-        }
+        onDispose { initJob?.cancel() }
     }
 
-    /**
-     * Run initialization once when the given [key] enters composition.
-     */
     LaunchedEffect(key) {
         kick()
     }
@@ -414,9 +397,6 @@ fun AudioPermissionGate(
         )
     }
 
-    /**
-     * Re-check permission when returning from Settings.
-     */
     DisposableEffect(lifecycleOwner, context) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -544,11 +524,11 @@ fun AppNav() {
     val options = remember(appContext) {
         val assetManager = appContext.assets
 
-        // Collect YAML config candidates (supports subfolders such as "configs/").
         val yamlFiles = listAssetYamlConfigs(assetManager)
             .filter { path ->
                 val name = path.substringAfterLast('/')
-                name.endsWith(".yaml") && (name.startsWith("survey_") || name.startsWith("survey_config"))
+                (name.endsWith(".yaml") || name.endsWith(".yml")) &&
+                        (name.startsWith("survey_") || name.startsWith("survey_config"))
             }
             .sorted()
 
@@ -560,7 +540,7 @@ fun AppNav() {
         mapped.ifEmpty {
             listOf(
                 ConfigOptionUi(
-                    id = "survey_config1.yaml",
+                    id = "survey_config20.yaml",
                     label = "Default config",
                     description = "Fallback survey configuration loaded from survey_config1.yaml."
                 )
@@ -572,9 +552,9 @@ fun AppNav() {
     var config by remember { mutableStateOf<SurveyConfig?>(null) }
     var configLoading by remember { mutableStateOf(false) }
     var configError by remember { mutableStateOf<String?>(null) }
+    var selectionEpoch by remember { mutableIntStateOf(0) }
 
-    var selectionEpoch by remember { mutableStateOf(0) }
-
+    // Intro: add onResolveConfigDetails (required by IntroScreen signature)
     if (chosen == null) {
         IntroScreen(
             options = options,
@@ -589,6 +569,12 @@ fun AppNav() {
                 Log.d(
                     "MainActivity",
                     "Intro -> Start session. epoch=$selectionEpoch, file=${option.id}"
+                )
+            },
+            onResolveConfigDetails = { configId ->
+                resolveConfigDetailsFromAssets(
+                    context = appContext,
+                    configId = configId
                 )
             }
         )
@@ -933,16 +919,6 @@ fun SurveyNavHost(
 
     val canGoBack by vmSurvey.canGoBack.collectAsState()
 
-    /**
-     * IMPORTANT:
-     * - Do NOT use rememberViewModelStoreNavEntryDecorator() unless you also install the
-     *   corresponding SavedState decorator for Navigation3.
-     * - Otherwise, you may crash with:
-     *   "ViewModelStoreNavEntryDecorator requires adding the SavedStateNavEntryDecorator..."
-     *
-     * This app already owns a session-wide ViewModelStore, so NavEntry ViewModel storage
-     * is not required here.
-     */
     NavDisplay(
         backStack = backStack,
         entryDecorators = listOf(
@@ -1076,16 +1052,12 @@ private fun HomeScreen(
 /* ───────────────────────────── SLM Config Helpers ────────────────────────── */
 
 private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
-    // Force the value type to Any to avoid Kotlin inferring an intersection type
-    // like Comparable<*> & Serializable when mixing String/Int/Double literals.
     val out: MutableMap<ConfigKey, Any> = mutableMapOf(
         ConfigKey.ACCELERATOR to ((slm.accelerator ?: "GPU").uppercase(Locale.US)),
         ConfigKey.MAX_TOKENS to ((slm.maxTokens ?: 512).toInt()),
         ConfigKey.TOP_K to ((slm.topK ?: 1).toInt()),
         ConfigKey.TOP_P to ((slm.topP ?: 0.0).toDouble()),
         ConfigKey.TEMPERATURE to ((slm.temperature ?: 0.0).toDouble())
-        // If you support repetition penalty, add it here with a corresponding ConfigKey:
-        // ConfigKey.REPETITION_PENALTY to ((slm.repetitionPenalty ?: 1.0).toDouble())
     )
 
     normalizeNumberTypes(out)
@@ -1094,7 +1066,6 @@ private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, A
 }
 
 private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
-    // Keep everything in stable numeric types for downstream APIs.
     m[ConfigKey.MAX_TOKENS] = (m[ConfigKey.MAX_TOKENS] as? Number)?.toInt() ?: 512
     m[ConfigKey.TOP_K] = (m[ConfigKey.TOP_K] as? Number)?.toInt() ?: 1
     m[ConfigKey.TOP_P] = (m[ConfigKey.TOP_P] as? Number)?.toDouble() ?: 0.0
@@ -1211,17 +1182,7 @@ private fun prettyNameFromFileStem(stem: String): String {
     }
 }
 
-/**
- * List YAML files from assets.
- *
- * Supports a shallow recursion so that configs can live in:
- * - assets/
- * - assets/configs/
- * - assets/surveys/
- *
- * Returned paths are asset-relative (e.g., "survey_config1.yaml" or "configs/survey_config2.yaml").
- */
-private fun listAssetYamlConfigs(assetManager: android.content.res.AssetManager): List<String> {
+private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
     val roots = listOf("", "configs", "surveys")
     val out = mutableListOf<String>()
 
@@ -1237,7 +1198,7 @@ private fun listAssetYamlConfigs(assetManager: android.content.res.AssetManager)
                 continue
             }
 
-            // AssetManager.list() does not clearly distinguish files/dirs; try to descend.
+            // AssetManager.list() doesn't clearly distinguish files/dirs; attempt to descend.
             walk(path, depth + 1)
         }
     }
@@ -1247,19 +1208,150 @@ private fun listAssetYamlConfigs(assetManager: android.content.res.AssetManager)
     return out.distinct()
 }
 
-/* ───────────────────────────── Crash Capture + Startup Upload ───────────────────────────── */
+/* ───────────────────────────── Config Details Resolver ───────────────────────────── */
 
 /**
- * Crash capture strategy:
- * - On uncaught exception, dump an exception header + logcat snapshot to a gzip file under
- *   app-private storage: files/diagnostics/crash/.
- * - On the next app start, scan that directory and enqueue uploads via WorkManager if GitHub
- *   config is present (BuildConfig.GH_*).
+ * Load config YAML text from assets and extract helpful meta (slm: section).
  *
  * Notes:
- * - This intentionally does NOT attempt network I/O during the crash.
- * - This keeps the crash handler fast and reduces the chance of ANR during fatal unwind.
+ * - No YAML library needed.
+ * - Best-effort: meta parsing can fail safely; longText still shows the real YAML.
  */
+private suspend fun resolveConfigDetailsFromAssets(
+    context: Context,
+    configId: String
+): ScreenConfigDetails = withContext(Dispatchers.IO) {
+    val candidates = buildList {
+        add(configId)
+        if (!configId.endsWith(".yaml", ignoreCase = true) && !configId.endsWith(".yml", ignoreCase = true)) {
+            add("$configId.yaml")
+            add("$configId.yml")
+        }
+        add("configs/$configId")
+        add("configs/$configId.yaml")
+        add("configs/$configId.yml")
+        add("surveys/$configId")
+        add("surveys/$configId.yaml")
+        add("surveys/$configId.yml")
+    }.distinct()
+
+    val (assetName, yamlText) = readFirstAssetText(context.assets, candidates)
+
+    val meta = extractSlmMeta(yamlText)
+
+    val summary = buildString {
+        val model = meta["model_name"] ?: meta["model"] ?: meta["modelName"]
+        val backend = meta["backend"]
+        val accel = meta["accelerator"] ?: meta["device"]
+        val maxTokens = meta["max_tokens"] ?: meta["maxTokens"]
+        val topK = meta["top_k"] ?: meta["topK"]
+        val topP = meta["top_p"] ?: meta["topP"]
+        val temp = meta["temperature"]
+
+        if (!model.isNullOrBlank()) append("model=$model  ")
+        if (!backend.isNullOrBlank()) append("backend=$backend  ")
+        if (!accel.isNullOrBlank()) append("accel=$accel  ")
+        if (!maxTokens.isNullOrBlank()) append("maxTokens=$maxTokens  ")
+        if (!topK.isNullOrBlank()) append("topK=$topK  ")
+        if (!topP.isNullOrBlank()) append("topP=$topP  ")
+        if (!temp.isNullOrBlank()) append("temp=$temp")
+        if (isBlank()) append("Loaded from assets: $assetName")
+    }.trim()
+
+    ScreenConfigDetails(
+        title = assetName,
+        summary = summary,
+        longText = yamlText,
+        meta = meta
+    )
+}
+
+private fun readFirstAssetText(
+    assets: AssetManager,
+    candidates: List<String>
+): Pair<String, String> {
+    var lastErr: Throwable? = null
+    for (name in candidates) {
+        try {
+            assets.open(name).use { input ->
+                val br = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
+                return name to br.readText()
+            }
+        } catch (t: Throwable) {
+            lastErr = t
+        }
+    }
+    throw IllegalArgumentException(
+        "Config asset not found. Tried: ${candidates.joinToString()}",
+        lastErr
+    )
+}
+
+/**
+ * Heuristically extract key/value pairs under the "slm:" section.
+ *
+ * This is intentionally lightweight:
+ * - Not a full YAML parser.
+ * - Handles common "key: value" lines in a nested block.
+ */
+private fun extractSlmMeta(yamlText: String): Map<String, String> {
+    val lines = yamlText.lines()
+
+    var inSlm = false
+    var slmIndent: Int? = null
+    val meta = linkedMapOf<String, String>()
+
+    fun leadingSpaces(s: String): Int =
+        s.indexOfFirst { it != ' ' }.let { if (it < 0) s.length else it }
+
+    for (raw in lines) {
+        val lineNoComment = raw.substringBefore("#")
+        if (lineNoComment.isBlank()) continue
+
+        val indent = leadingSpaces(lineNoComment)
+        val trimmed = lineNoComment.trim()
+
+        if (trimmed.endsWith(":") && !trimmed.contains(" ")) {
+            val section = trimmed.removeSuffix(":").trim()
+            if (section == "slm") {
+                inSlm = true
+                slmIndent = indent
+            } else {
+                if (inSlm && slmIndent != null && indent <= slmIndent!!) {
+                    inSlm = false
+                    slmIndent = null
+                }
+            }
+            continue
+        }
+
+        if (!inSlm || slmIndent == null) continue
+        if (indent <= slmIndent!!) {
+            inSlm = false
+            slmIndent = null
+            continue
+        }
+
+        val idx = trimmed.indexOf(":")
+        if (idx <= 0) continue
+
+        val k = trimmed.substring(0, idx).trim()
+        val vRaw = trimmed.substring(idx + 1).trim()
+        if (k.isBlank() || vRaw.isBlank()) continue
+
+        val v = vRaw
+            .removeSurrounding("\"")
+            .removeSurrounding("'")
+            .trim()
+
+        meta[k] = v
+    }
+
+    return meta
+}
+
+/* ───────────────────────────── Crash Capture + Startup Upload ───────────────────────────── */
+
 private object CrashCapture {
 
     private const val TAG = "CrashCapture"
@@ -1284,7 +1376,6 @@ private object CrashCapture {
         val prior = Thread.getDefaultUncaughtExceptionHandler()
 
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            // Prevent re-entrancy storms (rare, but can happen if handler itself crashes).
             if (!capturing.compareAndSet(false, true)) {
                 try {
                     prior?.uncaughtException(thread, throwable)
@@ -1305,7 +1396,6 @@ private object CrashCapture {
             } catch (t: Throwable) {
                 Log.e(TAG, "Crash capture unexpected failure: ${t.message}", t)
             } finally {
-                // Always delegate to preserve normal crash behavior / system reporting.
                 try {
                     if (prior != null) {
                         prior.uncaughtException(thread, throwable)
@@ -1321,9 +1411,6 @@ private object CrashCapture {
         Log.d(TAG, "Installed default uncaught exception handler.")
     }
 
-    /**
-     * On app startup, enqueue any pending crash files for upload (if GH is configured).
-     */
     fun enqueuePendingCrashUploadsIfPossible(context: Context) {
         val cfg = buildCrashGitHubConfigOrNull() ?: run {
             Log.d(TAG, "GitHub config missing; crash uploads will remain local.")
@@ -1331,8 +1418,6 @@ private object CrashCapture {
         }
 
         val dir = crashDir(context).apply { mkdirs() }
-
-        // Purge old files defensively.
         purgeOldCrashFiles(dir)
 
         val files = dir.listFiles { f ->
@@ -1347,7 +1432,6 @@ private object CrashCapture {
             .sortedByDescending { it.lastModified() }
             .take(MAX_FILES_TO_ENQUEUE)
             .forEach { file ->
-                // Worker should delete local file upon successful upload.
                 GitHubUploadWorker.enqueueExistingPayload(
                     context = context.applicationContext,
                     cfg = cfg,
@@ -1356,17 +1440,12 @@ private object CrashCapture {
             }
     }
 
-    /**
-     * Capture crash data into a gzip file and return it.
-     */
     private fun captureCrashToFile(
         context: Context,
         thread: Thread,
         throwable: Throwable
     ): File {
         val dir = crashDir(context).apply { mkdirs() }
-
-        // Keep storage from exploding.
         purgeOldCrashFiles(dir)
 
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -1421,12 +1500,6 @@ private object CrashCapture {
         toDelete.forEach { f -> runCatching { f.delete() } }
     }
 
-    /**
-     * Collect logcat output as bytes (best-effort).
-     *
-     * This tries to restrict to the current PID when supported.
-     * If it fails, it falls back to a generic logcat dump.
-     */
     private fun collectLogcatBytes(pid: Int, maxBytes: Int, maxMs: Long): ByteArray {
         val primary = listOf(
             "logcat",
@@ -1456,11 +1529,6 @@ private object CrashCapture {
             }
     }
 
-    /**
-     * Execute a command and read stdout up to [maxBytes] and [maxMs].
-     *
-     * redirectErrorStream(true) avoids deadlock if stderr fills up.
-     */
     private fun execAndReadCapped(cmd: List<String>, maxBytes: Int, maxMs: Long): ByteArray {
         val start = SystemClock.elapsedRealtime()
 
@@ -1486,15 +1554,10 @@ private object CrashCapture {
                 out.toByteArray()
             }
         } finally {
-            // Best-effort cleanup. Do not block inside crash handler.
             runCatching { proc.destroy() }
         }
     }
 
-    /**
-     * Build a GitHub config that stores crash logs under:
-     *   <GH_PATH_PREFIX>/diagnostics/crash/
-     */
     private fun buildCrashGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
         if (BuildConfig.GH_TOKEN.isBlank()) return null
         if (BuildConfig.GH_OWNER.isBlank() || BuildConfig.GH_REPO.isBlank()) return null

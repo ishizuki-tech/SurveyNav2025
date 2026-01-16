@@ -1,0 +1,173 @@
+graph:
+  startId: Start
+  nodes:
+    - id: Start
+      type: START
+      title: Start
+      question: Start
+      nextId: Q1
+
+    - id: Q1
+      type: AI
+      title: FAW Yield Loss (3 Seasons)
+      question: >-
+        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons.
+        (Percent or bags per acre are fine.)
+      nextId: Q2
+
+    - id: Q2
+      type: AI
+      title: Trade-off for 10-Day Earlier Harvest
+      question: >-
+        If you could harvest 10 days earlier, how much yield would you be willing to give up?
+        (Percent or bags per acre.)
+      nextId: Q3
+
+    - id: Q3
+      type: AI
+      title: Damage Threshold to Switch Variety
+      question: >-
+        What level of pest or disease damage would make you stop using your current maize variety and switch
+        to a new variety? Give a clear threshold (e.g., % plants/ears damaged or severity).
+      nextId: Q4
+
+    - id: Q4
+      type: AI
+      title: Expectations for Replacement Variety
+      question: >-
+        What would you expect from a new maize variety to replace the one you currently grow?
+        Be specific (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
+      nextId: Q5
+
+    - id: Q5
+      type: AI
+      title: Minimum Acceptable Harvest in Bad Year
+      question: >-
+        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season?
+        (Percent of usual harvest or bags per acre.)
+      nextId: Q6
+
+    - id: Q6
+      type: AI
+      title: Most Damaging Drought Timing
+      question: >-
+        When in the season is drought most devastating for your crop?
+        (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
+      nextId: Review
+
+    - id: Review
+      type: REVIEW
+      title: Review
+      question: ""
+      nextId: Done
+
+    - id: Done
+      type: DONE
+      title: Done
+      question: ""
+
+slm:
+  accelerator: "GPU"
+
+  # MediaPipe LLM Inference: maxTokens is total budget (input + output).
+  # To avoid hard failures from long prompts, keep this conservative.
+  max_tokens: 4096
+
+  top_k: 10
+  top_p: 0.95
+  temperature: 0.25
+
+  user_turn_prefix: "<start_of_turn>user"
+  model_turn_prefix: "<start_of_turn>model"
+  turn_end: "<end_of_turn>"
+
+  empty_json_instruction: "Respond with an empty JSON object: {}"
+
+  # Keep the global instruction short; per-node prompt handles specifics.
+  preamble: "You are a farmer survey expert. Read the Question and Answer and return strict one-line JSON."
+
+  key_contract: |
+    OUTPUT:
+    - Language: English
+    - JSON keys (exact): "analysis","expected_answer","follow_up_question","score"
+    - "score" is an integer 1..100
+
+  length_budget: |
+    LIMITS:
+    - analysis <= 60 chars
+    - expected_answer <= 140 chars
+    - follow_up_question <= 140 chars
+
+  scoring_rule: "Score only content relevance/completeness/accuracy. Ignore style."
+
+  strict_output: |-
+    STRICT:
+    - Output RAW JSON only (no markdown, no extra text).
+    - ONE LINE.
+    - Compact JSON preferred.
+
+prompts:
+  - nodeId: Q1
+    prompt: |-
+      Return JSON with keys: analysis, expected_answer, follow_up_question, score.
+      expected_answer: avg FAW yield loss over last 3 seasons (% or bags/acre).
+      follow_up_question: confirm the unit AND whether it's an average over 3 seasons.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q2
+    prompt: |-
+      Return JSON with keys: analysis, expected_answer, follow_up_question, score.
+      expected_answer: max yield loss willing to accept to harvest 10 days earlier (% or bags/acre).
+      follow_up_question: confirm the exact amount/unit (or the max acceptable boundary).
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q3
+    prompt: |-
+      Return JSON with keys: analysis, expected_answer, follow_up_question, score.
+      expected_answer: a clear switching threshold (metric + number + stage if relevant).
+      follow_up_question: confirm the metric/scale used for that threshold.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q4
+    prompt: |-
+      Return JSON with keys: analysis, expected_answer, follow_up_question, score.
+      expected_answer: top 2 replacement targets with numeric/categorical thresholds (compact).
+      follow_up_question: confirm which single trait is the top priority OR its numeric target.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q5
+    prompt: |-
+      Return JSON with keys: analysis, expected_answer, follow_up_question, score.
+      expected_answer: minimum acceptable harvest in a bad year (% of normal or bags/acre).
+      follow_up_question: confirm the baseline (normal harvest) OR the unit.
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+  - nodeId: Q6
+    prompt: |-
+      Return JSON with keys: analysis, expected_answer, follow_up_question, score.
+      expected_answer: the most damaging drought timing as a crop stage + brief reason.
+      follow_up_question: confirm the stage window (e.g., tasseling vs grain fill).
+      Question: {{QUESTION}}
+      Answer: {{ANSWER}}
+
+model_defaults:
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+  timeout_ms: 1800000
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-small-q5_1.bin"
+  language: "en" # "auto", "en", "ja", "sw"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true

@@ -20,6 +20,7 @@ import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.slm.Repository
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -62,7 +63,19 @@ class AiViewModel(
 
     companion object {
         private const val TAG = "AiViewModel"
+
+        // Keep true while investigating whitespace issues.
         private const val DEBUG_LOGS = true
+
+        // Additional debug logs for whitespace/chunk boundaries.
+        private const val DEBUG_WHITESPACE = true
+
+        // Log only the first N chunks verbosely to avoid log spam.
+        private const val DEBUG_CHUNK_LOG_LIMIT = 12
+
+        // Max chars to show in debug previews (avoid huge log lines).
+        private const val DEBUG_PREVIEW_CHARS = 240
+
         private const val DEFAULT_TIMEOUT_MS = 120_000L
     }
 
@@ -251,12 +264,6 @@ class AiViewModel(
     /**
      * Evaluate the given [prompt] and return the parsed score (0..100) or null.
      *
-     * Design:
-     * - This is a suspend wrapper that:
-     *   1) prepares UI state
-     *   2) starts a single evaluation job
-     *   3) awaits its completion
-     *
      * Timeout semantics:
      * - A timeout still attempts to parse whatever was streamed so far.
      * - [AiEvent.Final] is emitted at most once per call.
@@ -310,13 +317,13 @@ class AiViewModel(
             return viewModelScope.launch { }
         }
 
-        Log.d("AiViewModel", "prompt: $prompt")
+        if (DEBUG_LOGS) Log.d(TAG, "evaluateAsync: prompt.len=${prompt.length}")
 
         val fullPrompt = runCatching { repo.buildPrompt(prompt) }
             .onFailure { t -> Log.e(TAG, "evaluateAsync: buildPrompt failed", t) }
             .getOrElse { prompt }
 
-        Log.d("AiViewModel", "fullPrompt: $fullPrompt")
+        if (DEBUG_LOGS) Log.d(TAG, "evaluateAsync: fullPrompt.len=${fullPrompt.length}")
 
         if (!running.compareAndSet(false, true)) {
             Log.w(TAG, "evaluateAsync: already running -> returning existing job")
@@ -335,9 +342,7 @@ class AiViewModel(
         )
         evalJob = job
 
-        job.invokeOnCompletion {
-            finalizeRunFlags()
-        }
+        job.invokeOnCompletion { finalizeRunFlags() }
 
         return job
     }
@@ -346,9 +351,6 @@ class AiViewModel(
      * Cancel the ongoing evaluation if any.
      *
      * This is a user-driven cancellation path.
-     * - Sets [error] to "cancelled".
-     * - Emits [AiEvent.Cancelled].
-     * - Clears [loading] and [running] flags.
      */
     fun cancel() {
         Log.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
@@ -366,8 +368,6 @@ class AiViewModel(
 
     /**
      * Reset transient AI-related states while keeping chat history intact.
-     *
-     * @param keepError True to preserve the last error message.
      */
     fun resetStates(keepError: Boolean = false) {
         cancel()
@@ -381,8 +381,6 @@ class AiViewModel(
 
     /**
      * Reset all AI-related state including chats.
-     *
-     * Use this when starting a completely new survey run.
      */
     fun resetAll(keepError: Boolean = false) {
         resetStates(keepError = keepError)
@@ -397,16 +395,6 @@ class AiViewModel(
 
     // ───────────────────────── Internal evaluation core ─────────────────────────
 
-    /**
-     * Starts the evaluation coroutine that:
-     * - streams text
-     * - finalizes raw output
-     * - parses score & follow-ups
-     * - emits terminal events
-     *
-     * This function must be called only after [prepareUiForNewRun]
-     * and after [running] has been set to true.
-     */
     private fun startEvaluationInternal(
         originalPrompt: String,
         fullPrompt: String,
@@ -417,7 +405,6 @@ class AiViewModel(
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
-
         var finalEmitted = false
 
         try {
@@ -431,6 +418,22 @@ class AiViewModel(
 
                             _stream.update { it + part }
                             _events.tryEmit(AiEvent.Stream(part))
+
+                            if (DEBUG_LOGS && DEBUG_WHITESPACE && chunkCount <= DEBUG_CHUNK_LOG_LIMIT) {
+                                // Log chunk boundary/whitespace diagnostics.
+                                val head = part.take(12)
+                                val tail = part.takeLast(12)
+                                Log.d(
+                                    TAG,
+                                    "chunk[$chunkCount]: len=${part.length}, " +
+                                            "leadWS=${part.firstOrNull()?.isWhitespace() == true}, " +
+                                            "tailWS=${part.lastOrNull()?.isWhitespace() == true}, " +
+                                            "head='${debugVisible(head)}', tail='${debugVisible(tail)}'"
+                                )
+
+                                // Also log a short preview to see if spaces are present within the chunk.
+                                Log.d(TAG, "chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
+                            }
                         }
                     }
                 }
@@ -438,8 +441,6 @@ class AiViewModel(
                 timedOut = true
                 Log.w(TAG, "evaluate: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
-                // Treat only timeout-like cancellations as soft timeouts.
-                // For user-driven cancellation, rethrow and let the outer catch handle events.
                 if (looksLikeTimeout(e)) {
                     timedOut = true
                     Log.w(TAG, "evaluate: timeout-like cancellation (${e.javaClass.name})")
@@ -461,10 +462,21 @@ class AiViewModel(
                 )
             }
 
+            if (DEBUG_LOGS && DEBUG_WHITESPACE) {
+                // Visualize raw buffer to check whether whitespace exists BEFORE parsing.
+                Log.d(TAG, "rawVisible='${debugVisible(preview(rawText))}'")
+            }
+
             if (rawText.isNotBlank()) {
                 val parsedScore = clampScore(FollowupExtractor.extractScore(rawText))
                 val top3 = FollowupExtractor.fromRaw(rawText, max = 3)
                 val q0 = top3.firstOrNull()
+
+                if (DEBUG_LOGS && DEBUG_WHITESPACE) {
+                    // If raw has spaces but q0 doesn't, FollowupExtractor is stripping them.
+                    Log.d(TAG, "q0Visible='${debugVisible(preview(q0 ?: ""))}'")
+                    Log.d(TAG, "top3.count=${top3.size}, top3[0].len=${q0?.length ?: 0}")
+                }
 
                 _raw.value = rawText
                 _score.value = parsedScore
@@ -491,7 +503,6 @@ class AiViewModel(
             _error.value = "cancelled"
 
             if (!finalEmitted) {
-                // Best-effort terminal snapshot for UI that expects a final signal.
                 _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
             }
 
@@ -512,8 +523,6 @@ class AiViewModel(
 
     /**
      * Prepare all UI-visible states for a new evaluation run.
-     *
-     * This intentionally does not touch chat history.
      */
     private fun prepareUiForNewRun() {
         _loading.value = true
@@ -523,7 +532,6 @@ class AiViewModel(
         _followups.value = emptyList()
         _raw.value = null
 
-        // Preserve recent timeout/cancel badges unless overwritten by a new error.
         if (_error.value != "timeout" && _error.value != "cancelled") {
             _error.value = null
         }
@@ -531,8 +539,6 @@ class AiViewModel(
 
     /**
      * Finalize flags after an evaluation completes.
-     *
-     * This is idempotent and safe to call multiple times.
      */
     private fun finalizeRunFlags() {
         _loading.value = false
@@ -542,15 +548,8 @@ class AiViewModel(
 
     // ───────────────────────── helpers ─────────────────────────
 
-    /**
-     * Clamp score into the expected UI range.
-     */
     private fun clampScore(s: Int?): Int? = s?.coerceIn(0, 100)
 
-    /**
-     * Heuristic timeout detection for cancellation types that do not surface
-     * [TimeoutCancellationException] directly.
-     */
     private fun looksLikeTimeout(e: CancellationException): Boolean {
         val n = e.javaClass.name
         val m = e.message ?: ""
@@ -559,59 +558,55 @@ class AiViewModel(
                 m.contains("timeout", ignoreCase = true)
     }
 
-    /**
-     * Compute SHA-256 hex digest for lightweight debug comparison.
-     *
-     * This is used only for logging. Do not rely on this for security.
-     */
     private fun sha256Hex(input: String): String = runCatching {
         val md = MessageDigest.getInstance("SHA-256")
         val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
         bytes.joinToString("") { b -> "%02x".format(b.toInt() and 0xff) }
     }.getOrElse { "sha256_error" }
+
+    /**
+     * Convert whitespace/newlines/tabs to visible markers for logs.
+     */
+    private fun debugVisible(s: String): String {
+        if (s.isEmpty()) return ""
+        return buildString(s.length) {
+            for (ch in s) {
+                append(
+                    when (ch) {
+                        ' ' -> '␠'
+                        '\n' -> '↩'
+                        '\t' -> '⇥'
+                        '\r' -> '␍'
+                        else -> ch
+                    }
+                )
+            }
+        }
+    }
+
+    /**
+     * Safe preview for logs (avoid huge lines).
+     */
+    private fun preview(s: String): String {
+        if (s.isEmpty()) return ""
+        val n = min(DEBUG_PREVIEW_CHARS, s.length)
+        return s.take(n)
+    }
 }
 
 /* ───────────────────────── Events ───────────────────────── */
 
-/**
- * UI-facing events for reactive handling.
- *
- * These events are intentionally compact:
- * - They are suitable for transient UI effects.
- * - They avoid carrying heavyweight objects.
- */
 sealed interface AiEvent {
 
-    /**
-     * Emitted for each streamed chunk.
-     */
     data class Stream(val chunk: String) : AiEvent
 
-    /**
-     * Emitted at the end with the best-available final buffer.
-     *
-     * @param raw Raw text payload accumulated from the model.
-     * @param score Parsed score (0..100) or null.
-     * @param followups Extracted follow-up questions (up to top-3).
-     */
     data class Final(
         val raw: String,
         val score: Int?,
         val followups: List<String>
     ) : AiEvent
 
-    /**
-     * Emitted if evaluation was cancelled explicitly.
-     */
     data object Cancelled : AiEvent
-
-    /**
-     * Emitted if evaluation hit the timeout.
-     */
     data object Timeout : AiEvent
-
-    /**
-     * Emitted for unexpected errors.
-     */
     data class Error(val message: String) : AiEvent
 }

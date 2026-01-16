@@ -13,7 +13,8 @@
  *  Utility object for extracting follow-up questions and simple scores
  *  from raw SLM output. Supports:
  *    - Multiple embedded JSON fragments (JSONObject / JSONArray).
- *    - Robust key normalization and question-field detection.
+ *    - Robust key normalization (separator-insensitive + camelCase-aware).
+ *    - Question-field detection with lightweight heuristics.
  *    - Deduplication with stable encounter order.
  *    - Lightweight score extraction with JSON-first semantics and
  *      plain-text fallback.
@@ -35,6 +36,7 @@ import kotlin.math.min
  * Features:
  * - Detects and parses one or more JSON fragments (JSONObject / JSONArray) embedded in free-form text.
  * - Traverses objects/arrays to find likely question-bearing fields (key-insensitive, separator-insensitive).
+ * - Handles camelCase keys (e.g., followUpQuestion) by inserting separators before normalization.
  * - Deduplicates while preserving encounter order (LinkedHashSet semantics).
  * - Provides a light-weight 0..100 score extractor with robust JSON recursion + textual fallback.
  *
@@ -53,8 +55,18 @@ object FollowupExtractor {
     private val KEY_SEP_REGEX =
         Regex("""[\s_\u200B\u200C\u200D\u2060\u2010-\u2015]+""")
 
+    /** Trailing question marks (ASCII or full-width) to be coalesced to exactly one. */
+    private val TRAILING_QUESTION_REGEX = Regex("[?？]+$")
+
+    /** Matches integers 0..100; last match in the text is used for fallback scoring. */
+    private val NUMBER_0_TO_100_REGEX = Regex("""\b(?:100|[1-9]?\d)\b""")
+
+    /** Avoid accidentally capturing gigantic prompt blobs as a "question". */
+    private const val MAX_QUESTION_CHARS: Int = 220
+
     /**
      * Normalize field keys for matching:
+     * - Insert separators for camelCase and acronym boundaries.
      * - Lowercase the entire string.
      * - Convert any run of [space/_/unicode-dash/zero-width] to a single '-'.
      * - Trim leading/trailing dashes.
@@ -63,9 +75,45 @@ object FollowupExtractor {
      * - "followup question"      -> "followup-question"
      * - "follow_up_question"     -> "follow-up-question"
      * - "Follow-Up–Question"     -> "follow-up-question"
+     * - "followUpQuestion"       -> "follow-up-question"
+     * - "overallScore"           -> "overall-score"
      */
     private fun normKey(k: String): String =
-        k.lowercase().replace(KEY_SEP_REGEX, "-").trim('-')
+        decamel(k)
+            .lowercase()
+            .replace(KEY_SEP_REGEX, "-")
+            .trim('-')
+
+    /**
+     * Insert separators into camelCase / acronym boundaries.
+     *
+     * Rules (simple and robust):
+     * - lower/digit -> Upper inserts '-'
+     * - Upper + Upper + lower: split before the last Upper to keep acronyms together (e.g. "JSONScore" -> "JSON-Score")
+     */
+    private fun decamel(s: String): String {
+        if (s.isEmpty()) return s
+
+        val out = StringBuilder(s.length + 8)
+        val n = s.length
+
+        fun isUpper(c: Char) = c in 'A'..'Z'
+        fun isLower(c: Char) = c in 'a'..'z'
+        fun isDigit(c: Char) = c in '0'..'9'
+
+        for (i in 0 until n) {
+            val c = s[i]
+            val prev = if (i > 0) s[i - 1] else '\u0000'
+            val next = if (i + 1 < n) s[i + 1] else '\u0000'
+
+            val boundary1 = (isUpper(c) && (isLower(prev) || isDigit(prev)))
+            val boundary2 = (isUpper(prev) && isUpper(c) && isLower(next))
+
+            if (i > 0 && (boundary1 || boundary2)) out.append('-')
+            out.append(c)
+        }
+        return out.toString()
+    }
 
     /** Raw followup-like keys we consider as primary containers. */
     private val FOLLOWUP_KEYS_RAW: List<String> = listOf(
@@ -74,6 +122,7 @@ object FollowupExtractor {
         "follow-up question",
         "follow_up_question",
         "followUpQuestion",
+        "followupQuestion",
 
         // Plural / list containers
         "followup",
@@ -84,9 +133,11 @@ object FollowupExtractor {
         "follow-up-questions",
         "follow_up_questions",
         "followUpQuestions",
+        "followupQuestions",
         "follow-up-q",
         "next-questions",
-        "suggested-questions"
+        "suggested-questions",
+        "suggestedQuestions"
         // NOTE: We intentionally do NOT include a broad "questions" key here
         // to avoid accidentally treating original question lists as follow-ups.
     )
@@ -97,6 +148,10 @@ object FollowupExtractor {
 
     /** Field candidates inside an object that may carry question text. */
     private val QUESTION_FIELD_CANDIDATES: List<String> = listOf(
+        "followup question",
+        "follow-up question",
+        "follow_up_question",
+        "followUpQuestion",
         "question",
         "text",
         "q",
@@ -111,12 +166,6 @@ object FollowupExtractor {
     /** Normalized set for strict key equality checks. */
     private val QUESTION_FIELDS_NORM: Set<String> =
         QUESTION_FIELD_CANDIDATES.map(::normKey).toSet()
-
-    /** Trailing question marks (ASCII or full-width) to be coalesced to exactly one. */
-    private val TRAILING_QUESTION_REGEX = Regex("[?？]+$")
-
-    /** Matches integers 0..100; last match in the text is used for fallback scoring. */
-    private val NUMBER_0_TO_100_REGEX = Regex("""\b(?:100|[1-9]?\d)\b""")
 
     /* --------------------------------------------------------------------- */
     /* Public API                                                            */
@@ -138,9 +187,17 @@ object FollowupExtractor {
         if (raw.isBlank() || max <= 0) return emptyList()
 
         val out = LinkedHashSet<String>()
-        val fragments = extractJsonFragments(raw)
 
-        if (fragments.isNotEmpty()) {
+        // Extract JSON from:
+        // (1) fenced blocks, (2) the whole raw string.
+        val candidates = buildList {
+            addAll(extractCodeFenceBodies(raw))
+            add(raw)
+        }
+
+        for (cand in candidates) {
+            if (out.size >= max) break
+            val fragments = extractJsonFragments(cand)
             for (frag in fragments) {
                 if (out.size >= max) break
                 collect(frag, out, max)
@@ -196,20 +253,27 @@ object FollowupExtractor {
      * Extract an integer score in the range 0..100 from [text].
      *
      * Strategy:
-     *  (1) Parse JSON fragments and recursively look for "overall_score" or "score" keys
-     *      (numeric or numeric-string). The first valid key in document order wins.
+     *  (1) Parse JSON fragments and recursively look for "overall_score"/"overallScore"/"score"
+     *      keys (numeric or numeric-string). The first valid key in document order wins.
      *  (2) If not found, fall back to the last integer 0..100 in the raw text.
      */
     @JvmStatic
     fun extractScore(text: String): Int? {
-        val fragments = extractJsonFragments(text)
-        for (frag in fragments) {
-            val v = when (frag) {
-                is JSONObject -> findScoreRecursive(frag)
-                is JSONArray -> findScoreRecursive(frag)
-                else -> null
+        val candidates = buildList {
+            addAll(extractCodeFenceBodies(text))
+            add(text)
+        }
+
+        for (cand in candidates) {
+            val fragments = extractJsonFragments(cand)
+            for (frag in fragments) {
+                val v = when (frag) {
+                    is JSONObject -> findScoreRecursive(frag)
+                    is JSONArray -> findScoreRecursive(frag)
+                    else -> null
+                }
+                if (v != null) return clamp0to100(v)
             }
-            if (v != null) return clamp0to100(v)
         }
 
         // Plain-text fallback (last integer 0..100)
@@ -294,7 +358,8 @@ object FollowupExtractor {
                                 kn in QUESTION_FIELDS_NORM ||
                                         kn == "question" ||
                                         kn.endsWith("-question") ||
-                                        kn.endsWith("-q")
+                                        kn.endsWith("-q") ||
+                                        kn.contains("follow-up")
 
                             if (looksLikeQuestionField) {
                                 addIfMeaningful(v, out, max)
@@ -327,37 +392,49 @@ object FollowupExtractor {
         // Strong match: exact normalized candidate keys
         for (candidate in QUESTION_FIELD_CANDIDATES) {
             val v = normalizedMap[normKey(candidate)]
-            if (v is String && v.isNotBlank()) {
-                return v.trim()
-            }
+            if (v is String && v.isNotBlank()) return v.trim()
         }
 
         // Weak match: any field whose normalized name contains "question"
         for ((kNorm, v) in normalizedMap) {
-            if (kNorm.contains("question") && v is String && v.isNotBlank()) {
-                return v.trim()
-            }
+            if (kNorm.contains("question") && v is String && v.isNotBlank()) return v.trim()
         }
         return null
     }
 
-    /** Add a normalized non-empty string to [out] if still under [max]. */
+    /**
+     * Add a normalized non-empty string to [out] if still under [max].
+     *
+     * Light heuristics:
+     * - Trim and reject empty.
+     * - Cap length to avoid huge blobs (keeps UX stable).
+     * - Coalesce trailing question marks to exactly one (? or ？).
+     */
     private fun addIfMeaningful(s: String, out: MutableSet<String>, max: Int) {
         if (out.size >= max) return
-        val t = s.trim()
-        if (t.isEmpty()) return
+
+        val t0 = s.trim()
+        if (t0.isEmpty()) return
+
+        // Prevent prompt-size strings from being treated as questions.
+        val t = if (t0.length > MAX_QUESTION_CHARS) t0.take(MAX_QUESTION_CHARS).trimEnd() else t0
 
         val normalized = TRAILING_QUESTION_REGEX.replace(t) { m ->
             // Preserve the type of question mark the model used
             if (m.value.contains('？')) "？" else "?"
         }
+
         out.add(normalized)
     }
 
     /* ----------------------- Score (recursive JSON) ----------------------- */
 
     /** Allowed score keys (normalized). */
-    private val SCORE_KEYS = setOf("overall-score", "score")
+    private val SCORE_KEYS = setOf(
+        "overall-score",
+        "overallscore", // extra tolerance (in case separators were lost upstream)
+        "score"
+    )
 
     private fun findScoreRecursive(obj: JSONObject): Int? {
         // 1) Direct keys on this object (normalized).
@@ -369,9 +446,7 @@ object FollowupExtractor {
         }
         for (k in SCORE_KEYS) {
             norm[k]?.let { v ->
-                parseNumberOrNull(v)?.let { n ->
-                    return clamp0to100(n)
-                }
+                parseNumberOrNull(v)?.let { n -> return clamp0to100(n) }
             }
         }
 
@@ -423,9 +498,7 @@ object FollowupExtractor {
 
         for (ch in raw) {
             when (ch) {
-                '\r', '\n' -> {
-                    flush()
-                }
+                '\r', '\n' -> flush()
                 '。', '．', '!', '！', '?', '？' -> {
                     sb.append(ch)
                     flush()
@@ -440,17 +513,31 @@ object FollowupExtractor {
     /* ----------------------- JSON fragment extraction --------------------- */
 
     /**
+     * Extract all code-fence bodies (```...```) anywhere in the raw text.
+     *
+     * This catches common model outputs like:
+     *   Some text
+     *   ```json
+     *   {...}
+     *   ```
+     *   More text
+     */
+    private fun extractCodeFenceBodies(raw: String): List<String> {
+        val re = Regex("""```[A-Za-z0-9_-]*\s*\n([\s\S]*?)\n```""")
+        return re.findAll(raw).map { it.groupValues[1].trim() }.toList()
+    }
+
+    /**
      * Extract JSON fragments embedded in [raw].
      *
      * Behavior:
-     * - Strips ```...``` fences with optional language (e.g., ```json).
      * - Attempts whole-string parse first; if it succeeds, returns a single fragment.
      * - Otherwise scans for balanced '{...}' / '[...]' regions while:
      *   - Respecting string literals.
      *   - Skipping escaped quotes.
      */
     private fun extractJsonFragments(raw: String): List<Any> {
-        val s0 = stripCodeFences(raw.trim())
+        val s0 = raw.trim()
         val fragments = mutableListOf<Any>()
 
         // Quick path: whole string is a single JSON value.
@@ -511,19 +598,6 @@ object FollowupExtractor {
             }
         }
         return fragments
-    }
-
-    /**
-     * Remove ```...``` fences with optional language tag (```json, ```JSON etc.).
-     * Also tolerates extra whitespace/newlines around fences.
-     */
-    private fun stripCodeFences(s: String): String {
-        val fenced = Regex("""^\s*```[A-Za-z0-9_-]*\s*\n([\s\S]*?)\n```\s*$""")
-        val m = fenced.find(s)
-        if (m != null) return m.groupValues[1].trim()
-
-        // Best-effort fallback for simple cases
-        return s.removeSurrounding("```", "```").trim()
     }
 
     /** Try to parse [s] into a JSONObject or JSONArray; returns null on failure. */

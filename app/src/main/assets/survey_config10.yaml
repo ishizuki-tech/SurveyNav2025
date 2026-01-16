@@ -54,10 +54,10 @@ graph:
 
 slm:
   accelerator: "GPU"
-  max_tokens: 1024
-  top_k: 20
-  top_p: 0.9
-  temperature: 0.2
+  max_tokens: 4096
+  top_k: 64
+  top_p: 0.95
+  temperature: 1.0
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
   empty_json_instruction: "Respond with an empty JSON object: {}"
@@ -164,7 +164,7 @@ model_defaults:
 whisper:
   enabled: true
   asset_model_path: "models/ggml-small-q5_1.bin"
-  language: "en" # "auto", "en", "ja", "sw"
+  language: "en"
   translate: false
   print_timestamp: false
   target_sample_rate: 16000

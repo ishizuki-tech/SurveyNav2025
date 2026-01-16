@@ -63,9 +63,9 @@ graph:
 slm:
   accelerator: "GPU"
   max_tokens: 4096
-  top_k: 10
-  top_p: 0.2
-  temperature: 0.3
+  top_k: 64
+  top_p: 0.95
+  temperature: 1.0
   user_turn_prefix: "<start_of_turn>user"
   model_turn_prefix: "<start_of_turn>model"
   turn_end: "<end_of_turn>"
@@ -96,10 +96,8 @@ slm:
 
 whisper:
   enabled: true
-#  asset_model_path: "models/ggml-small-q5_1.bin"
-#  language: "en" # "auto", "en", "ja", "sw"
-  asset_model_path: "models/ggml-model-q4_0.bin"
-  language: "sw" # "auto", "en", "ja", "sw"
+  asset_model_path: "models/ggml-model-q5_0.bin"
+  language: "sw"
   translate: false
   print_timestamp: false
   target_sample_rate: 16000
