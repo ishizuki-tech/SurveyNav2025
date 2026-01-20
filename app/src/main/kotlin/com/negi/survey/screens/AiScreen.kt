@@ -29,6 +29,19 @@
  *  Notes:
  *   • All comments use KDoc-style English descriptions.
  *   • No business logic is embedded; this screen only orchestrates VMs.
+ *
+ *  Update (2026-01):
+ *   • Fix: LocalClipboardManager deprecated -> use LocalClipboard (suspend API).
+ *   • Fix: Safer focus request timing (wait for a frame before requestFocus()).
+ *   • Fix: Auto-scroll waits for a frame before using maxValue (less “0px” races).
+ *   • Fix: Stop recording on dispose and on navigation to avoid mic leaks.
+ *   • Improve: JSON preview extraction uses JsonPrimitive content, avoids quotes.
+ *   • Improve: JSON preview supports legacy keys + snake_case + camelCase keys.
+ *   • Improve: Copy action no longer toggles expand/collapse accidentally.
+ *   • New: Two-step flow (EVAL -> optional Follow-up generation).
+ *   • New: Two-step can be disabled via TwoStepPolicy.enabled (YAML two_step.enabled).
+ *   • Fix: Phase is reset safely on errors / stale raw to prevent “stuck running”.
+ *   • Fix: Robust gating when needs_followup key is missing (real-world model drift).
  * =====================================================================
  */
 
@@ -37,6 +50,7 @@
 package com.negi.survey.screens
 
 import android.annotation.SuppressLint
+import android.content.ClipData
 import android.util.Log
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
@@ -99,10 +113,12 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -117,16 +133,15 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.negi.survey.slm.FollowupExtractor
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.SurveyViewModel
 import kotlinx.coroutines.delay
@@ -137,6 +152,8 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlin.collections.ArrayDeque
 
 /* =============================================================================
@@ -144,15 +161,66 @@ import kotlin.collections.ArrayDeque
  * =============================================================================
  */
 
+private const val LOG_PROMPTS = false
+
+/**
+ * Two-step policy for EVAL -> Follow-up gating.
+ *
+ * IMPORTANT:
+ * Default enabled=false for backward compatibility. If config has no two_step section,
+ * we must not accidentally run two-step.
+ *
+ * @param enabled When false, the screen falls back to single-step behavior.
+ * @param okScoreThreshold Minimum score considered "OK".
+ * @param skipFollowupWhenOk When true, follow-up is skipped if score >= threshold
+ *                           unless needs_followup is explicitly true.
+ */
+data class TwoStepPolicy(
+    val enabled: Boolean = false,
+    val okScoreThreshold: Int = 85,
+    val skipFollowupWhenOk: Boolean = true
+)
+
+/**
+ * Optional capability interface for two-step prompting.
+ *
+ * Implement this on your SurveyViewModel (or a wrapper) to enable:
+ *  - EVAL prompt building
+ *  - Follow-up prompt building (using eval JSON)
+ *  - Gating policy per node
+ *
+ * AiScreen will automatically fall back to single-step if not implemented
+ * or policy.enabled is false.
+ */
+interface TwoStepPromptProvider {
+
+    /**
+     * Build the EVAL prompt for the given node.
+     */
+    fun buildEvalPrompt(nodeId: String, question: String, answer: String): String
+
+    /**
+     * Build the Follow-up prompt for the given node, using the EVAL JSON result.
+     *
+     * Output is expected to be either:
+     *  - a plain text follow-up question, OR
+     *  - a JSON object containing follow_up_question (snake_case/camelCase/legacy).
+     */
+    fun buildFollowupPrompt(
+        nodeId: String,
+        question: String,
+        answer: String,
+        evalJsonPretty: String
+    ): String
+
+    /**
+     * Two-step gating policy per node.
+     */
+    fun twoStepPolicy(nodeId: String): TwoStepPolicy = TwoStepPolicy()
+}
+
 /**
  * Simple abstraction for a speech-to-text controller (e.g., Whisper.cpp).
- *
- * Implementations are expected to:
- *  - Expose recording state, transcription state, and latest recognized text
- *    as [StateFlow]s.
- *  - Provide [startRecording] and [stopRecording] controls.
- *  - Optionally rely on [toggleRecording] as a convenience entry point.
- *  - Accept optional context for export naming/correlation.
  */
 interface SpeechController {
 
@@ -170,14 +238,6 @@ interface SpeechController {
 
     /**
      * Update the context used for correlating speech with the survey run.
-     *
-     * Implementations that export voice files may embed these values into
-     * file names or sidecar metadata.
-     *
-     * Default implementation is a no-op so non-export controllers remain valid.
-     *
-     * @param surveyId UUID of the active survey run.
-     * @param questionId Node ID for the current question.
      */
     fun updateContext(
         surveyId: String?,
@@ -194,9 +254,6 @@ interface SpeechController {
 
     /**
      * Convenience toggle that switches between start/stop.
-     *
-     * This method reads [isRecording.value] directly. Implementations should
-     * ensure their [StateFlow] values are updated promptly to avoid UI drift.
      */
     fun toggleRecording() {
         if (isRecording.value) stopRecording() else startRecording()
@@ -204,25 +261,19 @@ interface SpeechController {
 }
 
 /**
+ * Internal phase for two-step orchestration.
+ */
+private enum class TwoStepPhase {
+    Idle,
+    EvalRunning,
+    FollowupRunning
+}
+
+/**
  * Full-screen AI evaluation screen bound to a single survey node.
- *
- * This composable:
- *  - Reads the question text and persisted answer for [nodeId] from [vmSurvey].
- *  - Streams AI evaluation and renders it as chat bubbles via [vmAI].
- *  - Updates survey answer and follow-up questions back into [vmSurvey].
- *  - Manages IME focus, background tap-to-dismiss, and auto-scrolling.
- *  - Optionally integrates a [SpeechController] to allow microphone-based
- *    answer input.
  *
  * The screen does not perform any AI logic itself; all evaluation is delegated
  * to [AiViewModel.evaluateAsync].
- *
- * @param nodeId Graph node identifier for the current AI question.
- * @param vmSurvey Survey-level ViewModel providing questions and answers.
- * @param vmAI AI-specific ViewModel for streaming and chat state.
- * @param onNext Callback invoked when the user presses the "Next" button.
- * @param onBack Callback invoked when the user presses the "Back" button.
- * @param speechController Optional speech controller backing the composer mic.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSerializationApi::class)
 @Composable
@@ -243,35 +294,13 @@ fun AiScreen(
     // Survey state
     // ---------------------------------------------------------------------
 
-    /**
-     * Question text stream for this node.
-     *
-     * We default the initial state to the ViewModel snapshot to avoid a
-     * transient blank state when the Flow is still cold.
-     */
     val question by remember(vmSurvey, nodeId) {
         vmSurvey.questions.map { it[nodeId].orEmpty() }
     }.collectAsState(initial = vmSurvey.getQuestion(nodeId))
 
-    /**
-     * Session id increments when the survey is reset. Used to scope local UI
-     * memory so previous run artifacts do not leak into a new run.
-     */
     val sessionId by vmSurvey.sessionId.collectAsState()
-
-    /**
-     * Stable UUID for the active survey run.
-     *
-     * This is the preferred identifier for export correlation and should
-     * be propagated to any speech controller that writes voice files.
-     */
     val surveyUuid by vmSurvey.surveyUuid.collectAsState()
 
-    /**
-     * Keep speech controller context in sync with the active survey run + node.
-     *
-     * This allows voice exports to embed a stable UUID/question association.
-     */
     LaunchedEffect(nodeId, sessionId, surveyUuid, speechController) {
         speechController?.updateContext(
             surveyId = surveyUuid,
@@ -293,12 +322,6 @@ fun AiScreen(
     val speechPartial by partialFlow.collectAsState(initial = "")
     val speechError by errFlow.collectAsState(initial = null)
 
-    /**
-     * Text field should be disabled while recording or transcribing.
-     *
-     * This prevents the user from fighting with live STT updates and keeps
-     * the state machine simple: either the user types or the mic owns input.
-     */
     val textFieldEnabled = !speechRecording && !speechTranscribing
 
     val speechStatusText: String? = when {
@@ -319,12 +342,6 @@ fun AiScreen(
     val error by vmAI.error.collectAsState()
     val followup by vmAI.followupQuestion.collectAsState()
 
-    /**
-     * Chat history for this node.
-     *
-     * This is a ViewModel-backed stream to ensure chat remains stable across
-     * recompositions and survives configuration changes.
-     */
     val chat by remember(vmAI, nodeId) { vmAI.chatFlow(nodeId) }.collectAsState()
 
     // ---------------------------------------------------------------------
@@ -339,12 +356,6 @@ fun AiScreen(
         }
     }
 
-    /**
-     * Local composer value scoped by (nodeId, sessionId).
-     *
-     * This ensures a brand-new survey run does not inherit draft input from
-     * a previous run, even if the screen object is still in memory.
-     */
     var composer by remember(nodeId, sessionId) {
         mutableStateOf(vmSurvey.getAnswer(nodeId))
     }
@@ -352,44 +363,103 @@ fun AiScreen(
     val focusRequester = remember { FocusRequester() }
     val scroll = rememberScrollState()
 
-    /**
-     * Sync composer with persisted Survey answers at node/session boundaries.
-     */
     LaunchedEffect(nodeId, sessionId) {
         composer = vmSurvey.getAnswer(nodeId)
+    }
+
+    // ---------------------------------------------------------------------
+    // Two-step orchestration local memory
+    // ---------------------------------------------------------------------
+
+    val twoStepProvider = remember(vmSurvey) { vmSurvey as? TwoStepPromptProvider }
+
+    val twoStepPolicy = remember(twoStepProvider, nodeId, sessionId) {
+        twoStepProvider?.twoStepPolicy(nodeId) ?: TwoStepPolicy(enabled = false)
+    }
+    val twoStepActive = (twoStepProvider != null) && twoStepPolicy.enabled
+
+    var phase by remember(nodeId, sessionId) { mutableStateOf(TwoStepPhase.Idle) }
+
+    /**
+     * Holds the submission context needed for follow-up prompt building.
+     */
+    var pendingQuestion by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+    var pendingAnswer by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+
+    /**
+     * Distinct raw tracking to avoid confusing EVAL output and FOLLOWUP output.
+     */
+    var lastEvalRaw by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+    var lastFollowupRaw by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+
+    /**
+     * Remembers whether the current in-flight request is actually using two-step.
+     */
+    var inFlightTwoStep by remember(nodeId, sessionId) { mutableStateOf(false) }
+
+    /**
+     * Local follow-up memory to avoid double-appends.
+     */
+    var lastFollowupLocal by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+
+    // ---------------------------------------------------------------------
+    // Safety reset on node/session change
+    // ---------------------------------------------------------------------
+
+    LaunchedEffect(nodeId, sessionId) {
+        vmAI.resetStates()
+        vmAI.chatRemoveTyping(nodeId)
+
+        phase = TwoStepPhase.Idle
+        pendingQuestion = null
+        pendingAnswer = null
+        inFlightTwoStep = false
+        lastEvalRaw = null
+        lastFollowupRaw = null
+        lastFollowupLocal = null
     }
 
     // ---------------------------------------------------------------------
     // Seed and focus behavior
     // ---------------------------------------------------------------------
 
-    /**
-     * Ensure the first AI bubble contains the question and request focus.
-     *
-     * We intentionally keep the keyboard open to support rapid iterative
-     * answering when the AI asks follow-up questions.
-     */
-    LaunchedEffect(nodeId, question) {
-        vmAI.chatEnsureSeedQuestion(nodeId, question)
+    LaunchedEffect(nodeId, question, sessionId) {
+        val q = question.trim()
+        if (q.isNotBlank()) {
+            vmAI.chatEnsureSeedQuestion(nodeId, q)
+        }
+        withFrameNanos { /* wait for layout */ }
         focusRequester.requestFocus()
         keyboard?.show()
     }
 
-    /**
-     * Surface AI errors as snackbars.
-     */
-    LaunchedEffect(error) {
+    LaunchedEffect(error, nodeId, sessionId) {
         error?.let { snack.showSnackbar(it) }
+    }
+
+    /**
+     * Safety: reset phase and typing bubble on error to avoid “stuck running”.
+     */
+    LaunchedEffect(error, loading, phase, nodeId, sessionId) {
+        if (loading) return@LaunchedEffect
+        if (error.isNullOrBlank()) return@LaunchedEffect
+        if (phase == TwoStepPhase.Idle) return@LaunchedEffect
+
+        phase = TwoStepPhase.Idle
+        pendingQuestion = null
+        pendingAnswer = null
+        inFlightTwoStep = false
+        lastEvalRaw = null
+        lastFollowupRaw = null
+
+        vmAI.chatRemoveTyping(nodeId)
     }
 
     // ---------------------------------------------------------------------
     // Typing bubble orchestration
     // ---------------------------------------------------------------------
 
-    /**
-     * Maintain/update typing bubble during streaming.
-     */
-    LaunchedEffect(loading, stream) {
+    LaunchedEffect(loading, stream, nodeId, sessionId) {
         if (loading) {
             val txt = stream.ifBlank { "…" }
             vmAI.chatUpsertTyping(
@@ -405,46 +475,25 @@ fun AiScreen(
     }
 
     /**
-     * Replace typing bubble with pretty JSON when the final result arrives.
+     * Remove typing bubble if a request ends without a final raw output.
      */
-    LaunchedEffect(raw, loading) {
-        if (!raw.isNullOrBlank() && !loading) {
-            val pretty = prettyOrRaw(prettyJson, raw!!)
-            vmAI.chatReplaceTypingWith(
-                nodeId,
-                AiViewModel.ChatMsgVm(
-                    id = "result-$nodeId-${System.nanoTime()}",
-                    sender = AiViewModel.ChatSender.AI,
-                    json = pretty
-                )
-            )
-        }
-    }
-
-    /**
-     * If streaming stops without a final raw result (cancel/error),
-     * ensure the typing bubble is removed to avoid "stuck typing" UX.
-     */
-    LaunchedEffect(loading, raw) {
+    LaunchedEffect(loading, raw, nodeId, sessionId) {
         if (!loading && raw.isNullOrBlank()) {
             vmAI.chatRemoveTyping(nodeId)
         }
     }
 
     // ---------------------------------------------------------------------
-    // Follow-up persistence
+    // Follow-up persistence (legacy / VM-driven)
     // ---------------------------------------------------------------------
 
     /**
-     * Track the last follow-up appended by this screen instance to avoid
-     * re-appending a stable follow-up on recomposition.
+     * In two-step mode, AiScreen owns follow-up persistence to avoid double-appends.
+     * In single-step mode, preserve the legacy behavior (vmAI.followupQuestion).
      */
-    var lastFollowupLocal by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(followup, loading, twoStepActive, nodeId, sessionId) {
+        if (twoStepActive) return@LaunchedEffect
 
-    /**
-     * Append follow-up question when AI is idle; also persist to SurveyViewModel.
-     */
-    LaunchedEffect(followup, loading) {
         val fu = followup
         if (fu != null && !loading && fu != lastFollowupLocal) {
             lastFollowupLocal = fu
@@ -469,23 +518,11 @@ fun AiScreen(
     var wasTranscribing by remember(nodeId, sessionId) { mutableStateOf(false) }
     var lastCommitted by remember(nodeId, sessionId) { mutableStateOf<String?>(null) }
 
-    /**
-     * Commit recognized speech only when an utterance finishes.
-     *
-     * Design choice:
-     * - When a new utterance begins, we clear the current composer and
-     *   persisted answer for this node. This favors "speech owns the answer"
-     *   semantics and prevents accidental concatenation of multiple utterances.
-     *
-     * If you want a "speech appends to typed draft" experience instead,
-     * remove the clear step and append the final text to [composer].
-     */
-    LaunchedEffect(speechRecording, speechTranscribing, speechPartial) {
+    LaunchedEffect(speechRecording, speechTranscribing, speechPartial, nodeId, sessionId) {
         if (speechController == null) return@LaunchedEffect
 
         val startedThisUtterance =
-            (!wasRecording && !wasTranscribing) &&
-                    (speechRecording || speechTranscribing)
+            (!wasRecording && !wasTranscribing) && (speechRecording || speechTranscribing)
 
         if (startedThisUtterance) {
             composer = ""
@@ -494,9 +531,7 @@ fun AiScreen(
         }
 
         val finishedThisUtterance =
-            (wasRecording || wasTranscribing) &&
-                    !speechRecording &&
-                    !speechTranscribing
+            (wasRecording || wasTranscribing) && !speechRecording && !speechTranscribing
 
         if (finishedThisUtterance) {
             val text = speechPartial.trim()
@@ -515,21 +550,189 @@ fun AiScreen(
     // Auto-scroll
     // ---------------------------------------------------------------------
 
-    /**
-     * Auto-scroll to bottom when chat size changes.
-     */
-    LaunchedEffect(chat.size) {
-        delay(16)
+    LaunchedEffect(chat.size, nodeId, sessionId) {
+        withFrameNanos { /* wait for scroll range */ }
         scroll.animateScrollTo(scroll.maxValue)
     }
 
-    /**
-     * Keep view pinned to the bottom while streaming grows.
-     */
-    LaunchedEffect(stream, loading) {
+    LaunchedEffect(stream, loading, nodeId, sessionId) {
         if (loading) {
             delay(24)
+            withFrameNanos { /* wait for scroll range */ }
             scroll.scrollTo(scroll.maxValue)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Two-step result handling (raw -> bubbles + optional follow-up trigger)
+    // ---------------------------------------------------------------------
+
+    LaunchedEffect(raw, loading, phase, inFlightTwoStep, twoStepPolicy, twoStepActive, nodeId, sessionId) {
+        val r = raw
+        if (loading) return@LaunchedEffect
+        if (r.isNullOrBlank()) return@LaunchedEffect
+        if (!twoStepActive && phase != TwoStepPhase.EvalRunning) return@LaunchedEffect
+
+        when (phase) {
+            TwoStepPhase.EvalRunning -> {
+                // Prevent re-processing the same EVAL raw.
+                if (lastEvalRaw == r) return@LaunchedEffect
+                lastEvalRaw = r
+
+                val pretty = prettyOrRaw(prettyJson, r)
+
+                // 1) Materialize EVAL/BASE JSON bubble.
+                // Some versions might not have a typing bubble yet; ensure we still show output.
+                runCatching {
+                    vmAI.chatReplaceTypingWith(
+                        nodeId,
+                        AiViewModel.ChatMsgVm(
+                            id = "result-$nodeId-${System.nanoTime()}",
+                            sender = AiViewModel.ChatSender.AI,
+                            json = pretty
+                        )
+                    )
+                }.onFailure {
+                    vmAI.chatAppend(
+                        nodeId,
+                        AiViewModel.ChatMsgVm(
+                            id = "result-$nodeId-${System.nanoTime()}",
+                            sender = AiViewModel.ChatSender.AI,
+                            json = pretty
+                        )
+                    )
+                }
+
+                // 2) Single-step path: done.
+                if (!inFlightTwoStep) {
+                    phase = TwoStepPhase.Idle
+                    pendingQuestion = null
+                    pendingAnswer = null
+                    return@LaunchedEffect
+                }
+
+                // 3) Two-step: decide follow-up.
+                val decision = parseEvalDecision(pretty)
+
+                val explicitNeeds = decision.needsFollowup
+                val score = decision.score
+                val fuFromEval = decision.followupFromEval?.trim().orEmpty()
+
+                val scoreOk = score?.let { it >= twoStepPolicy.okScoreThreshold } ?: false
+                val scoreLow = score?.let { it < twoStepPolicy.okScoreThreshold } ?: false
+                val hasFuSuggestion = fuFromEval.isNotBlank()
+
+                val shouldFollowup = when (explicitNeeds) {
+                    true -> true
+                    false -> false
+                    null -> {
+                        when {
+                            hasFuSuggestion -> true
+                            scoreLow -> true
+                            twoStepPolicy.skipFollowupWhenOk && scoreOk -> false
+                            else -> false
+                        }
+                    }
+                }
+
+                if (!shouldFollowup) {
+                    phase = TwoStepPhase.Idle
+                    pendingQuestion = null
+                    pendingAnswer = null
+                    inFlightTwoStep = false
+                    return@LaunchedEffect
+                }
+
+                // 4) Build follow-up prompt; if unavailable, fall back to eval's follow-up (if present).
+                val pq = pendingQuestion
+                val pa = pendingAnswer
+
+                val fuPrompt = runCatching {
+                    if (pq != null && pa != null) {
+                        twoStepProvider?.buildFollowupPrompt(nodeId, pq, pa, pretty)
+                    } else {
+                        null
+                    }
+                }.getOrNull().orEmpty().trim()
+
+                if (fuPrompt.isBlank()) {
+                    if (fuFromEval.isNotBlank() && fuFromEval != lastFollowupLocal) {
+                        lastFollowupLocal = fuFromEval
+                        vmAI.chatAppend(
+                            nodeId,
+                            AiViewModel.ChatMsgVm(
+                                id = "fu-$nodeId-${System.nanoTime()}",
+                                sender = AiViewModel.ChatSender.AI,
+                                text = fuFromEval
+                            )
+                        )
+                        vmSurvey.addFollowupQuestion(nodeId, fuFromEval)
+                    }
+                    phase = TwoStepPhase.Idle
+                    pendingQuestion = null
+                    pendingAnswer = null
+                    inFlightTwoStep = false
+                    return@LaunchedEffect
+                }
+
+                // 5) Kick follow-up generation.
+                lastFollowupRaw = null
+                phase = TwoStepPhase.FollowupRunning
+                scope.launch {
+                    vmAI.evaluateAsync(fuPrompt)
+                }
+            }
+
+            TwoStepPhase.FollowupRunning -> {
+                // Prevent re-processing the same follow-up raw.
+                if (lastFollowupRaw == r) return@LaunchedEffect
+                lastFollowupRaw = r
+
+                val fu = extractFollowupQuestionFromAny(r)?.trim().orEmpty()
+                if (fu.isBlank()) {
+                    vmAI.chatRemoveTyping(nodeId)
+                    phase = TwoStepPhase.Idle
+                    pendingQuestion = null
+                    pendingAnswer = null
+                    inFlightTwoStep = false
+                    return@LaunchedEffect
+                }
+
+                if (fu != lastFollowupLocal) {
+                    lastFollowupLocal = fu
+
+                    // Replace typing bubble with the follow-up question bubble.
+                    runCatching {
+                        vmAI.chatReplaceTypingWith(
+                            nodeId,
+                            AiViewModel.ChatMsgVm(
+                                id = "fu-$nodeId-${System.nanoTime()}",
+                                sender = AiViewModel.ChatSender.AI,
+                                text = fu
+                            )
+                        )
+                    }.onFailure {
+                        vmAI.chatAppend(
+                            nodeId,
+                            AiViewModel.ChatMsgVm(
+                                id = "fu-$nodeId-${System.nanoTime()}",
+                                sender = AiViewModel.ChatSender.AI,
+                                text = fu
+                            )
+                        )
+                    }
+                    vmSurvey.addFollowupQuestion(nodeId, fu)
+                } else {
+                    vmAI.chatRemoveTyping(nodeId)
+                }
+
+                phase = TwoStepPhase.Idle
+                pendingQuestion = null
+                pendingAnswer = null
+                inFlightTwoStep = false
+            }
+
+            TwoStepPhase.Idle -> Unit
         }
     }
 
@@ -537,17 +740,16 @@ fun AiScreen(
     // Submit logic
     // ---------------------------------------------------------------------
 
-    /**
-     * Submit current answer and trigger AI evaluation.
-     *
-     * This keeps IME open for rapid back-and-forth rounds.
-     */
     fun submit() {
         val answer = composer.trim()
         if (answer.isBlank() || loading) return
         if (speechRecording || speechTranscribing) return
 
         vmSurvey.setAnswer(answer, nodeId)
+
+        // NOTE:
+        // This method answers the last unanswered follow-up if one exists.
+        // If you want stricter behavior, gate this call based on UI context.
         vmSurvey.answerLastFollowup(nodeId, answer)
 
         vmAI.chatAppend(
@@ -559,14 +761,31 @@ fun AiScreen(
             )
         )
 
+        val q = vmSurvey.getQuestion(nodeId)
+        pendingQuestion = q
+        pendingAnswer = answer
+        lastEvalRaw = null
+        lastFollowupRaw = null
+
+        // Decide per-submission behavior.
+        inFlightTwoStep = twoStepActive
+        phase = TwoStepPhase.EvalRunning
+
         scope.launch {
-            val q = vmSurvey.getQuestion(nodeId)
-            val prompt = vmSurvey.getPrompt(nodeId, q, answer)
-            Log.d("AiScreen", "Submitting: $prompt")
-            vmAI.evaluateAsync(prompt)
+            val evalPrompt = if (inFlightTwoStep) {
+                twoStepProvider?.buildEvalPrompt(nodeId, q, answer).orEmpty()
+            } else {
+                vmSurvey.getPrompt(nodeId, q, answer)
+            }
+
+            if (LOG_PROMPTS) {
+                val preview = evalPrompt.replace("\n", " ").take(240)
+                Log.d("AiScreen", "Submitting prompt (${evalPrompt.length} chars): $preview…")
+            }
+
+            vmAI.evaluateAsync(evalPrompt)
         }
 
-        // Clear only the local composer to show immediate "sent" feedback.
         composer = ""
     }
 
@@ -579,10 +798,6 @@ fun AiScreen(
     Scaffold(
         topBar = { CompactTopBar(title = "Question • $nodeId") },
         snackbarHost = { SnackbarHost(snack) },
-        /**
-         * Keep window inset handling centralized so different Compose versions
-         * can be supported by swapping this value if needed.
-         */
         contentWindowInsets = zeroInsetsSafe(),
         bottomBar = {
             Surface(
@@ -611,9 +826,7 @@ fun AiScreen(
                         speechTranscribing = speechTranscribing,
                         speechStatusText = speechStatusText,
                         speechStatusIsError = speechStatusIsError,
-                        onToggleSpeech = speechController?.let { sc ->
-                            { sc.toggleRecording() }
-                        }
+                        onToggleSpeech = speechController?.let { sc -> { sc.toggleRecording() } }
                     )
 
                     HorizontalDivider(
@@ -629,6 +842,7 @@ fun AiScreen(
                     ) {
                         TextButton(
                             onClick = {
+                                runCatching { speechController?.stopRecording() }
                                 vmAI.resetStates()
                                 onBack()
                             }
@@ -640,6 +854,7 @@ fun AiScreen(
 
                         OutlinedButton(
                             onClick = {
+                                runCatching { speechController?.stopRecording() }
                                 vmAI.resetStates()
                                 onNext()
                             }
@@ -672,19 +887,21 @@ fun AiScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 chat.forEach { m ->
-                    val isAi = m.sender != AiViewModel.ChatSender.USER
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
-                    ) {
-                        if (m.json != null) {
-                            JsonBubbleMono(pretty = m.json, snack = snack)
-                        } else {
-                            BubbleMono(
-                                text = m.text.orEmpty(),
-                                isAi = isAi,
-                                isTyping = m.isTyping
-                            )
+                    key(m.id) {
+                        val isAi = m.sender != AiViewModel.ChatSender.USER
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
+                        ) {
+                            if (m.json != null) {
+                                JsonBubbleMono(pretty = m.json, snack = snack)
+                            } else {
+                                BubbleMono(
+                                    text = m.text.orEmpty(),
+                                    isAi = isAi,
+                                    isTyping = m.isTyping
+                                )
+                            }
                         }
                     }
                 }
@@ -692,24 +909,16 @@ fun AiScreen(
         }
     }
 
-    /**
-     * Clear transient AI state when leaving this screen.
-     *
-     * Chat history is intentionally preserved inside [AiViewModel].
-     */
-    DisposableEffect(Unit) {
-        onDispose { vmAI.resetStates() }
+    DisposableEffect(nodeId, sessionId, speechController) {
+        onDispose {
+            runCatching { speechController?.stopRecording() }
+            vmAI.resetStates()
+        }
     }
 }
 
 /* ───────────────────────────── Top bar ─────────────────────────────────── */
 
-/**
- * Minimal top bar for the AI screen.
- *
- * @param title Display title for the current node.
- * @param height Height of the bar content area.
- */
 @Composable
 private fun CompactTopBar(
     title: String,
@@ -744,14 +953,6 @@ private fun CompactTopBar(
 
 /* ───────────────────────────── Chat bubbles ─────────────────────────────── */
 
-/**
- * Monotone chat bubble with a subtle glass edge and micro-tail.
- *
- * @param text Bubble text content.
- * @param isAi True for AI/system bubbles, false for user bubbles.
- * @param isTyping True when this bubble is a typing indicator.
- * @param maxWidth Maximum visual width for a bubble.
- */
 @Composable
 private fun BubbleMono(
     text: String,
@@ -854,11 +1055,6 @@ private fun BubbleMono(
     }
 }
 
-/**
- * Three-dot typing indicator for AI bubbles.
- *
- * @param color Base color for dots.
- */
 @Composable
 private fun TypingDots(color: Color) {
     val t = rememberInfiniteTransition(label = "typing")
@@ -896,12 +1092,6 @@ private fun TypingDots(color: Color) {
     }
 }
 
-/**
- * Single dot for the typing indicator.
- *
- * @param alpha Current animated alpha.
- * @param color Base color.
- */
 @Composable
 private fun Dot(alpha: Float, color: Color) {
     Box(
@@ -913,13 +1103,6 @@ private fun Dot(alpha: Float, color: Color) {
 
 /* ───────────────────────────── JSON bubble ──────────────────────────────── */
 
-/**
- * Compact JSON result bubble with expand/collapse and copy action.
- *
- * @param pretty Pretty-printed JSON, or raw fallback text.
- * @param collapsedMaxHeight Max height for the collapsed preview.
- * @param snack Optional snackbar host for UX feedback on copy.
- */
 @Composable
 private fun JsonBubbleMono(
     pretty: String,
@@ -928,12 +1111,14 @@ private fun JsonBubbleMono(
 ) {
     var expanded by remember { mutableStateOf(false) }
     val cs = MaterialTheme.colorScheme
-    val clipboard = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val clip = RoundedCornerShape(10.dp)
 
-    val headerScore = remember(pretty) { FollowupExtractor.extractScore(pretty) }
+    val headerScore = remember(pretty) { parseEvalDecision(pretty).score }
     val previewText = remember(pretty) { buildJsonPreview(pretty) }
+
+    var suppressToggle by remember { mutableStateOf(false) }
 
     Surface(
         color = cs.surfaceVariant.copy(alpha = 0.60f),
@@ -947,7 +1132,13 @@ private fun JsonBubbleMono(
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
-            ) { expanded = !expanded }
+            ) {
+                if (suppressToggle) {
+                    suppressToggle = false
+                    return@clickable
+                }
+                expanded = !expanded
+            }
     ) {
         Column {
             Row(
@@ -976,10 +1167,15 @@ private fun JsonBubbleMono(
                     color = cs.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
                 )
+
                 IconButton(
                     onClick = {
-                        clipboard.setText(AnnotatedString(pretty))
-                        scope.launch { snack?.showSnackbar("JSON copied") }
+                        suppressToggle = true
+                        scope.launch {
+                            val clipData = ClipData.newPlainText("json", pretty)
+                            clipboard.setClipEntry(clipData.toClipEntry())
+                            snack?.showSnackbar("JSON copied")
+                        }
                     },
                     modifier = Modifier.size(28.dp)
                 ) {
@@ -1022,21 +1218,6 @@ private fun JsonBubbleMono(
 
 /* ───────────────────────────── Composer ─────────────────────────────────── */
 
-/**
- * Chat composer row with optional microphone control.
- *
- * @param value Current composer text.
- * @param onValueChange Text change callback.
- * @param onSend Submit callback.
- * @param enabled Global enable state for user input.
- * @param focusRequester Focus requester for the text field.
- * @param speechEnabled True when a [SpeechController] is supplied.
- * @param speechRecording True while microphone capture is running.
- * @param speechTranscribing True while STT decoding is running.
- * @param speechStatusText Optional status line under the composer.
- * @param speechStatusIsError True when the status line should use the error color.
- * @param onToggleSpeech Recorder toggle callback.
- */
 @Composable
 private fun ChatComposer(
     value: String,
@@ -1097,10 +1278,6 @@ private fun ChatComposer(
 
             if (speechEnabled && onToggleSpeech != null) {
                 val tint = cs.onSurfaceVariant
-                /**
-                 * Mic button is disabled while transcribing to avoid overlapping
-                 * utterance sessions in controllers that do not support re-entrancy.
-                 */
                 val micEnabled = (enabled || speechRecording) && !speechTranscribing
 
                 IconButton(
@@ -1155,12 +1332,6 @@ private fun ChatComposer(
 
 /* ─────────────────────────── Visual utilities ───────────────────────────── */
 
-/**
- * Animated monotone backplate.
- *
- * This creates slow, neutral gradients that keep the screen firmly in
- * grayscale territory while still providing subtle motion cues.
- */
 @Composable
 private fun animatedMonotoneBackplate(): Brush {
     val cs = MaterialTheme.colorScheme
@@ -1190,13 +1361,6 @@ private fun animatedMonotoneBackplate(): Brush {
     )
 }
 
-/**
- * Draw a subtle monochrome edge highlight around a surface.
- *
- * @param alpha Base alpha of the edge gradient.
- * @param corner Corner radius used to compute the stroke rounding.
- * @param stroke Stroke width.
- */
 @Composable
 private fun Modifier.neutralEdge(
     alpha: Float = 0.16f,
@@ -1220,53 +1384,38 @@ private fun Modifier.neutralEdge(
     }
 )
 
-/**
- * Provide a "zero insets" value for Scaffold in a single place.
- *
- * Some Compose versions offer a direct constructor. If your build complains,
- * replace this with a version-appropriate alternative.
- */
 private fun zeroInsetsSafe(): WindowInsets {
     return WindowInsets(0, 0, 0, 0)
 }
 
 /* ───────────────────────────── JSON helpers ─────────────────────────────── */
 
-/**
- * Try to pretty-print a JSON-like response; fall back to raw text.
- *
- * The model sometimes wraps JSON in Markdown fences or emits extra natural
- * language around it. We attempt lenient extraction of the first valid JSON
- * object/array found in the text.
- */
 private fun prettyOrRaw(json: Json, raw: String): String {
     val stripped = stripCodeFence(raw)
     val element = parseJsonLenient(json, stripped)
     return if (element != null) {
         json.encodeToString(JsonElement.serializer(), element)
     } else {
-        raw
+        stripped
     }
 }
 
-/**
- * Build a compact preview string for the collapsed JSON bubble.
- *
- * We prefer the three high-signal keys used by the evaluation contract:
- * - "analysis"
- * - "expected answer"
- * - "follow-up question"
- */
 private fun buildJsonPreview(pretty: String): String {
     val json = Json { ignoreUnknownKeys = true }
     val stripped = stripCodeFence(pretty)
     val element = parseJsonLenient(json, stripped)
 
-    val obj = element as? kotlinx.serialization.json.JsonObject
+    val obj = element as? JsonObject
     if (obj != null) {
-        val analysis = obj["analysis"]?.toString()?.trim('"')
-        val fu = obj["follow-up question"]?.toString()?.trim('"')
-        val expected = obj["expected answer"]?.toString()?.trim('"')
+        val analysis = obj.firstStringOf("analysis")
+        val expected = obj.firstStringOf("expected_answer", "expectedAnswer", "expected answer")
+        val fu = obj.firstStringOf(
+            "follow_up_question",
+            "followUpQuestion",
+            "followup_question",
+            "follow-up question",
+            "follow up question"
+        )
 
         val lines = buildList {
             if (!analysis.isNullOrBlank()) add("analysis: $analysis")
@@ -1274,19 +1423,104 @@ private fun buildJsonPreview(pretty: String): String {
             if (!fu.isNullOrBlank()) add("follow-up: $fu")
         }
 
-        if (lines.isNotEmpty()) {
-            return lines.joinToString("\n")
-        }
+        if (lines.isNotEmpty()) return lines.joinToString("\n")
     }
 
     val t = stripped.trim()
     return if (t.length <= 180) t else t.take(180).trimEnd() + "…"
 }
 
-/**
- * Lenient JSON parser that attempts to locate the first valid JSON payload
- * in a mixed string.
- */
+private data class EvalDecision(
+    val score: Int?,
+    val needsFollowup: Boolean?,
+    val followupFromEval: String?
+)
+
+private fun parseEvalDecision(pretty: String): EvalDecision {
+    val json = Json { ignoreUnknownKeys = true }
+    val stripped = stripCodeFence(pretty)
+    val element = parseJsonLenient(json, stripped)
+
+    val obj = element as? JsonObject
+    if (obj != null) {
+        val score = obj.firstIntOf("score")
+        val needs = obj.firstBoolOf("needs_followup", "needsFollowup", "needsFollowUp", "needs_follow_up")
+        val fu = obj.firstStringOf(
+            "follow_up_question",
+            "followUpQuestion",
+            "followup_question",
+            "follow-up question",
+            "follow up question"
+        )
+        return EvalDecision(score = score, needsFollowup = needs, followupFromEval = fu)
+    }
+    return EvalDecision(score = null, needsFollowup = null, followupFromEval = null)
+}
+
+private fun extractFollowupQuestionFromAny(raw: String): String? {
+    val json = Json { ignoreUnknownKeys = true }
+    val stripped = stripCodeFence(raw).trim()
+    if (stripped.isBlank()) return null
+
+    val element = parseJsonLenient(json, stripped)
+    when (element) {
+        is JsonObject -> {
+            val fu = element.firstStringOf(
+                "follow_up_question",
+                "followUpQuestion",
+                "followup_question",
+                "follow-up question",
+                "follow up question"
+            )
+            if (!fu.isNullOrBlank()) return fu
+        }
+        is JsonPrimitive -> {
+            val s = element.contentOrNullSafe()?.trim()
+            if (!s.isNullOrBlank()) return s
+        }
+        else -> Unit
+    }
+
+    val t = stripped.trim()
+    if (t.startsWith("\"") && t.endsWith("\"") && t.length >= 2) {
+        return t.substring(1, t.length - 1).trim().ifBlank { null }
+    }
+    return t.ifBlank { null }
+}
+
+private fun JsonObject.firstStringOf(vararg keys: String): String? {
+    for (k in keys) {
+        val v = (this[k] as? JsonPrimitive)?.contentOrNullSafe()?.trim()
+        if (!v.isNullOrBlank()) return v
+    }
+    return null
+}
+
+private fun JsonObject.firstIntOf(vararg keys: String): Int? {
+    for (k in keys) {
+        val p = this[k] as? JsonPrimitive ?: continue
+        val v = p.contentOrNullSafe()?.trim().orEmpty()
+        val i = v.toIntOrNull()
+        if (i != null) return i
+    }
+    return null
+}
+
+private fun JsonObject.firstBoolOf(vararg keys: String): Boolean? {
+    for (k in keys) {
+        val p = this[k] as? JsonPrimitive ?: continue
+        val v = p.contentOrNullSafe()?.trim()?.lowercase().orEmpty()
+        when (v) {
+            "true", "1", "yes", "y" -> return true
+            "false", "0", "no", "n" -> return false
+        }
+    }
+    return null
+}
+
+private fun JsonPrimitive.contentOrNullSafe(): String? =
+    runCatching { this.content }.getOrNull()
+
 private fun parseJsonLenient(json: Json, text: String): JsonElement? {
     val trimmed = text.trim()
     if (trimmed.isEmpty()) return null
@@ -1313,14 +1547,6 @@ private fun parseJsonLenient(json: Json, text: String): JsonElement? {
 private fun parseOrNull(json: Json, value: String): JsonElement? =
     runCatching { json.parseToJsonElement(value) }.getOrNull()
 
-/**
- * Strip a single Markdown code fence layer if present.
- *
- * Supports:
- *  ```json
- *  { ... }
- *  ```
- */
 private fun stripCodeFence(text: String): String {
     val t = text.trim()
     if (!t.startsWith("```")) return t
@@ -1331,11 +1557,6 @@ private fun stripCodeFence(text: String): String {
     return t.substring(contentStart, closing).trim()
 }
 
-/**
- * Find the matching closing boundary for a JSON object or array.
- *
- * This is a lightweight parser that respects string escaping rules.
- */
 private fun findMatchingJsonBoundary(text: String, start: Int): Int {
     if (start !in text.indices) return -1
     val open = text[start]
@@ -1392,8 +1613,9 @@ private fun ChatPreview() {
                 json = """
                     {
                       "analysis": "Clear unit",
-                      "expected answer": "~10% avg loss over 3 seasons",
-                      "follow-up question": "Is 10% per season or overall?",
+                      "expected_answer": "~10% avg loss over 3 seasons",
+                      "needs_followup": true,
+                      "follow_up_question": "Is 10% per season or overall?",
                       "score": 88
                     }
                 """.trimIndent()
@@ -1418,19 +1640,21 @@ private fun ChatPreview() {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 fake.forEach { m ->
-                    val isAi = m.sender != AiViewModel.ChatSender.USER
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
-                    ) {
-                        if (m.json != null) {
-                            JsonBubbleMono(pretty = m.json)
-                        } else {
-                            BubbleMono(
-                                text = m.text.orEmpty(),
-                                isAi = isAi,
-                                isTyping = false
-                            )
+                    key(m.id) {
+                        val isAi = m.sender != AiViewModel.ChatSender.USER
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = if (isAi) Arrangement.Start else Arrangement.End
+                        ) {
+                            if (m.json != null) {
+                                JsonBubbleMono(pretty = m.json)
+                            } else {
+                                BubbleMono(
+                                    text = m.text.orEmpty(),
+                                    isAi = isAi,
+                                    isTyping = false
+                                )
+                            }
                         }
                     }
                 }

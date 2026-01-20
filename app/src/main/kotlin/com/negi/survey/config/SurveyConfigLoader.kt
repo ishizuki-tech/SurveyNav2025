@@ -11,15 +11,25 @@
  *  Summary:
  *  ---------------------------------------------------------------------
  *  Strongly-typed survey configuration model and loader.
- *  Supports JSON and YAML formats, SLM metadata, model defaults,
- *  Whisper metadata, and structural validation for graph-based survey flows.
+ *  Supports JSON and YAML formats, SLM metadata, Two-step (EVAL -> Follow-up),
+ *  model defaults, Whisper metadata, and structural validation for graph-based
+ *  survey flows.
  *
- *  Features:
- *   • Typed prompts, graph, SLM runtime metadata, Whisper metadata, and model defaults
- *   • JSON/YAML auto-detection with BOM and newline normalization
- *   • Config-level graph/SLM/Whisper/model-defaults validation
- *   • Backward-compatible type aliases for legacy call sites
- *   • Convenience loader APIs that validate on load
+ *  Update (2026-01):
+ *  ---------------------------------------------------------------------
+ *   • Fix: Accept both snake_case and camelCase keys for core graph/prompt fields:
+ *       - graph.start_id / graph.startId
+ *       - prompts[].node_id / prompts[].nodeId
+ *       - nodes[].next_id / nodes[].nextId
+ *     via custom serializers (no unsafe text rewriting).
+ *
+ *   • Improve: Stronger validation
+ *       - Detect blank prompt nodeId / blank prompt template
+ *       - Detect AI nodes with no prompt defined (any stage)
+ *       - Warn on self-loop nextId
+ *       - Warn on unreachable nodes from startId (soft rule)
+ *
+ *   • Improve: Prompt stage utilities (BASE/EVAL/FOLLOWUP) with tolerant parsing.
  * =====================================================================
  */
 
@@ -30,24 +40,38 @@ import com.charleskorn.kaml.Yaml
 import com.charleskorn.kaml.YamlConfiguration
 import java.io.File
 import java.nio.charset.Charset
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.nullable
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.buildClassSerialDescriptor
+import kotlinx.serialization.descriptors.element
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.encoding.CompositeDecoder
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.encoding.decodeStructure
+import kotlinx.serialization.encoding.encodeStructure
 import kotlinx.serialization.json.Json
 
 /**
  * Top-level configuration model for a survey.
  *
- * Aggregates the prompt table, graph structure, SLM metadata, Whisper metadata,
- * and model defaults that describe how a survey should be executed at runtime.
+ * Aggregates the prompt table, graph structure, SLM metadata, TwoStep metadata,
+ * Whisper metadata, and model defaults that describe how a survey should be
+ * executed at runtime.
  */
 @Serializable
 data class SurveyConfig(
     val prompts: List<Prompt> = emptyList(),
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
+    @SerialName("two_step") val twoStep: TwoStepMeta = TwoStepMeta(),
     val whisper: WhisperMeta = WhisperMeta(),
     @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
@@ -57,16 +81,44 @@ data class SurveyConfig(
     // ---------------------------------------------------------------------
 
     /**
+     * Prompt stage token derived from staged prompt identifiers.
+     */
+    enum class PromptStage {
+        BASE,
+        EVAL,
+        FOLLOWUP,
+        UNKNOWN
+    }
+
+    /**
      * A single prompt template entry associated with a specific graph node.
      *
-     * The template string can contain placeholders such as {{QUESTION}},
-     * {{ANSWER}}, and {{NODE_ID}} which will be resolved by the ViewModel.
+     * Notes:
+     * - Supports both nodeId and node_id in configs via custom serializer.
+     * - Supports staged node ids like "Q1#eval" or "Q1#followup".
      */
-    @Serializable
+    @Serializable(with = PromptSerializer::class)
     data class Prompt(
         val nodeId: String,
         val prompt: String
-    )
+    ) {
+
+        /**
+         * Extract the base node id from staged prompt identifiers.
+         */
+        fun baseNodeId(): String = nodeId.baseNodeId()
+
+        /**
+         * Extract the stage token (e.g., "eval", "followup") from a staged prompt id.
+         * Returns null if the nodeId does not contain a stage delimiter.
+         */
+        fun stageTokenOrNull(): String? = nodeId.stageTokenOrNull()
+
+        /**
+         * Resolve the stage into a [PromptStage] using tolerant parsing.
+         */
+        fun stage(): PromptStage = stageTokenOrNull().toPromptStage()
+    }
 
     // ---------------------------------------------------------------------
     // graph
@@ -75,14 +127,37 @@ data class SurveyConfig(
     /**
      * Graph definition for the survey flow.
      *
-     * The graph is defined by an entry-point node ID ([startId]) and
-     * a flat list of [NodeDTO] instances that describe each node.
+     * Notes:
+     * - Supports startId and start_id in configs via custom serializer.
      */
-    @Serializable
+    @Serializable(with = GraphSerializer::class)
     data class Graph(
         val startId: String,
         val nodes: List<NodeDTO> = emptyList()
     )
+
+    // ---------------------------------------------------------------------
+    // Two-step metadata (EVAL -> optional Follow-up)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Two-step SLM flow configuration.
+     */
+    @Serializable
+    data class TwoStepMeta(
+        @SerialName("enabled") val enabled: Boolean? = null,
+        @SerialName("eval_ok_score_threshold") val evalOkScoreThreshold: Int? = null,
+        @SerialName("skip_followup_when_ok") val skipFollowupWhenOk: Boolean? = null
+    ) {
+        /** Resolve enabled with a default. */
+        fun enabledOr(defaultValue: Boolean = false): Boolean = enabled ?: defaultValue
+
+        /** Resolve eval_ok_score_threshold with a default. */
+        fun okScoreThresholdOr(defaultValue: Int = 85): Int = evalOkScoreThreshold ?: defaultValue
+
+        /** Resolve skip_followup_when_ok with a default. */
+        fun skipFollowupWhenOkOr(defaultValue: Boolean = true): Boolean = skipFollowupWhenOk ?: defaultValue
+    }
 
     // ---------------------------------------------------------------------
     // SLM metadata
@@ -91,18 +166,19 @@ data class SurveyConfig(
     /**
      * SLM runtime parameters and system-prompt metadata.
      *
-     * All fields are optional. Snake_case field names have explicit
-     * [SerialName] annotations to keep YAML/JSON key resolution stable
-     * even if the Kotlin property names change in the future.
+     * All fields are optional. Snake_case field names have explicit [SerialName]
+     * annotations to keep YAML/JSON key resolution stable.
      */
     @Serializable
     data class SlmMeta(
-        // --- runtime params (optional) ---
-
         /** Preferred accelerator type, "CPU" or "GPU". */
         @SerialName("accelerator") val accelerator: String? = null,
 
-        /** Maximum number of tokens to generate per call. */
+        /**
+         * Maximum number of tokens for the backend.
+         *
+         * Note: On some backends, this may represent (input + output) tokens.
+         */
         @SerialName("max_tokens") val maxTokens: Int? = null,
 
         /** Top-k sampling parameter. */
@@ -114,7 +190,11 @@ data class SurveyConfig(
         /** Temperature parameter for sampling. */
         @SerialName("temperature") val temperature: Double? = null,
 
-        // --- meta/system prompt pieces (optional) ---
+        /** Repetition penalty, if supported by the backend. */
+        @SerialName("repetition_penalty") val repetitionPenalty: Double? = null,
+
+        /** Optional stop sequences, if supported by the backend. */
+        @SerialName("stop_sequences") val stopSequences: List<String>? = null,
 
         /** Prefix prepended before user turns, if any. */
         @SerialName("user_turn_prefix") val user_turn_prefix: String? = null,
@@ -131,18 +211,66 @@ data class SurveyConfig(
         /** Global preamble text for the system prompt. */
         @SerialName("preamble") val preamble: String? = null,
 
-        /** Contract that describes model behavior and scope. */
+        /** Contract that describes model behavior and scope (legacy single-step). */
         @SerialName("key_contract") val key_contract: String? = null,
 
-        /** Narrative about the allowed length for answers. */
+        /** Narrative about the allowed length for answers (legacy single-step). */
         @SerialName("length_budget") val length_budget: String? = null,
 
         /** Description of how scoring should work. */
         @SerialName("scoring_rule") val scoring_rule: String? = null,
 
-        /** Extra constraints to enforce strict output formats. */
-        @SerialName("strict_output") val strict_output: String? = null
-    )
+        /** Extra constraints to enforce strict output formats (legacy single-step). */
+        @SerialName("strict_output") val strict_output: String? = null,
+
+        /** Contract for the EVAL step (strict JSON output, gating keys, etc.). */
+        @SerialName("eval_key_contract") val eval_key_contract: String? = null,
+
+        /** Length constraints for the EVAL step. */
+        @SerialName("eval_length_budget") val eval_length_budget: String? = null,
+
+        /** Strict-output constraints for the EVAL step. */
+        @SerialName("eval_strict_output") val eval_strict_output: String? = null,
+
+        /** Contract for the follow-up step (e.g., plain text, single sentence). */
+        @SerialName("followup_contract") val followup_contract: String? = null
+    ) {
+        /** Convenience alias (camelCase) for call sites. */
+        val userTurnPrefix: String? get() = user_turn_prefix
+
+        /** Convenience alias (camelCase) for call sites. */
+        val modelTurnPrefix: String? get() = model_turn_prefix
+
+        /** Convenience alias (camelCase) for call sites. */
+        val turnEnd: String? get() = turn_end
+
+        /** Convenience alias (camelCase) for call sites. */
+        val emptyJsonInstruction: String? get() = empty_json_instruction
+
+        /** Convenience alias (camelCase) for call sites. */
+        val keyContract: String? get() = key_contract
+
+        /** Convenience alias (camelCase) for call sites. */
+        val lengthBudget: String? get() = length_budget
+
+        /** Convenience alias (camelCase) for call sites. */
+        val scoringRule: String? get() = scoring_rule
+
+        /** Convenience alias (camelCase) for call sites. */
+        val strictOutput: String? get() = strict_output
+
+        /** Convenience alias (camelCase) for call sites. */
+        val evalKeyContract: String? get() = eval_key_contract
+
+        /** Convenience alias (camelCase) for call sites. */
+        val evalLengthBudget: String? get() = eval_length_budget
+
+        /** Convenience alias (camelCase) for call sites. */
+        val evalStrictOutput: String? get() = eval_strict_output
+
+        /** Convenience alias (camelCase) for call sites. */
+        val followupContract: String? get() = followup_contract
+    }
 
     // ---------------------------------------------------------------------
     // Whisper metadata
@@ -150,9 +278,6 @@ data class SurveyConfig(
 
     /**
      * Whisper runtime parameters used by on-device speech input.
-     *
-     * These values are optional overrides for the client-side defaults.
-     * When omitted, the app should fall back to stable defaults.
      */
     @Serializable
     data class WhisperMeta(
@@ -187,37 +312,47 @@ data class SurveyConfig(
 
     /**
      * Model download and UI default settings.
-     *
-     * These values are optional overrides for the client-side defaults
-     * used by the SLM integration (for example, download URL and timeouts).
      */
     @Serializable
     data class ModelDefaults(
-        /**
-         * Default model URL for the download UI.
-         */
+        /** Default model URL for the download UI. */
         @SerialName("default_model_url") val defaultModelUrl: String? = null,
 
-        /**
-         * Default file name to use when saving the model locally.
-         */
+        /** Default file name to use when saving the model locally. */
         @SerialName("default_file_name") val defaultFileName: String? = null,
 
-        /**
-         * Optional timeout override for model loading/inference, in milliseconds.
-         */
+        /** Optional timeout override for model loading/inference, in milliseconds. */
         @SerialName("timeout_ms") val timeoutMs: Long? = null,
 
-        /**
-         * Optional UI throttling interval for streaming updates, in milliseconds.
-         */
+        /** Optional UI throttling interval for streaming updates, in milliseconds. */
         @SerialName("ui_throttle_ms") val uiThrottleMs: Long? = null,
 
-        /**
-         * Optional minimum number of streamed bytes before pushing a UI update.
-         */
+        /** Optional minimum number of streamed bytes before pushing a UI update. */
         @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
     )
+
+    // ---------------------------------------------------------------------
+    // Prompt lookup helpers
+    // ---------------------------------------------------------------------
+
+    /**
+     * Find the best matching prompt for [nodeId] and [stage].
+     *
+     * Resolution:
+     *  1) stage-specific prompt (base id matches and stage matches)
+     *  2) base prompt (base id matches and stage == BASE)
+     *  3) null
+     */
+    fun findPrompt(nodeId: String, stage: PromptStage = PromptStage.BASE): Prompt? {
+        val base = nodeId.baseNodeId()
+        val stageHit = prompts.firstOrNull { it.baseNodeId() == base && it.stage() == stage }
+        if (stageHit != null) return stageHit
+        return prompts.firstOrNull { it.baseNodeId() == base && it.stage() == PromptStage.BASE }
+    }
+
+    /** Find the prompt template string for [nodeId] and [stage]. */
+    fun findPromptText(nodeId: String, stage: PromptStage = PromptStage.BASE): String? =
+        findPrompt(nodeId, stage)?.prompt
 
     // ---------------------------------------------------------------------
     // Validation
@@ -245,18 +380,14 @@ data class SurveyConfig(
 
         // --- node id sanity ---
         val ids = graph.nodes.map { it.id }
-        val blankIds = ids.filter { it.isBlank() }.distinct()
-        if (blankIds.isNotEmpty()) {
+        if (ids.any { it.isBlank() }) {
             issues += "graph.nodes contains blank id entries"
         }
-
         val idSet = ids.filter { it.isNotBlank() }.toSet()
 
         // --- startId existence ---
         if (graph.startId.isNotBlank() && graph.startId !in idSet) {
-            issues += "graph.startId='${graph.startId}' not found in node ids: ${
-                idSet.joinToString(",")
-            }"
+            issues += "graph.startId='${graph.startId}' not found in node ids: ${idSet.joinToString(",")}"
         }
 
         // --- duplicate node id check ---
@@ -284,48 +415,102 @@ data class SurveyConfig(
         if (startNode != null && startNode.nodeType() != NodeType.START) {
             issues += "graph.startId points to a non-START node (id='${startNode.id}', type='${startNode.type}')"
         }
-
         val explicitStarts = graph.nodes.count { it.nodeType() == NodeType.START }
         if (explicitStarts > 1) {
             issues += "multiple START nodes detected (count=$explicitStarts)"
         }
 
-        // --- prompt target existence check ---
+        // --- prompts sanity ---
+        if (prompts.any { it.nodeId.isBlank() }) {
+            issues += "prompts contain blank nodeId entries"
+        }
+        val blankPromptBodies = prompts
+            .asSequence()
+            .filter { it.prompt.isBlank() }
+            .map { it.nodeId }
+            .toList()
+        if (blankPromptBodies.isNotEmpty()) {
+            issues += "prompts contain blank prompt templates for nodeIds: ${blankPromptBodies.joinToString(",")}"
+        }
+
+        // --- prompts target existence check (TwoStep-staged ids supported) ---
         val unknownPromptTargets = prompts
             .asSequence()
-            .map { it.nodeId }
+            .map { it.nodeId.baseNodeId() }
             .filter { it.isNotBlank() }
             .filter { it !in idSet }
             .distinct()
             .toList()
         if (unknownPromptTargets.isNotEmpty()) {
-            issues += "prompts contain unknown nodeIds: ${
-                unknownPromptTargets.joinToString(",")
-            }"
+            issues += "prompts contain unknown nodeIds (base ids): ${unknownPromptTargets.joinToString(",")}"
         }
 
-        // --- prompt target duplication check ---
-        val duplicatePromptTargets = prompts
-            .filter { it.nodeId.isNotBlank() }
-            .groupingBy { it.nodeId }
+        // --- prompt target duplication check (base + stage) ---
+        val duplicatePromptKeys = prompts
+            .asSequence()
+            .map { p ->
+                val base = p.nodeId.baseNodeId()
+                val stage = p.nodeId.stageTokenOrNull()?.lowercase()?.trim().orEmpty()
+                if (stage.isEmpty()) base else "$base#$stage"
+            }
+            .filter { it.isNotBlank() }
+            .groupingBy { it }
             .eachCount()
             .filterValues { it > 1 }
             .keys
-        if (duplicatePromptTargets.isNotEmpty()) {
-            issues += "multiple prompts defined for nodeIds: ${
-                duplicatePromptTargets.joinToString(",")
-            }"
+            .toList()
+        if (duplicatePromptKeys.isNotEmpty()) {
+            issues += "multiple prompts defined for nodeIds (base+stage): ${duplicatePromptKeys.joinToString(",")}"
         }
 
-        // --- nextId reference existence check ---
+        // --- staged prompt sanity (soft) ---
+        val blankStagePrompts = prompts
+            .asSequence()
+            .map { it.nodeId }
+            .filter { it.containsStageDelimiter() }
+            .filter { it.stageTokenOrNull().isNullOrBlank() }
+            .toList()
+        if (blankStagePrompts.isNotEmpty()) {
+            issues += "prompts contain staged nodeIds with blank stage token: ${blankStagePrompts.joinToString(",")}"
+        }
+
+        // --- AI nodes should have a prompt defined (any stage is acceptable) ---
+        val aiIds = graph.nodes
+            .asSequence()
+            .filter { it.nodeType() == NodeType.AI }
+            .map { it.id }
+            .filter { it.isNotBlank() }
+            .toList()
+
+        val promptBaseSet = prompts
+            .asSequence()
+            .map { it.nodeId.baseNodeId() }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+        val aiMissingPrompts = aiIds.filter { it !in promptBaseSet }
+        if (aiMissingPrompts.isNotEmpty()) {
+            issues += "AI nodes with no prompt defined: ${aiMissingPrompts.joinToString(",")}"
+        }
+
+        // --- nextId reference existence check + self-loop warning ---
         graph.nodes.forEach { node ->
-            node.nextId
-                ?.takeIf { it.isNotBlank() }
-                ?.let { next ->
-                    if (next !in idSet) {
-                        issues += "node '${node.id}' references unknown nextId='$next'"
-                    }
+            val next = node.nextId?.takeIf { it.isNotBlank() }
+            if (next != null) {
+                if (next !in idSet) {
+                    issues += "node '${node.id}' references unknown nextId='$next'"
                 }
+                if (next == node.id) {
+                    issues += "node '${node.id}' has self-loop nextId='${node.id}'"
+                }
+            }
+        }
+
+        // --- Reachability check (soft rule) ---
+        val reachable = graph.reachableNodeIds()
+        val unreachable = idSet.minus(reachable)
+        if (unreachable.isNotEmpty()) {
+            issues += "unreachable nodes from startId='${graph.startId}': ${unreachable.joinToString(",")}"
         }
 
         // --- AI node question non-empty check ---
@@ -348,6 +533,13 @@ data class SurveyConfig(
                 issues += "Choice node '${it.id}' has empty options"
             }
 
+        // --- TwoStep sanity (optional) ---
+        twoStep.evalOkScoreThreshold?.let { th ->
+            if (th !in 1..100) {
+                issues += "two_step.eval_ok_score_threshold must be in [1,100] (got $th)"
+            }
+        }
+
         // --- SLM param sanity (optional, only if given) ---
         slm.accelerator?.let { acc ->
             val a = acc.trim().uppercase()
@@ -355,45 +547,21 @@ data class SurveyConfig(
                 issues += "slm.accelerator should be 'CPU' or 'GPU' (got '$acc')"
             }
         }
-        slm.maxTokens?.let {
-            if (it <= 0) {
-                issues += "slm.max_tokens must be > 0 (got $it)"
-            }
-        }
-        slm.topK?.let {
-            if (it < 0) {
-                issues += "slm.top_k must be >= 0 (got $it)"
-            }
-        }
-        slm.topP?.let {
-            if (it !in 0.0..1.0) {
-                issues += "slm.top_p must be in [0.0,1.0] (got $it)"
-            }
-        }
-        slm.temperature?.let {
-            if (it < 0.0) {
-                issues += "slm.temperature must be >= 0.0 (got $it)"
-            }
-        }
+        slm.maxTokens?.let { if (it <= 0) issues += "slm.max_tokens must be > 0 (got $it)" }
+        slm.topK?.let { if (it < 0) issues += "slm.top_k must be >= 0 (got $it)" }
+        slm.topP?.let { if (it !in 0.0..1.0) issues += "slm.top_p must be in [0.0,1.0] (got $it)" }
+        slm.temperature?.let { if (it < 0.0) issues += "slm.temperature must be >= 0.0 (got $it)" }
+        slm.repetitionPenalty?.let { if (it <= 0.0) issues += "slm.repetition_penalty must be > 0.0 (got $it)" }
 
         // --- Whisper param sanity (optional, only if given) ---
-        whisper.assetModelPath?.let { p ->
-            if (p.isBlank()) {
-                issues += "whisper.asset_model_path is blank"
-            }
-        }
+        whisper.assetModelPath?.let { if (it.isBlank()) issues += "whisper.asset_model_path is blank" }
         whisper.language?.let { lang ->
             val norm = lang.trim().lowercase()
-            val ok = norm in setOf("auto", "en", "ja", "sw")
-            if (!ok) {
+            if (norm !in setOf("auto", "en", "ja", "sw")) {
                 issues += "whisper.language should be one of 'auto','en','ja','sw' (got '$lang')"
             }
         }
-        whisper.targetSampleRate?.let { sr ->
-            if (sr <= 0) {
-                issues += "whisper.target_sample_rate must be > 0 (got $sr)"
-            }
-        }
+        whisper.targetSampleRate?.let { if (it <= 0) issues += "whisper.target_sample_rate must be > 0 (got $it)" }
         whisper.recordSampleRates?.let { rs ->
             if (rs.isEmpty()) {
                 issues += "whisper.record_sample_rates is empty"
@@ -406,38 +574,16 @@ data class SurveyConfig(
         }
 
         // --- Model defaults sanity (optional, only if given) ---
-        modelDefaults.defaultModelUrl?.let { url ->
-            if (url.isBlank()) {
-                issues += "model_defaults.default_model_url is blank"
-            }
-        }
-        modelDefaults.defaultFileName?.let { name ->
-            if (name.isBlank()) {
-                issues += "model_defaults.default_file_name is blank"
-            }
-        }
-        modelDefaults.timeoutMs?.let { ms ->
-            if (ms <= 0L) {
-                issues += "model_defaults.timeout_ms must be > 0 (got $ms)"
-            }
-        }
-        modelDefaults.uiThrottleMs?.let { ms ->
-            if (ms < 0L) {
-                issues += "model_defaults.ui_throttle_ms must be >= 0 (got $ms)"
-            }
-        }
-        modelDefaults.uiMinDeltaBytes?.let { bytes ->
-            if (bytes < 0L) {
-                issues += "model_defaults.ui_min_delta_bytes must be >= 0 (got $bytes)"
-            }
-        }
+        modelDefaults.defaultModelUrl?.let { if (it.isBlank()) issues += "model_defaults.default_model_url is blank" }
+        modelDefaults.defaultFileName?.let { if (it.isBlank()) issues += "model_defaults.default_file_name is blank" }
+        modelDefaults.timeoutMs?.let { if (it <= 0L) issues += "model_defaults.timeout_ms must be > 0 (got $it)" }
+        modelDefaults.uiThrottleMs?.let { if (it < 0L) issues += "model_defaults.ui_throttle_ms must be >= 0 (got $it)" }
+        modelDefaults.uiMinDeltaBytes?.let { if (it < 0L) issues += "model_defaults.ui_min_delta_bytes must be >= 0 (got $it)" }
 
         return issues
     }
 
-    /**
-     * Validate and throw an [IllegalArgumentException] if issues are found.
-     */
+    /** Validate and throw an [IllegalArgumentException] if issues are found. */
     fun requireValid() {
         val issues = validate()
         require(issues.isEmpty()) {
@@ -449,12 +595,10 @@ data class SurveyConfig(
      * Export the prompt table as JSON Lines.
      *
      * Each list element is a single JSON-encoded [Prompt] record.
-     * This is useful for feeding prompts into offline tools or logging
-     * pipelines.
      */
     fun toJsonl(): List<String> =
         SurveyConfigLoader.jsonCompact.let { json ->
-            prompts.map { json.encodeToString(Prompt.serializer(), it) }
+            prompts.map { json.encodeToString(PromptSerializer, it) }
         }
 
     /**
@@ -469,25 +613,13 @@ data class SurveyConfig(
     /**
      * Serialize the full configuration as YAML.
      *
-     * @param strict When true, the encoder uses strict mode for YAML, which
-     * may reject configuration that contains unknown fields.
+     * @param strict When true, the encoder uses strict mode for YAML.
      */
     fun toYaml(strict: Boolean = false): String =
         SurveyConfigLoader.yaml(strict).encodeToString(serializer(), this)
 
     /**
-     * Compose a single system prompt string from the SLM metadata fields.
-     *
-     * Only non-blank fields are appended, separated by line breaks, in the
-     * following order:
-     *  - preamble
-     *  - key_contract
-     *  - length_budget
-     *  - scoring_rule
-     *  - strict_output
-     *  - empty_json_instruction
-     *
-     * This function is side-effect free and can be called repeatedly.
+     * Compose a single system prompt string from the legacy SLM metadata fields.
      */
     fun composeSystemPrompt(): String {
         val parts = listOf(
@@ -502,25 +634,72 @@ data class SurveyConfig(
 
         return parts.joinToString("\n")
     }
+
+    /**
+     * Compose a system prompt string for the EVAL step (TwoStep).
+     */
+    fun composeEvalSystemPrompt(): String {
+        val parts = listOf(
+            slm.preamble,
+            slm.eval_key_contract ?: slm.key_contract,
+            slm.eval_length_budget ?: slm.length_budget,
+            slm.scoring_rule,
+            slm.eval_strict_output ?: slm.strict_output,
+            slm.empty_json_instruction
+        ).filterNot { it.isNullOrBlank() }
+            .map { it!!.trim() }
+
+        return parts.joinToString("\n")
+    }
+
+    /**
+     * Compose a system prompt string for the Follow-up step (TwoStep).
+     */
+    fun composeFollowupSystemPrompt(): String {
+        val parts = listOf(
+            slm.preamble,
+            slm.followup_contract
+        ).filterNot { it.isNullOrBlank() }
+            .map { it!!.trim() }
+
+        return parts.joinToString("\n")
+    }
+
+    /**
+     * Compute reachable node ids from [graph.startId] following nextId pointers.
+     *
+     * This graph model currently supports a single linear successor ([NodeDTO.nextId]).
+     * Branching should be represented at a higher layer, or by extending NodeDTO.
+     */
+    private fun Graph.reachableNodeIds(): Set<String> {
+        val byId = nodes.associateBy { it.id }
+        val visited = linkedSetOf<String>()
+
+        var current = startId
+        while (current.isNotBlank() && current !in visited) {
+            visited += current
+            val n = byId[current] ?: break
+            val next = n.nextId?.trim().orEmpty()
+            if (next.isBlank()) break
+            current = next
+        }
+        return visited
+    }
 }
 
-/**
- * Backward-compatible alias for [SurveyConfig.Prompt].
- */
+/** Backward-compatible alias for [SurveyConfig.Prompt]. */
 typealias PromptEntry = SurveyConfig.Prompt
 
-/**
- * Backward-compatible alias for [SurveyConfig.Graph].
- */
+/** Backward-compatible alias for [SurveyConfig.Graph]. */
 typealias GraphConfig = SurveyConfig.Graph
 
 /**
  * Raw graph node as it is stored in the configuration file.
  *
- * This DTO is intentionally independent from the ViewModel-layer Node type
- * and should only contain data that can be safely serialized/deserialized.
+ * Notes:
+ * - Supports nextId and next_id in configs via custom serializer.
  */
-@Serializable
+@Serializable(with = NodeDTOSerializer::class)
 data class NodeDTO(
     val id: String,
     val type: String,
@@ -529,19 +708,12 @@ data class NodeDTO(
     val options: List<String> = emptyList(),
     val nextId: String? = null
 ) {
-    /**
-     * Interpret the [type] string as a [NodeType] enum value.
-     *
-     * Unknown or malformed type strings are mapped to [NodeType.UNKNOWN].
-     */
+    /** Interpret the [type] string as a [NodeType] enum value. */
     fun nodeType(): NodeType = NodeType.from(type)
 }
 
 /**
  * Node type enumeration used at the configuration layer.
- *
- * Unknown or unrecognized values are mapped to [UNKNOWN]. This enum is
- * separate from any ViewModel-level enum to keep layers decoupled.
  */
 enum class NodeType {
     START,
@@ -557,7 +729,7 @@ enum class NodeType {
         /**
          * Convert a raw string into a [NodeType].
          *
-         * This parser is intentionally tolerant of real-world config variance:
+         * Tolerant parsing:
          * - case-insensitive
          * - accepts snake_case, kebab-case, and compact/camel-like forms
          */
@@ -589,10 +761,6 @@ enum class NodeType {
 
 /**
  * Supported configuration formats for serialization and deserialization.
- *
- * - [JSON]: Force JSON decoding/encoding.
- * - [YAML]: Force YAML decoding/encoding.
- * - [AUTO]: Let the loader sniff by extension or content.
  */
 enum class ConfigFormat {
     JSON,
@@ -602,40 +770,28 @@ enum class ConfigFormat {
 
 /**
  * Loader and writer utilities for [SurveyConfig].
- *
- * This object centralizes JSON/YAML serializers, format sniffing, and
- * normalization of line endings and BOM so that all call sites share
- * consistent behavior.
  */
 object SurveyConfigLoader {
 
-    /**
-     * Compact JSON instance used for reading and minimal writing.
-     *
-     * - Ignores unknown keys.
-     * - Uses lenient parsing to tolerate minor format deviations.
-     */
+    /** Compact JSON instance used for reading and minimal writing. */
     internal val jsonCompact: Json = Json {
         ignoreUnknownKeys = true
         prettyPrint = false
         isLenient = true
+        coerceInputValues = true
+        explicitNulls = false
     }
 
-    /**
-     * Pretty-printing JSON instance used for human-friendly output.
-     */
+    /** Pretty-printing JSON instance used for human-friendly output. */
     internal val jsonPretty: Json = Json {
         ignoreUnknownKeys = true
         prettyPrint = true
         isLenient = true
+        coerceInputValues = true
+        explicitNulls = false
     }
 
-    /**
-     * Create a YAML serializer with a given strictness.
-     *
-     * When [strict] is false, unknown fields are ignored and defaults are
-     * not encoded (encodeDefaults=false).
-     */
+    /** Create a YAML serializer with a given strictness. */
     internal fun yaml(strict: Boolean = false): Yaml =
         Yaml(
             configuration = YamlConfiguration(
@@ -644,9 +800,7 @@ object SurveyConfigLoader {
             )
         )
 
-    /**
-     * Load [SurveyConfig] from an asset file.
-     */
+    /** Load [SurveyConfig] from an asset file. */
     fun fromAssets(
         context: Context,
         fileName: String,
@@ -656,11 +810,7 @@ object SurveyConfigLoader {
         try {
             context.assets.open(fileName).bufferedReader(charset).use { reader ->
                 val raw = reader.readText()
-                fromString(
-                    text = raw,
-                    format = format,
-                    fileNameHint = fileName
-                )
+                fromString(text = raw, format = format, fileNameHint = fileName)
             }
         } catch (ex: Exception) {
             throw IllegalArgumentException(
@@ -669,9 +819,7 @@ object SurveyConfigLoader {
             )
         }
 
-    /**
-     * Load [SurveyConfig] from an asset file and validate immediately.
-     */
+    /** Load [SurveyConfig] from an asset file and validate immediately. */
     fun fromAssetsValidated(
         context: Context,
         fileName: String,
@@ -680,9 +828,7 @@ object SurveyConfigLoader {
     ): SurveyConfig =
         fromAssets(context, fileName, charset, format).also { it.requireValid() }
 
-    /**
-     * Load [SurveyConfig] from a regular file on disk.
-     */
+    /** Load [SurveyConfig] from a regular file on disk. */
     fun fromFile(
         path: String,
         charset: Charset = Charsets.UTF_8,
@@ -693,11 +839,7 @@ object SurveyConfigLoader {
             require(file.exists()) { "Config file not found: $path" }
             file.bufferedReader(charset).use { reader ->
                 val raw = reader.readText()
-                fromString(
-                    text = raw,
-                    format = format,
-                    fileNameHint = file.name
-                )
+                fromString(text = raw, format = format, fileNameHint = file.name)
             }
         } catch (ex: Exception) {
             throw IllegalArgumentException(
@@ -706,9 +848,7 @@ object SurveyConfigLoader {
             )
         }
 
-    /**
-     * Load [SurveyConfig] from a file and validate immediately.
-     */
+    /** Load [SurveyConfig] from a file and validate immediately. */
     fun fromFileValidated(
         path: String,
         charset: Charset = Charsets.UTF_8,
@@ -718,12 +858,6 @@ object SurveyConfigLoader {
 
     /**
      * Parse [SurveyConfig] from a raw string.
-     *
-     * The string is normalized (BOM removed, line endings unified, trailing
-     * newlines trimmed) and then decoded as either JSON or YAML depending on:
-     *  - [format] if it is not [ConfigFormat.AUTO]
-     *  - file name hint (extension)
-     *  - or content sniffing.
      */
     fun fromString(
         text: String,
@@ -731,11 +865,7 @@ object SurveyConfigLoader {
         fileNameHint: String? = null
     ): SurveyConfig {
         val sanitized = text.normalize()
-        val chosen = pickFormat(
-            desired = format,
-            fileName = fileNameHint,
-            text = sanitized
-        )
+        val chosen = pickFormat(desired = format, fileName = fileNameHint, text = sanitized)
 
         return try {
             when (chosen) {
@@ -751,8 +881,7 @@ object SurveyConfigLoader {
         } catch (ex: SerializationException) {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
-                "Parsing error (format=${chosen.name}). First 200 chars: " +
-                        "$preview :: ${ex.message}",
+                "Parsing error (format=${chosen.name}). First 200 chars: $preview :: ${ex.message}",
                 ex
             )
         } catch (ex: Exception) {
@@ -765,9 +894,7 @@ object SurveyConfigLoader {
         }
     }
 
-    /**
-     * Parse [SurveyConfig] from a string and validate immediately.
-     */
+    /** Parse [SurveyConfig] from a string and validate immediately. */
     fun fromStringValidated(
         text: String,
         format: ConfigFormat = ConfigFormat.AUTO,
@@ -775,18 +902,12 @@ object SurveyConfigLoader {
     ): SurveyConfig =
         fromString(text, format, fileNameHint).also { it.requireValid() }
 
-    /**
-     * Decide which [ConfigFormat] to use, based on the desired format,
-     * file name extension, and optionally the content.
-     */
     private fun pickFormat(
         desired: ConfigFormat,
         fileName: String? = null,
         text: String? = null
     ): ConfigFormat {
-        if (desired != ConfigFormat.AUTO) {
-            return desired
-        }
+        if (desired != ConfigFormat.AUTO) return desired
 
         val lower = fileName?.lowercase().orEmpty()
         if (lower.endsWith(".json")) return ConfigFormat.JSON
@@ -796,19 +917,14 @@ object SurveyConfigLoader {
     }
 
     /**
-     * Quickly infer the format from the first non-empty line and leading
-     * characters.
-     *
-     * Heuristic:
+     * Heuristic format sniffing:
      *  - Leading '{' or '[' -> JSON
      *  - Leading '---', '- ' or typical "key: value" -> YAML
      *  - Otherwise fall back to JSON.
      */
     private fun sniffFormat(text: String): ConfigFormat {
         val trimmed = text.trimStart('\uFEFF', ' ', '\n', '\r', '\t')
-        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            return ConfigFormat.JSON
-        }
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) return ConfigFormat.JSON
 
         val firstNonEmpty = trimmed
             .lineSequence()
@@ -830,21 +946,241 @@ object SurveyConfigLoader {
      * - Converts CRLF/CR to LF.
      * - Trims trailing line breaks.
      */
-    private fun String.normalize(): String =
-        this.removePrefix("\uFEFF")
-            .replace("\r\n", "\n")
+    private fun String.normalize(): String {
+        val s = if (this.isNotEmpty() && this[0] == '\uFEFF') this.drop(1) else this
+        return s.replace("\r\n", "\n")
             .replace("\r", "\n")
             .trimEnd('\n')
+    }
 
-    /**
-     * Return a short preview string for error messages.
-     *
-     * Line breaks are escaped and the string is truncated to [max] characters.
-     */
+    /** Return a short preview string for error messages. */
     private fun String.safePreview(max: Int = 200): String =
         this.replace("\n", "\\n")
             .replace("\r", "\\r")
-            .let { t ->
-                if (t.length <= max) t else t.take(max) + "..."
+            .let { t -> if (t.length <= max) t else t.take(max) + "..." }
+}
+
+/* ───────────────────────────── Serializers ─────────────────────────────── */
+
+private val StringListSer: KSerializer<List<String>> = ListSerializer(String.serializer())
+private val NullableStringSer: KSerializer<String?> = String.serializer().nullable
+
+/**
+ * Serializer that accepts both node_id and nodeId, and encodes as node_id.
+ */
+private object PromptSerializer : KSerializer<SurveyConfig.Prompt> {
+
+    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("Prompt") {
+        element<String>("node_id", isOptional = true)
+        element<String>("nodeId", isOptional = true)
+        element<String>("prompt", isOptional = true)
+        element<String>("template", isOptional = true) // legacy alias
+    }
+
+    override fun serialize(encoder: Encoder, value: SurveyConfig.Prompt) {
+        encoder.encodeStructure(descriptor) {
+            // Encode snake_case to keep YAML style stable.
+            encodeStringElement(descriptor, 0, value.nodeId)
+            encodeStringElement(descriptor, 2, value.prompt)
+        }
+    }
+
+    override fun deserialize(decoder: Decoder): SurveyConfig.Prompt {
+        var nodeIdSnake: String? = null
+        var nodeIdCamel: String? = null
+        var prompt: String? = null
+        var template: String? = null
+
+        decoder.decodeStructure(descriptor) {
+            while (true) {
+                when (val idx = decodeElementIndex(descriptor)) {
+                    CompositeDecoder.DECODE_DONE -> break
+                    0 -> nodeIdSnake = decodeNullableSerializableElement(descriptor, 0, NullableStringSer)
+                    1 -> nodeIdCamel = decodeNullableSerializableElement(descriptor, 1, NullableStringSer)
+                    2 -> prompt = decodeNullableSerializableElement(descriptor, 2, NullableStringSer)
+                    3 -> template = decodeNullableSerializableElement(descriptor, 3, NullableStringSer)
+                    else -> {
+                        // Unknown indices should not appear with ignoreUnknownKeys=true.
+                    }
+                }
             }
+        }
+
+        val nodeId = (nodeIdSnake ?: nodeIdCamel ?: "").trim()
+        val body = (prompt ?: template ?: "").trimEnd()
+        return SurveyConfig.Prompt(nodeId = nodeId, prompt = body)
+    }
+}
+
+/**
+ * Serializer that accepts both start_id and startId, and encodes as start_id.
+ */
+private object GraphSerializer : KSerializer<SurveyConfig.Graph> {
+
+    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("Graph") {
+        element<String>("start_id", isOptional = true)
+        element<String>("startId", isOptional = true)
+        element<List<NodeDTO>>("nodes")
+    }
+
+    override fun serialize(encoder: Encoder, value: SurveyConfig.Graph) {
+        encoder.encodeStructure(descriptor) {
+            encodeStringElement(descriptor, 0, value.startId)
+            encodeSerializableElement(descriptor, 2, ListSerializer(NodeDTO.serializer()), value.nodes)
+        }
+    }
+
+    override fun deserialize(decoder: Decoder): SurveyConfig.Graph {
+        var startSnake: String? = null
+        var startCamel: String? = null
+        var nodes: List<NodeDTO>? = null
+
+        decoder.decodeStructure(descriptor) {
+            while (true) {
+                when (val idx = decodeElementIndex(descriptor)) {
+                    CompositeDecoder.DECODE_DONE -> break
+                    0 -> startSnake = decodeNullableSerializableElement(descriptor, 0, NullableStringSer)
+                    1 -> startCamel = decodeNullableSerializableElement(descriptor, 1, NullableStringSer)
+                    2 -> nodes = decodeSerializableElement(descriptor, 2, ListSerializer(NodeDTO.serializer()))
+                    else -> {
+                        // Unknown indices should not appear with ignoreUnknownKeys=true.
+                    }
+                }
+            }
+        }
+
+        val startId = (startSnake ?: startCamel ?: "").trim()
+        return SurveyConfig.Graph(startId = startId, nodes = nodes ?: emptyList())
+    }
+}
+
+/**
+ * Serializer that accepts both next_id and nextId, and encodes as next_id.
+ */
+private object NodeDTOSerializer : KSerializer<NodeDTO> {
+
+    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("NodeDTO") {
+        element<String>("id")
+        element<String>("type")
+        element<String>("title", isOptional = true)
+        element<String>("question", isOptional = true)
+        element<List<String>>("options", isOptional = true)
+        element<String?>("next_id", isOptional = true)
+        element<String?>("nextId", isOptional = true)
+    }
+
+    override fun serialize(encoder: Encoder, value: NodeDTO) {
+        encoder.encodeStructure(descriptor) {
+            encodeStringElement(descriptor, 0, value.id)
+            encodeStringElement(descriptor, 1, value.type)
+
+            if (value.title.isNotBlank()) {
+                encodeStringElement(descriptor, 2, value.title)
+            }
+            if (value.question.isNotBlank()) {
+                encodeStringElement(descriptor, 3, value.question)
+            }
+            if (value.options.isNotEmpty()) {
+                encodeSerializableElement(descriptor, 4, StringListSer, value.options)
+            }
+            // Encode snake_case to match YAML style.
+            value.nextId?.trim()?.takeIf { it.isNotBlank() }?.let { next ->
+                encodeStringElement(descriptor, 5, next)
+            }
+        }
+    }
+
+    override fun deserialize(decoder: Decoder): NodeDTO {
+        var id: String? = null
+        var type: String? = null
+        var title: String = ""
+        var question: String = ""
+        var options: List<String> = emptyList()
+        var nextSnake: String? = null
+        var nextCamel: String? = null
+
+        decoder.decodeStructure(descriptor) {
+            while (true) {
+                when (val idx = decodeElementIndex(descriptor)) {
+                    CompositeDecoder.DECODE_DONE -> break
+                    0 -> id = decodeStringElement(descriptor, 0)
+                    1 -> type = decodeStringElement(descriptor, 1)
+                    2 -> title = decodeStringElement(descriptor, 2)
+                    3 -> question = decodeStringElement(descriptor, 3)
+                    4 -> options = decodeSerializableElement(descriptor, 4, StringListSer)
+                    5 -> nextSnake = decodeNullableSerializableElement(descriptor, 5, NullableStringSer)
+                    6 -> nextCamel = decodeNullableSerializableElement(descriptor, 6, NullableStringSer)
+                    else -> {
+                        // Unknown indices should not appear with ignoreUnknownKeys=true.
+                    }
+                }
+            }
+        }
+
+        return NodeDTO(
+            id = (id ?: "").trim(),
+            type = (type ?: "").trim(),
+            title = title,
+            question = question,
+            options = options,
+            nextId = (nextSnake ?: nextCamel)?.trim()?.ifBlank { null }
+        )
+    }
+}
+
+/* ───────────────────────────── Stage helpers ────────────────────────────── */
+
+/**
+ * Return true if the string contains any delimiter that suggests a staged prompt id.
+ */
+private fun String.containsStageDelimiter(): Boolean =
+    this.contains('#') || this.contains(':') || this.contains('/')
+
+/**
+ * Extract base node id from a staged prompt identifier.
+ *
+ * Examples:
+ *  - "Q1#eval"      -> "Q1"
+ *  - "Q1:followup"  -> "Q1"
+ *  - "Q1/followup"  -> "Q1"
+ *  - "Q1"           -> "Q1"
+ */
+private fun String.baseNodeId(): String {
+    val raw = this.trim()
+    if (raw.isEmpty()) return raw
+    val cut = raw.indexOfFirst { it == '#' || it == ':' || it == '/' }
+    return if (cut < 0) raw else raw.substring(0, cut).trim()
+}
+
+/**
+ * Extract stage token from a staged prompt identifier.
+ *
+ * Examples:
+ *  - "Q1#eval"      -> "eval"
+ *  - "Q1:followup"  -> "followup"
+ *  - "Q1/followup"  -> "followup"
+ *  - "Q1"           -> null
+ */
+private fun String.stageTokenOrNull(): String? {
+    val raw = this.trim()
+    if (raw.isEmpty()) return null
+    val cut = raw.indexOfFirst { it == '#' || it == ':' || it == '/' }
+    if (cut < 0) return null
+    if (cut == raw.lastIndex) return ""
+    return raw.substring(cut + 1).trim()
+}
+
+/**
+ * Convert a stage token to [SurveyConfig.PromptStage] using tolerant parsing.
+ */
+private fun String?.toPromptStage(): SurveyConfig.PromptStage {
+    val t = this?.trim()?.lowercase().orEmpty()
+    if (t.isBlank()) return SurveyConfig.PromptStage.BASE
+
+    return when (t) {
+        "base" -> SurveyConfig.PromptStage.BASE
+        "eval", "evaluation", "judge", "score" -> SurveyConfig.PromptStage.EVAL
+        "followup", "follow_up", "follow-up", "fu", "clarify" -> SurveyConfig.PromptStage.FOLLOWUP
+        else -> SurveyConfig.PromptStage.UNKNOWN
+    }
 }
