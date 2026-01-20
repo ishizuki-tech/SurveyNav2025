@@ -25,7 +25,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -35,12 +34,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONException
+import org.json.JSONObject
 
 /**
  * Repository that streams inference results from an on-device LLM backend.
@@ -69,7 +71,7 @@ interface Repository {
 }
 
 /* ====================================================================== */
-/*  Shared process-wide inference gate                                    */
+/*  Shared process-wide inference gate                                     */
 /* ====================================================================== */
 
 /**
@@ -101,6 +103,8 @@ private object AiTrace {
     /** Chunk size per log line (keep below Logcat line limit). */
     private const val LOG_CHUNK: Int = 3_200
 
+    private val installedOnce = AtomicBoolean(false)
+
     @Volatile
     private var appContext: Context? = null
 
@@ -115,7 +119,9 @@ private object AiTrace {
      */
     fun install(context: Context) {
         appContext = context.applicationContext
-        Log.d(TAG, "Installed (enabled=$enabled)")
+        if (installedOnce.compareAndSet(false, true)) {
+            Log.d(TAG, "Installed (enabled=$enabled)")
+        }
     }
 
     fun capAppend(sb: StringBuilder, chunk: String): Boolean {
@@ -133,7 +139,7 @@ private object AiTrace {
         return runCatching {
             val md = MessageDigest.getInstance("SHA-256")
             val bytes = md.digest(text.toByteArray(Charsets.UTF_8))
-            bytes.take(8).joinToString("") { b -> "%02x".format(b) }
+            bytes.take(8).joinToString("") { b -> "%02x".format(b.toInt() and 0xff) }
         }.getOrElse { "sha256_err" }
     }
 
@@ -237,8 +243,7 @@ private class StreamDeltaNormalizer(
             decided = if (lastFull.isNotEmpty() && incoming.startsWith(lastFull)) {
                 PartialMode.ACCUMULATED
             } else {
-                // Wait one step: store and keep AUTO until we can compare reliably.
-                // But if lastFull is empty, we can't decide yet.
+                // Wait one step: keep AUTO until we can compare reliably.
                 PartialMode.AUTO
             }
         }
@@ -252,7 +257,7 @@ private class StreamDeltaNormalizer(
                 val delta = if (incoming.startsWith(lastFull)) {
                     incoming.substring(lastFull.length)
                 } else {
-                    // Fallback: if mismatch, treat as a full reset; emit whole incoming.
+                    // Fallback: mismatch => treat as full reset; emit whole incoming.
                     incoming
                 }
                 lastFull = incoming
@@ -268,6 +273,89 @@ private class StreamDeltaNormalizer(
 }
 
 /* ====================================================================== */
+/*  Shared prompt defaults                                                 */
+/* ====================================================================== */
+
+private object PromptDefaults {
+    // YAML fallback defaults
+    const val USER_TURN_PREFIX: String = "<start_of_turn>user"
+    const val MODEL_TURN_PREFIX: String = "<start_of_turn>model"
+    const val TURN_END: String = "<end_of_turn>"
+    const val EMPTY_JSON_INSTRUCTION: String = "Respond with an empty JSON object: {}"
+
+    const val PREAMBLE: String =
+        "You are a well-known farmer survey expert. Read the Question and the Answer."
+
+    const val KEY_CONTRACT: String =
+        "OUTPUT FORMAT:\n" +
+                "- In English.\n" +
+                "- Keys:\n" +
+                "  • \"analysis\": short string\n" +
+                "  • \"expected answer\": short string\n" +
+                "  • \"follow-up question\": a single short confirm/validate question\n" +
+                "  • \"score\": integer 1–100\n" +
+                "FOLLOW-UP INTENT:\n" +
+                "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
+                "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
+                "- Keep it single-scope and answerable immediately."
+
+    const val LENGTH_BUDGET: String =
+        "LENGTH LIMITS:\n" +
+                "- analysis<=80 chars\n" +
+                "- expected answer<=60 chars\n" +
+                "- follow-up question<=90 chars"
+
+    const val SCORING_RULE: String =
+        "SCORING RULE:\n" +
+                "- Judge ONLY content relevance/completeness/accuracy.\n" +
+                "- Do NOT penalize style or formatting."
+
+    const val STRICT_OUTPUT: String =
+        "STRICT OUTPUT (NO MARKDOWN):\n" +
+                "- RAW JSON only.\n" +
+                "- No extra text.\n" +
+                "- Prefer compact JSON.\n" +
+                "- Entire output should be short and machine-parseable."
+}
+
+/* ====================================================================== */
+/*  Shared prompt builder                                                  */
+/* ====================================================================== */
+
+private fun buildPromptCommon(config: SurveyConfig, userPrompt: String): String {
+    val slm = config.slm
+
+    val userTurn = slm.user_turn_prefix ?: PromptDefaults.USER_TURN_PREFIX
+    val modelTurn = slm.model_turn_prefix ?: PromptDefaults.MODEL_TURN_PREFIX
+    val turnEnd = slm.turn_end ?: PromptDefaults.TURN_END
+    val emptyJson = slm.empty_json_instruction ?: PromptDefaults.EMPTY_JSON_INSTRUCTION
+
+    val preamble = slm.preamble ?: PromptDefaults.PREAMBLE
+    val keyContract = slm.key_contract ?: PromptDefaults.KEY_CONTRACT
+    val lengthBudget = slm.length_budget ?: PromptDefaults.LENGTH_BUDGET
+    val scoringRule = slm.scoring_rule ?: PromptDefaults.SCORING_RULE
+    val strictOutput = slm.strict_output ?: PromptDefaults.STRICT_OUTPUT
+
+    val effective = if (userPrompt.isBlank()) emptyJson else userPrompt.trimIndent().normalizePrompt()
+
+    val userBlock = compactJoin(
+        preamble,
+        keyContract,
+        lengthBudget,
+        scoringRule,
+        strictOutput,
+        effective,
+    )
+
+    return compactJoin(
+        userTurn,
+        userBlock,
+        turnEnd,
+        modelTurn,
+    )
+}
+
+/* ====================================================================== */
 /*  SLM (MediaPipe) backend                                               */
 /* ====================================================================== */
 
@@ -277,51 +365,16 @@ class SlmDirectRepository(
     private val config: SurveyConfig,
 ) : Repository {
 
+    init {
+        // Ensure file dumps can work without requiring explicit install elsewhere.
+        AiTrace.install(appContext)
+    }
+
     companion object {
         private const val TAG = "SlmDirectRepository"
 
         /** Request correlation id sequence (process-wide). */
         private val REQ_SEQ = AtomicLong(0L)
-
-        // YAML fallback defaults
-        private const val DEF_USER_TURN_PREFIX = "<start_of_turn>user"
-        private const val DEF_MODEL_TURN_PREFIX = "<start_of_turn>model"
-        private const val DEF_TURN_END = "<end_of_turn>"
-        private const val DEF_EMPTY_JSON_INSTRUCTION = "Respond with an empty JSON object: {}"
-
-        private const val DEF_PREAMBLE =
-            "You are a well-known farmer survey expert. Read the Question and the Answer."
-
-        private const val DEF_KEY_CONTRACT =
-            "OUTPUT FORMAT:\n" +
-                    "- In English.\n" +
-                    "- Keys:\n" +
-                    "  • \"analysis\": short string\n" +
-                    "  • \"expected answer\": short string\n" +
-                    "  • \"follow-up question\": a single short confirm/validate question\n" +
-                    "  • \"score\": integer 1–100\n" +
-                    "FOLLOW-UP INTENT:\n" +
-                    "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
-                    "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
-                    "- Keep it single-scope and answerable immediately."
-
-        private const val DEF_LENGTH_BUDGET =
-            "LENGTH LIMITS:\n" +
-                    "- analysis<=80 chars\n" +
-                    "- expected answer<=60 chars\n" +
-                    "- follow-up question<=90 chars"
-
-        private const val DEF_SCORING_RULE =
-            "SCORING RULE:\n" +
-                    "- Judge ONLY content relevance/completeness/accuracy.\n" +
-                    "- Do NOT penalize style or formatting."
-
-        private const val DEF_STRICT_OUTPUT =
-            "STRICT OUTPUT (NO MARKDOWN):\n" +
-                    "- RAW JSON only.\n" +
-                    "- No extra text.\n" +
-                    "- Prefer compact JSON.\n" +
-                    "- Entire output should be short and machine-parseable."
 
         // Watchdogs
         private const val HARD_WATCHDOG_MS = 20_000L
@@ -339,42 +392,11 @@ class SlmDirectRepository(
     }
 
     override fun buildPrompt(userPrompt: String): String {
-        val slm = config.slm
-
-        val userTurn = slm.user_turn_prefix ?: DEF_USER_TURN_PREFIX
-        val modelTurn = slm.model_turn_prefix ?: DEF_MODEL_TURN_PREFIX
-        val turnEnd = slm.turn_end ?: DEF_TURN_END
-        val emptyJson = slm.empty_json_instruction ?: DEF_EMPTY_JSON_INSTRUCTION
-
-        val preamble = slm.preamble ?: DEF_PREAMBLE
-        val keyContract = slm.key_contract ?: DEF_KEY_CONTRACT
-        val lengthBudget = slm.length_budget ?: DEF_LENGTH_BUDGET
-        val scoringRule = slm.scoring_rule ?: DEF_SCORING_RULE
-        val strictOutput = slm.strict_output ?: DEF_STRICT_OUTPUT
-
-        val effective = if (userPrompt.isBlank()) emptyJson else userPrompt.trimIndent().normalizePrompt()
-
-        val userBlock = compactJoin(
-            preamble,
-            keyContract,
-            lengthBudget,
-            scoringRule,
-            strictOutput,
-            effective,
-        )
-
-        val finalPrompt = compactJoin(
-            userTurn,
-            userBlock,
-            turnEnd,
-            modelTurn,
-        )
-
-        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${finalPrompt.length}")
-        return finalPrompt
+        val p = buildPromptCommon(config, userPrompt)
+        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${p.length}")
+        return p
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
     override suspend fun request(prompt: String): Flow<String> =
         callbackFlow {
             val out = this
@@ -419,9 +441,7 @@ class SlmDirectRepository(
 
                 val emitterJob = anchorScope.launch {
                     for (chunk in emitCh) {
-                        if (chunk.isNotEmpty() && !out.isClosedForSend) {
-                            out.trySend(chunk)
-                        }
+                        if (chunk.isNotEmpty() && !out.isClosedForSend) out.trySend(chunk)
                     }
                 }
 
@@ -480,7 +500,7 @@ class SlmDirectRepository(
                         tag = TAG,
                         level = if (cause != null) Log.WARN else Log.DEBUG,
                         header = "[$requestId] FINALIZE: $reason",
-                        body = stats
+                        body = stats,
                     )
 
                     val dump = buildString {
@@ -554,7 +574,7 @@ class SlmDirectRepository(
 
                     Log.d(
                         TAG,
-                        "[$requestId] SLM request start: model='${model.name}', prompt.len=${normalizedPrompt.length}, gateWaitMs=$gateWaitMs, busy=${isBusyNow()}"
+                        "[$requestId] SLM request start: model='${model.name}', prompt.len=${normalizedPrompt.length}, gateWaitMs=$gateWaitMs, busy=${isBusyNow()}",
                     )
 
                     AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT (FULL)", normalizedPrompt)
@@ -569,7 +589,8 @@ class SlmDirectRepository(
                             done.set(true)
                         }
                         while (!done.get()) delay(25)
-                        err
+                        // BUGFIX: null means success (do NOT treat as timeout).
+                        err ?: ""
                     } ?: "SLM.ensureInitialized timed out."
 
                     if (initErr.isNotBlank()) {
@@ -633,7 +654,7 @@ class SlmDirectRepository(
                             seenOnClean.set(true)
                             Log.d(TAG, "[$requestId] SLM onClean (model='${model.name}')")
                             closeOnce("onClean")
-                        }
+                        },
                     )
                 } catch (t: Throwable) {
                     Log.e(TAG, "[$requestId] SLM.runInference threw: ${t.message}", t)
@@ -668,47 +689,7 @@ class LiteRtRepository(
 
     companion object {
         private const val TAG = "LiteRtRepository"
-
         private val REQ_SEQ = AtomicLong(0L)
-
-        private const val DEF_USER_TURN_PREFIX = "<start_of_turn>user"
-        private const val DEF_MODEL_TURN_PREFIX = "<start_of_turn>model"
-        private const val DEF_TURN_END = "<end_of_turn>"
-        private const val DEF_EMPTY_JSON_INSTRUCTION = "Respond with an empty JSON object: {}"
-
-        private const val DEF_PREAMBLE =
-            "You are a well-known farmer survey expert. Read the Question and the Answer."
-
-        private const val DEF_KEY_CONTRACT =
-            "OUTPUT FORMAT:\n" +
-                    "- In English.\n" +
-                    "- Keys:\n" +
-                    "  • \"analysis\": short string\n" +
-                    "  • \"expected answer\": short string\n" +
-                    "  • \"follow-up question\": a single short confirm/validate question\n" +
-                    "  • \"score\": integer 1–100\n" +
-                    "FOLLOW-UP INTENT:\n" +
-                    "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
-                    "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
-                    "- Keep it single-scope and answerable immediately."
-
-        private const val DEF_LENGTH_BUDGET =
-            "LENGTH LIMITS:\n" +
-                    "- analysis<=80 chars\n" +
-                    "- expected answer<=60 chars\n" +
-                    "- follow-up question<=90 chars"
-
-        private const val DEF_SCORING_RULE =
-            "SCORING RULE:\n" +
-                    "- Judge ONLY content relevance/completeness/accuracy.\n" +
-                    "- Do NOT penalize style or formatting."
-
-        private const val DEF_STRICT_OUTPUT =
-            "STRICT OUTPUT (NO MARKDOWN):\n" +
-                    "- RAW JSON only.\n" +
-                    "- No extra text.\n" +
-                    "- Prefer compact JSON.\n" +
-                    "- Entire output should be short and machine-parseable."
 
         private const val HARD_WATCHDOG_MS = 20_000L
         private const val PROGRESS_STALL_MS = 6_000L
@@ -716,42 +697,11 @@ class LiteRtRepository(
     }
 
     override fun buildPrompt(userPrompt: String): String {
-        val slm = config.slm
-
-        val userTurn = slm.user_turn_prefix ?: DEF_USER_TURN_PREFIX
-        val modelTurn = slm.model_turn_prefix ?: DEF_MODEL_TURN_PREFIX
-        val turnEnd = slm.turn_end ?: DEF_TURN_END
-        val emptyJson = slm.empty_json_instruction ?: DEF_EMPTY_JSON_INSTRUCTION
-
-        val preamble = slm.preamble ?: DEF_PREAMBLE
-        val keyContract = slm.key_contract ?: DEF_KEY_CONTRACT
-        val lengthBudget = slm.length_budget ?: DEF_LENGTH_BUDGET
-        val scoringRule = slm.scoring_rule ?: DEF_SCORING_RULE
-        val strictOutput = slm.strict_output ?: DEF_STRICT_OUTPUT
-
-        val effective = if (userPrompt.isBlank()) emptyJson else userPrompt.trimIndent().normalizePrompt()
-
-        val userBlock = compactJoin(
-            preamble,
-            keyContract,
-            lengthBudget,
-            scoringRule,
-            strictOutput,
-            effective,
-        )
-
-        val finalPrompt = compactJoin(
-            userTurn,
-            userBlock,
-            turnEnd,
-            modelTurn,
-        )
-
-        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${finalPrompt.length}")
-        return finalPrompt
+        val p = buildPromptCommon(config, userPrompt)
+        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${p.length}")
+        return p
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
     override suspend fun request(prompt: String): Flow<String> =
         callbackFlow {
             val out = this
@@ -903,7 +853,7 @@ class LiteRtRepository(
                             markProgress()
                             bestEffortCleanUp("onError")
                             closeOnce("litert-error", RuntimeException(message))
-                        }
+                        },
                     )
                 } catch (t: Throwable) {
                     Log.e(TAG, "[$requestId] LiteRtLM.runInference threw: ${t.message}", t)
@@ -921,4 +871,591 @@ class LiteRtRepository(
         }
             .buffer(Channel.BUFFERED)
             .flowOn(Dispatchers.IO)
+}
+
+/* ====================================================================== */
+/*  Unified Single/Double step support                                    */
+/* ====================================================================== */
+
+/**
+ * Output key style for the final JSON.
+ *
+ * - LEGACY: "expected answer", "follow-up question"
+ * - SNAKE_CASE: "expected_answer", "follow_up_question"
+ */
+enum class OutputKeyStyle {
+    LEGACY,
+    SNAKE_CASE,
+}
+
+/**
+ * Two-step stages.
+ */
+enum class TwoStepStage {
+    EVAL,
+    FOLLOW_UP,
+}
+
+/**
+ * Request mode for AI.
+ */
+sealed class AiRequestMode {
+
+    /**
+     * Single-step mode: runs exactly one inference and streams raw deltas.
+     */
+    data class SingleStep(
+        val passThroughStreaming: Boolean = true,
+    ) : AiRequestMode()
+
+    /**
+     * Double-step mode: runs EVAL then optional FOLLOW_UP based on gating.
+     */
+    data class DoubleStep(
+        val options: TwoStepOptions = TwoStepOptions(),
+    ) : AiRequestMode()
+}
+
+/**
+ * Configuration knobs for two-step validation.
+ */
+data class TwoStepOptions(
+    /** Score threshold at/above which we consider the answer "OK". */
+    val evalOkScoreThreshold: Int = 85,
+
+    /** If true and eval says OK, skip the follow-up step. */
+    val skipFollowupWhenOk: Boolean = true,
+
+    /**
+     * If true, on EVAL JSON parse failure we conservatively run FOLLOW_UP.
+     * If false, we return the raw EVAL output as-is.
+     */
+    val followupOnEvalParseError: Boolean = true,
+
+    /** Output key style for the final JSON. */
+    val outputKeyStyle: OutputKeyStyle = OutputKeyStyle.LEGACY,
+
+    /**
+     * Emit streamed deltas from EVAL step to the returned Flow.
+     * Usually false (keeps UI clean).
+     */
+    val emitEvalChunks: Boolean = false,
+
+    /**
+     * Emit streamed deltas from FOLLOW_UP step to the returned Flow.
+     * Usually false (follow-up output should be short anyway).
+     */
+    val emitFollowupChunks: Boolean = false,
+
+    /**
+     * Emit the final merged JSON as a single emission at the end.
+     * If you also emit chunks, this can cause duplicated-looking UI,
+     * so by default it only emits the final JSON.
+     */
+    val emitFinalMergedJson: Boolean = true,
+
+    /**
+     * If true, allow FOLLOW_UP step to override analysis/expected fields too.
+     * Default keeps EVAL's analysis/expected and only replaces follow-up question.
+     */
+    val followupOverridesAllFields: Boolean = false,
+
+    /**
+     * If true, include gating fields ("needs_followup", "missing") in final JSON.
+     * Default false to preserve legacy schema.
+     */
+    val includeGatingFieldsInFinal: Boolean = false,
+
+    /**
+     * If true, include minimal meta fields in final JSON for debugging.
+     * Default false to keep output compact and stable.
+     */
+    val includeMetaInFinal: Boolean = false,
+)
+
+/**
+ * Run inference in either Single-step or Double-step mode.
+ *
+ * Contract:
+ * - SingleStep: streams raw deltas from the underlying repository (legacy behavior).
+ * - DoubleStep: captures EVAL (optionally emits chunks), gates, and optionally runs FOLLOW_UP.
+ *   It then emits one final merged JSON (by default).
+ */
+fun Repository.requestWithMode(
+    userPrompt: String,
+    mode: AiRequestMode = AiRequestMode.SingleStep(),
+): Flow<String> = flow {
+    when (mode) {
+        is AiRequestMode.SingleStep -> {
+            val prompt = buildPrompt(userPrompt)
+            request(prompt).collect { delta ->
+                if (mode.passThroughStreaming) emit(delta)
+            }
+        }
+
+        is AiRequestMode.DoubleStep -> {
+            val opts = mode.options
+            val metaRid = SystemClock.elapsedRealtime()
+
+            // -------------------------
+            // 1) EVAL
+            // -------------------------
+            val evalUserPrompt = buildEvalUserPrompt(
+                baseUserPrompt = userPrompt,
+                threshold = opts.evalOkScoreThreshold,
+                keyStyle = opts.outputKeyStyle,
+            )
+
+            val evalPrompt = buildPrompt(evalUserPrompt)
+            val evalRaw = collectFlowToString(
+                upstream = request(evalPrompt),
+                emitChunks = opts.emitEvalChunks,
+                emit = { chunk -> emit(chunk) },
+            )
+
+            val evalJsonStr = extractFirstJsonObject(evalRaw) ?: ""
+            val evalParsed = parseEvalJson(
+                jsonStr = evalJsonStr,
+                keyStyle = opts.outputKeyStyle,
+            )
+
+            if (evalParsed == null) {
+                // EVAL parse failed.
+                if (!opts.followupOnEvalParseError) {
+                    if (opts.emitFinalMergedJson) {
+                        emit(wrapAsFallbackJson(evalRaw, opts.outputKeyStyle, error = "eval_json_parse_failed"))
+                    }
+                    return@flow
+                }
+                // Otherwise: proceed to FOLLOW_UP with no "missing" hint.
+            } else {
+                val needsFollowup = decideNeedsFollowup(evalParsed, opts.evalOkScoreThreshold)
+                val ok = !needsFollowup
+
+                if (ok && opts.skipFollowupWhenOk) {
+                    val finalJson = buildFinalJsonFromEval(
+                        eval = evalParsed,
+                        keyStyle = opts.outputKeyStyle,
+                        includeGating = opts.includeGatingFieldsInFinal,
+                        includeMeta = opts.includeMetaInFinal,
+                        metaRid = metaRid,
+                        metaMode = "single_eval_ok",
+                    )
+                    if (opts.emitFinalMergedJson) emit(finalJson)
+                    return@flow
+                }
+            }
+
+            // -------------------------
+            // 2) FOLLOW_UP
+            // -------------------------
+            val followUserPrompt = buildFollowupUserPrompt(
+                baseUserPrompt = userPrompt,
+                evalMissingHint = evalParsed?.missing,
+                keyStyle = opts.outputKeyStyle,
+            )
+
+            val followPrompt = buildPrompt(followUserPrompt)
+            val followRaw = collectFlowToString(
+                upstream = request(followPrompt),
+                emitChunks = opts.emitFollowupChunks,
+                emit = { chunk -> emit(chunk) },
+            )
+
+            val followJsonStr = extractFirstJsonObject(followRaw) ?: ""
+            val followParsed = parseFollowupJson(
+                jsonStr = followJsonStr,
+                keyStyle = opts.outputKeyStyle,
+            )
+
+            val finalMerged = mergeEvalAndFollowup(
+                eval = evalParsed,
+                follow = followParsed,
+                rawEval = evalRaw,
+                rawFollow = followRaw,
+                opts = opts,
+                metaRid = metaRid,
+            )
+
+            if (opts.emitFinalMergedJson) emit(finalMerged)
+        }
+    }
+}
+
+/* ====================================================================== */
+/*  Two-step helpers                                                      */
+/* ====================================================================== */
+
+private data class EvalResult(
+    val analysis: String?,
+    val expected: String?,
+    val followupQuestion: String?,
+    val score: Int?,
+    val needsFollowup: Boolean?,
+    val missing: String?,
+)
+
+private data class FollowupResult(
+    val analysis: String?,
+    val expected: String?,
+    val followupQuestion: String?,
+    val score: Int?,
+)
+
+/**
+ * Collect a streaming [Flow] into a single String while optionally emitting chunks downstream.
+ */
+private suspend fun collectFlowToString(
+    upstream: Flow<String>,
+    emitChunks: Boolean,
+    emit: suspend (String) -> Unit,
+): String {
+    val sb = StringBuilder(8 * 1024)
+    upstream.collect { delta ->
+        if (delta.isEmpty()) return@collect
+        sb.append(delta)
+        if (emitChunks) emit(delta)
+    }
+    return sb.toString()
+}
+
+/**
+ * Build a stage-specific user prompt for EVAL.
+ *
+ * This is appended AFTER the repository's base key contract, so we make it explicit that this step overrides it.
+ */
+private fun buildEvalUserPrompt(
+    baseUserPrompt: String,
+    threshold: Int,
+    keyStyle: OutputKeyStyle,
+): String {
+    val keys = keysForStyle(keyStyle)
+    val override = buildString {
+        appendLine("OVERRIDE: EVAL STEP (validation).")
+        appendLine("Return RAW JSON only (no markdown, no extra text).")
+        appendLine("Required keys:")
+        appendLine(" - \"${keys.analysis}\" (short)")
+        appendLine(" - \"${keys.expected}\" (short)")
+        appendLine(" - \"${keys.followup}\" (single question or empty string)")
+        appendLine(" - \"${keys.score}\" (integer 1-100)")
+        appendLine("Additional gating keys (required):")
+        appendLine(" - \"needs_followup\" (true/false)")
+        appendLine(" - \"missing\" (short string or empty)")
+        appendLine("Rules:")
+        appendLine(" - If score >= $threshold: set needs_followup=false and set \"${keys.followup}\" to \"\".")
+        appendLine(" - If score < $threshold: set needs_followup=true and ask ONE concrete follow-up question.")
+    }
+    return compactJoin(override, baseUserPrompt)
+}
+
+/**
+ * Build a stage-specific user prompt for FOLLOW_UP.
+ */
+private fun buildFollowupUserPrompt(
+    baseUserPrompt: String,
+    evalMissingHint: String?,
+    keyStyle: OutputKeyStyle,
+): String {
+    val keys = keysForStyle(keyStyle)
+    val hintLine = evalMissingHint?.takeIf { it.isNotBlank() }?.let { "Hint (missing): $it" } ?: ""
+    val override = buildString {
+        appendLine("OVERRIDE: FOLLOW_UP STEP (generate a single clarifying question).")
+        appendLine("Return RAW JSON only (no markdown, no extra text).")
+        appendLine("Keys:")
+        appendLine(" - \"${keys.analysis}\" (short)")
+        appendLine(" - \"${keys.expected}\" (short)")
+        appendLine(" - \"${keys.followup}\" (ONE single-scope question)")
+        appendLine(" - \"${keys.score}\" (integer 1-100)")
+        if (hintLine.isNotBlank()) appendLine(hintLine)
+        appendLine("Rules:")
+        appendLine(" - Focus ONLY on the best next follow-up question to clarify the respondent's original answer.")
+        appendLine(" - Keep it concrete, answerable immediately, and not multi-part.")
+    }
+    return compactJoin(override, baseUserPrompt)
+}
+
+/**
+ * Decide if a follow-up is needed based on [EvalResult].
+ *
+ * Order of precedence:
+ * 1) explicit needs_followup if present
+ * 2) score threshold comparison
+ * 3) otherwise: conservative true
+ */
+private fun decideNeedsFollowup(eval: EvalResult, threshold: Int): Boolean {
+    eval.needsFollowup?.let { return it }
+    val score = eval.score
+    if (score != null) return score < threshold
+    return true
+}
+
+/**
+ * Parse EVAL JSON (best-effort).
+ */
+private fun parseEvalJson(jsonStr: String, keyStyle: OutputKeyStyle): EvalResult? {
+    if (jsonStr.isBlank()) return null
+    return try {
+        val obj = JSONObject(jsonStr)
+        val keys = keysForStyle(keyStyle)
+        EvalResult(
+            analysis = obj.optStringAny(keys.analysis, "analysis"),
+            expected = obj.optStringAny(keys.expected, "expected_answer", "expected answer", "expectedAnswer"),
+            followupQuestion = obj.optStringAny(keys.followup, "follow_up_question", "follow-up question", "followup_question"),
+            score = obj.optIntAny(keys.score, "score"),
+            needsFollowup = obj.optBooleanAny("needs_followup", "needsFollowup", "needs followup"),
+            missing = obj.optStringAny("missing", "missing_field", "missing fields"),
+        )
+    } catch (_: JSONException) {
+        null
+    }
+}
+
+/**
+ * Parse FOLLOW_UP JSON (best-effort).
+ */
+private fun parseFollowupJson(jsonStr: String, keyStyle: OutputKeyStyle): FollowupResult? {
+    if (jsonStr.isBlank()) return null
+    return try {
+        val obj = JSONObject(jsonStr)
+        val keys = keysForStyle(keyStyle)
+        FollowupResult(
+            analysis = obj.optStringAny(keys.analysis, "analysis"),
+            expected = obj.optStringAny(keys.expected, "expected_answer", "expected answer", "expectedAnswer"),
+            followupQuestion = obj.optStringAny(keys.followup, "follow_up_question", "follow-up question", "followup_question"),
+            score = obj.optIntAny(keys.score, "score"),
+        )
+    } catch (_: JSONException) {
+        null
+    }
+}
+
+/**
+ * Build final JSON from EVAL only.
+ */
+private fun buildFinalJsonFromEval(
+    eval: EvalResult,
+    keyStyle: OutputKeyStyle,
+    includeGating: Boolean,
+    includeMeta: Boolean,
+    metaRid: Long,
+    metaMode: String,
+): String {
+    val keys = keysForStyle(keyStyle)
+    val out = JSONObject()
+    out.put(keys.analysis, eval.analysis ?: "")
+    out.put(keys.expected, eval.expected ?: "")
+    out.put(keys.followup, eval.followupQuestion ?: "")
+    out.put(keys.score, eval.score ?: 0)
+
+    if (includeGating) {
+        out.put("needs_followup", eval.needsFollowup ?: false)
+        out.put("missing", eval.missing ?: "")
+    }
+    if (includeMeta) {
+        out.put("_meta_rid", metaRid)
+        out.put("_meta_mode", metaMode)
+    }
+    return out.toString()
+}
+
+/**
+ * Merge EVAL and FOLLOW_UP outputs into one final JSON.
+ *
+ * Default behavior:
+ * - Preserve EVAL's analysis/expected/score
+ * - Replace follow-up question with FOLLOW_UP's follow-up question (if present)
+ */
+private fun mergeEvalAndFollowup(
+    eval: EvalResult?,
+    follow: FollowupResult?,
+    rawEval: String,
+    rawFollow: String,
+    opts: TwoStepOptions,
+    metaRid: Long,
+): String {
+    val keys = keysForStyle(opts.outputKeyStyle)
+
+    if (eval == null && follow == null) {
+        return wrapAsFallbackJson(
+            rawOutput = compactJoin("EVAL_RAW:\n$rawEval", "FOLLOW_RAW:\n$rawFollow"),
+            keyStyle = opts.outputKeyStyle,
+            error = "both_steps_parse_failed",
+        )
+    }
+
+    val baseAnalysis = eval?.analysis ?: follow?.analysis ?: ""
+    val baseExpected = eval?.expected ?: follow?.expected ?: ""
+    val baseScore = eval?.score ?: follow?.score ?: 0
+    val baseFollowup = eval?.followupQuestion ?: follow?.followupQuestion ?: ""
+
+    val followFollowup = follow?.followupQuestion?.takeIf { it.isNotBlank() }
+    val followAnalysis = follow?.analysis?.takeIf { it.isNotBlank() }
+    val followExpected = follow?.expected?.takeIf { it.isNotBlank() }
+    val followScore = follow?.score
+
+    val out = JSONObject()
+
+    if (opts.followupOverridesAllFields) {
+        out.put(keys.analysis, followAnalysis ?: baseAnalysis)
+        out.put(keys.expected, followExpected ?: baseExpected)
+        out.put(keys.followup, followFollowup ?: baseFollowup)
+        out.put(keys.score, followScore ?: baseScore)
+    } else {
+        out.put(keys.analysis, baseAnalysis)
+        out.put(keys.expected, baseExpected)
+        out.put(keys.followup, followFollowup ?: baseFollowup)
+        out.put(keys.score, baseScore)
+    }
+
+    if (opts.includeGatingFieldsInFinal) {
+        out.put("needs_followup", true)
+        out.put("missing", eval?.missing ?: "")
+    }
+
+    if (opts.includeMetaInFinal) {
+        out.put("_meta_rid", metaRid)
+        out.put("_meta_mode", "two_step_merged")
+    }
+
+    return out.toString()
+}
+
+/**
+ * Wrap raw output into a conservative JSON when strict JSON couldn't be extracted/parsed.
+ */
+private fun wrapAsFallbackJson(rawOutput: String, keyStyle: OutputKeyStyle, error: String): String {
+    val keys = keysForStyle(keyStyle)
+    val out = JSONObject()
+    out.put(keys.analysis, "")
+    out.put(keys.expected, "")
+    out.put(keys.followup, "")
+    out.put(keys.score, 0)
+    out.put("_error", error)
+    out.put("_raw", rawOutput.take(20_000))
+    return out.toString()
+}
+
+/**
+ * Extract the first JSON object from [text] using a small state machine that handles strings/escapes.
+ */
+private fun extractFirstJsonObject(text: String): String? {
+    val s = text.normalizePrompt()
+    val firstBrace = s.indexOf('{')
+    if (firstBrace < 0) return null
+
+    var start = -1
+    var depth = 0
+    var inString = false
+    var escaped = false
+
+    for (i in firstBrace until s.length) {
+        val c = s[i]
+
+        if (inString) {
+            if (escaped) {
+                escaped = false
+            } else {
+                when (c) {
+                    '\\' -> escaped = true
+                    '"' -> inString = false
+                }
+            }
+            continue
+        }
+
+        when (c) {
+            '"' -> inString = true
+            '{' -> {
+                if (depth == 0) start = i
+                depth++
+            }
+            '}' -> {
+                if (depth > 0) depth--
+                if (depth == 0 && start >= 0) return s.substring(start, i + 1)
+            }
+        }
+    }
+    return null
+}
+
+/**
+ * Key set for a chosen [OutputKeyStyle].
+ */
+private data class KeySet(
+    val analysis: String,
+    val expected: String,
+    val followup: String,
+    val score: String,
+)
+
+private fun keysForStyle(style: OutputKeyStyle): KeySet {
+    return when (style) {
+        OutputKeyStyle.LEGACY -> KeySet(
+            analysis = "analysis",
+            expected = "expected answer",
+            followup = "follow-up question",
+            score = "score",
+        )
+        OutputKeyStyle.SNAKE_CASE -> KeySet(
+            analysis = "analysis",
+            expected = "expected_answer",
+            followup = "follow_up_question",
+            score = "score",
+        )
+    }
+}
+
+/* ====================================================================== */
+/*  JSONObject small utilities                                             */
+/* ====================================================================== */
+
+private fun JSONObject.optStringAny(vararg keys: String): String? {
+    for (k in keys) {
+        if (!has(k) || isNull(k)) continue
+        val v = opt(k)
+        when (v) {
+            is String -> return v
+            is Number, is Boolean -> return v.toString()
+            else -> {
+                val s = optString(k, "")
+                if (s.isNotBlank()) return s
+            }
+        }
+    }
+    return null
+}
+
+private fun JSONObject.optIntAny(vararg keys: String): Int? {
+    for (k in keys) {
+        if (!has(k) || isNull(k)) continue
+        val v = opt(k)
+        when (v) {
+            is Int -> return v
+            is Long -> return v.toInt()
+            is Double -> return v.toInt()
+            is Float -> return v.toInt()
+            is String -> {
+                val n = v.trim().toIntOrNull()
+                if (n != null) return n
+            }
+        }
+    }
+    return null
+}
+
+private fun JSONObject.optBooleanAny(vararg keys: String): Boolean? {
+    for (k in keys) {
+        if (!has(k) || isNull(k)) continue
+        val v = opt(k)
+        when (v) {
+            is Boolean -> return v
+            is String -> {
+                val t = v.trim().lowercase(Locale.US)
+                if (t == "true") return true
+                if (t == "false") return false
+            }
+            is Number -> return v.toInt() != 0
+        }
+    }
+    return null
 }

@@ -13,13 +13,20 @@
 
 package com.negi.survey.vm
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.negi.survey.BuildConfig
+import com.negi.survey.slm.AiRequestMode
 import com.negi.survey.slm.FollowupExtractor
+import com.negi.survey.slm.OutputKeyStyle
 import com.negi.survey.slm.Repository
+import com.negi.survey.slm.TwoStepOptions
+import com.negi.survey.slm.requestWithMode
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.CancellationException
@@ -34,6 +41,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -44,8 +52,8 @@ import kotlinx.coroutines.withTimeout
  * ViewModel dedicated to AI-related operations and chat persistence.
  *
  * Responsibilities:
- * - Build prompts and evaluate text via [Repository].
- * - Stream partial outputs to UI.
+ * - Evaluate via [Repository] with SingleStep / DoubleStep (2-step).
+ * - Stream partial outputs to UI (throttled).
  * - Extract and keep score / follow-up questions (top-3).
  * - Persist chat history per nodeId.
  * - Provide robust timeout/cancel handling.
@@ -54,6 +62,10 @@ import kotlinx.coroutines.withTimeout
  * - At most one evaluation is allowed at a time.
  * - The single-flight guarantee is enforced by [running].
  * - The active evaluation coroutine is tracked by [evalJob] so UI can cancel it.
+ *
+ * Staleness model:
+ * - Each run gets a monotonically increasing runId.
+ * - UI state updates are ignored if they come from a stale runId.
  */
 class AiViewModel(
     private val repo: Repository,
@@ -64,11 +76,9 @@ class AiViewModel(
     companion object {
         private const val TAG = "AiViewModel"
 
-        // Keep true while investigating whitespace issues.
-        private const val DEBUG_LOGS = true
-
-        // Additional debug logs for whitespace/chunk boundaries.
-        private const val DEBUG_WHITESPACE = true
+        // Debug toggles (avoid log spam in release).
+        private const val DEBUG_LOGS = BuildConfig.DEBUG
+        private const val DEBUG_WHITESPACE = BuildConfig.DEBUG
 
         // Log only the first N chunks verbosely to avoid log spam.
         private const val DEBUG_CHUNK_LOG_LIMIT = 12
@@ -77,6 +87,14 @@ class AiViewModel(
         private const val DEBUG_PREVIEW_CHARS = 240
 
         private const val DEFAULT_TIMEOUT_MS = 120_000L
+
+        // Stream publishing throttle to reduce UI churn / allocations.
+        // Publish stream snapshot at most every N ms OR after N new chars.
+        private const val STREAM_PUBLISH_MIN_INTERVAL_MS = 40L
+        private const val STREAM_PUBLISH_MIN_NEW_CHARS = 96
+
+        // Max chat messages per node (soft cap to prevent unbounded growth).
+        private const val CHAT_MAX_PER_NODE = 200
     }
 
     // ───────────────────────── UI state ─────────────────────────
@@ -93,7 +111,7 @@ class AiViewModel(
 
     private val _stream = MutableStateFlow("")
 
-    /** Live concatenation of streamed tokens from the model. */
+    /** Live concatenation of streamed tokens from the model (throttled). */
     val stream: StateFlow<String> = _stream.asStateFlow()
 
     private val _raw = MutableStateFlow<String?>(null)
@@ -157,11 +175,6 @@ class AiViewModel(
 
     /**
      * Observe chat list for a specific [nodeId] as a [StateFlow].
-     *
-     * This keeps UI code minimal:
-     * ```kotlin
-     * val bubbles by vmAI.chatFlow(node.id).collectAsState()
-     * ```
      */
     fun chatFlow(nodeId: String): StateFlow<List<ChatMsgVm>> =
         _chats
@@ -186,55 +199,45 @@ class AiViewModel(
         }
     }
 
-    /**
-     * Append a new chat message for [nodeId].
-     */
+    /** Append a new chat message for [nodeId]. */
     fun chatAppend(nodeId: String, msg: ChatMsgVm) {
-        updateNode(nodeId) { it + msg }
+        updateNode(nodeId) { list ->
+            val next = list + msg
+            if (next.size <= CHAT_MAX_PER_NODE) next else next.takeLast(CHAT_MAX_PER_NODE)
+        }
         if (DEBUG_LOGS) Log.v(TAG, "chatAppend[$nodeId]: ${msg.id}")
     }
 
-    /**
-     * Replace existing typing bubble or append if not present.
-     */
+    /** Replace existing typing bubble or append if not present. */
     fun chatUpsertTyping(nodeId: String, typing: ChatMsgVm) {
         updateNode(nodeId) { list ->
             val i = list.indexOfFirst { it.isTyping }
-            if (i >= 0) list.toMutableList().apply { set(i, typing) } else list + typing
+            val next = if (i >= 0) list.toMutableList().apply { set(i, typing) } else list + typing
+            if (next.size <= CHAT_MAX_PER_NODE) next else next.takeLast(CHAT_MAX_PER_NODE)
         }
     }
 
-    /**
-     * Remove any typing bubbles for [nodeId].
-     */
+    /** Remove any typing bubbles for [nodeId]. */
     fun chatRemoveTyping(nodeId: String) {
         updateNode(nodeId) { list -> list.filterNot { it.isTyping } }
     }
 
-    /**
-     * Replace a typing bubble with [finalMsg], or append if none exists.
-     */
+    /** Replace a typing bubble with [finalMsg], or append if none exists. */
     fun chatReplaceTypingWith(nodeId: String, finalMsg: ChatMsgVm) {
         updateNode(nodeId) { list ->
             val i = list.indexOfFirst { it.isTyping }
-            if (i >= 0) list.toMutableList().apply { set(i, finalMsg) } else list + finalMsg
+            val next = if (i >= 0) list.toMutableList().apply { set(i, finalMsg) } else list + finalMsg
+            if (next.size <= CHAT_MAX_PER_NODE) next else next.takeLast(CHAT_MAX_PER_NODE)
         }
     }
 
-    /**
-     * Clear chat history for a single [nodeId].
-     */
+    /** Clear chat history for a single [nodeId]. */
     fun chatClear(nodeId: String) {
         _chats.update { it - nodeId }
         if (DEBUG_LOGS) Log.w(TAG, "chatClear: cleared chat for $nodeId")
     }
 
-    /**
-     * Clear chat history for all nodes.
-     *
-     * Use this when starting a completely fresh survey session so that
-     * no previous AI conversation leaks into the new run.
-     */
+    /** Clear chat history for all nodes. */
     fun resetChats() {
         _chats.value = emptyMap()
         if (DEBUG_LOGS) Log.w(TAG, "resetChats: cleared all chats")
@@ -255,80 +258,141 @@ class AiViewModel(
     private var evalJob: Job? = null
     private val running = AtomicBoolean(false)
 
-    /**
-     * True when an evaluation coroutine is currently running.
-     */
+    // Run id / staleness guard
+    private val runSeq = AtomicLong(0L)
+    private val activeRunId = AtomicLong(0L)
+
+    /** True when an evaluation coroutine is currently running. */
     val isRunning: Boolean
         get() = running.get()
 
-    /**
-     * Evaluate the given [prompt] and return the parsed score (0..100) or null.
-     *
-     * Timeout semantics:
-     * - A timeout still attempts to parse whatever was streamed so far.
-     * - [AiEvent.Final] is emitted at most once per call.
-     * - [AiEvent.Timeout] is emitted in addition when applicable.
-     */
+    // ─────────────────────── Mode helpers ───────────────────────
+
+    fun defaultTwoStepOptions(): TwoStepOptions {
+        return TwoStepOptions(
+            evalOkScoreThreshold = 85,
+            skipFollowupWhenOk = true,
+            followupOnEvalParseError = true,
+            outputKeyStyle = OutputKeyStyle.LEGACY,
+            emitEvalChunks = false,
+            emitFollowupChunks = false,
+            emitFinalMergedJson = true,
+            followupOverridesAllFields = false,
+            includeGatingFieldsInFinal = false,
+            includeMetaInFinal = false
+        )
+    }
+
+    // ─────────────────────── Public API ───────────────────────
+
     suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
+        return evaluateWithMode(
+            prompt = prompt,
+            mode = AiRequestMode.SingleStep(passThroughStreaming = true),
+            timeoutMs = timeoutMs
+        )
+    }
+
+    suspend fun evaluateTwoStep(
+        prompt: String,
+        twoStepOptions: TwoStepOptions = defaultTwoStepOptions(),
+        timeoutMs: Long = defaultTimeoutMs
+    ): Int? {
+        return evaluateWithMode(
+            prompt = prompt,
+            mode = AiRequestMode.DoubleStep(options = twoStepOptions),
+            timeoutMs = timeoutMs
+        )
+    }
+
+    suspend fun evaluateWithMode(
+        prompt: String,
+        mode: AiRequestMode,
+        timeoutMs: Long = defaultTimeoutMs
+    ): Int? {
         if (prompt.isBlank()) {
-            Log.i(TAG, "evaluate: blank prompt -> reset states and return null")
+            Log.i(TAG, "evaluateWithMode: blank prompt -> reset states and return null")
             resetStates(keepError = false)
             return null
         }
 
-        val fullPrompt = runCatching { repo.buildPrompt(prompt) }
-            .onFailure { t -> Log.e(TAG, "evaluate: buildPrompt failed", t) }
-            .getOrElse { prompt }
-
         if (!running.compareAndSet(false, true)) {
-            Log.w(TAG, "evaluate: already running -> returning current score=${_score.value}")
+            Log.w(TAG, "evaluateWithMode: already running -> returning current score=${_score.value}")
             return _score.value
         }
 
+        val runId = runSeq.incrementAndGet()
+        activeRunId.set(runId)
+
+        // Cancel any previous job (defensive).
         evalJob?.cancel()
         evalJob = null
 
         prepareUiForNewRun()
 
-        val elapsed = measureTimeMillis {
-            val job = startEvaluationInternal(
-                originalPrompt = prompt,
-                fullPrompt = fullPrompt,
-                timeoutMs = timeoutMs
-            )
-            evalJob = job
-            job.join()
+        try {
+            val elapsed = measureTimeMillis {
+                val job = startEvaluationInternal(
+                    runId = runId,
+                    originalPrompt = prompt,
+                    mode = mode,
+                    timeoutMs = timeoutMs
+                )
+                evalJob = job
+                job.join()
+            }
+
+            Log.d(TAG, "evaluateWithMode: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
+            return _score.value
+        } catch (e: CancellationException) {
+            // If the caller is cancelled, cancel the underlying run silently.
+            if (DEBUG_LOGS) Log.w(TAG, "evaluateWithMode: caller cancelled -> silent cancel of runId=$runId", e)
+            cancelInternal(silent = true)
+            throw e
         }
-
-        finalizeRunFlags()
-
-        Log.d(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
-        return _score.value
     }
 
-    /**
-     * Fire-and-forget variant of [evaluate].
-     *
-     * @return [Job] representing the launched evaluation.
-     */
     fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
+        return evaluateAsyncWithMode(
+            prompt = prompt,
+            mode = AiRequestMode.SingleStep(passThroughStreaming = true),
+            timeoutMs = timeoutMs
+        )
+    }
+
+    fun evaluateTwoStepAsync(
+        prompt: String,
+        twoStepOptions: TwoStepOptions = defaultTwoStepOptions(),
+        timeoutMs: Long = defaultTimeoutMs
+    ): Job {
+        return evaluateAsyncWithMode(
+            prompt = prompt,
+            mode = AiRequestMode.DoubleStep(options = twoStepOptions),
+            timeoutMs = timeoutMs
+        )
+    }
+
+    fun evaluateAsyncWithMode(
+        prompt: String,
+        mode: AiRequestMode,
+        timeoutMs: Long = defaultTimeoutMs
+    ): Job {
         if (prompt.isBlank()) {
             resetStates(keepError = false)
             return viewModelScope.launch { }
         }
 
-        if (DEBUG_LOGS) Log.d(TAG, "evaluateAsync: prompt.len=${prompt.length}")
-
-        val fullPrompt = runCatching { repo.buildPrompt(prompt) }
-            .onFailure { t -> Log.e(TAG, "evaluateAsync: buildPrompt failed", t) }
-            .getOrElse { prompt }
-
-        if (DEBUG_LOGS) Log.d(TAG, "evaluateAsync: fullPrompt.len=${fullPrompt.length}")
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "evaluateAsyncWithMode: prompt.len=${prompt.length}, mode=${mode.javaClass.simpleName}")
+        }
 
         if (!running.compareAndSet(false, true)) {
-            Log.w(TAG, "evaluateAsync: already running -> returning existing job")
+            Log.w(TAG, "evaluateAsyncWithMode: already running -> returning existing job")
             return evalJob ?: viewModelScope.launch { }
         }
+
+        val runId = runSeq.incrementAndGet()
+        activeRunId.set(runId)
 
         evalJob?.cancel()
         evalJob = null
@@ -336,41 +400,36 @@ class AiViewModel(
         prepareUiForNewRun()
 
         val job = startEvaluationInternal(
+            runId = runId,
             originalPrompt = prompt,
-            fullPrompt = fullPrompt,
+            mode = mode,
             timeoutMs = timeoutMs
         )
         evalJob = job
-
-        job.invokeOnCompletion { finalizeRunFlags() }
-
         return job
     }
 
     /**
      * Cancel the ongoing evaluation if any.
      *
-     * This is a user-driven cancellation path.
+     * This is a user-driven cancellation path:
+     * - Immediately updates UI (loading=false, error="cancelled")
+     * - Invalidates run id to ignore late emissions
+     * - Emits [AiEvent.Cancelled] exactly once from here
      */
     fun cancel() {
-        Log.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
-
-        runCatching { evalJob?.cancel() }
-            .onFailure { t -> Log.w(TAG, "cancel: exception during cancel (ignored)", t) }
-
-        _error.value = "cancelled"
-        _loading.value = false
-        running.set(false)
-        evalJob = null
-
-        _events.tryEmit(AiEvent.Cancelled)
+        cancelInternal(silent = false)
     }
 
     /**
      * Reset transient AI-related states while keeping chat history intact.
+     *
+     * IMPORTANT:
+     * This reset must not surface user-visible "cancelled" errors.
+     * Use silent cancel for internal resets (screen change, node switch, etc.).
      */
     fun resetStates(keepError: Boolean = false) {
-        cancel()
+        cancelInternal(silent = true)
         _score.value = null
         _stream.value = ""
         _raw.value = null
@@ -379,101 +438,163 @@ class AiViewModel(
         if (!keepError) _error.value = null
     }
 
-    /**
-     * Reset all AI-related state including chats.
-     */
+    /** Reset all AI-related state including chats. */
     fun resetAll(keepError: Boolean = false) {
         resetStates(keepError = keepError)
         resetChats()
     }
 
     override fun onCleared() {
-        Log.i(TAG, "onCleared: ViewModel is being cleared -> cancel()")
+        if (DEBUG_LOGS) Log.i(TAG, "onCleared: ViewModel is being cleared -> silent cancel")
         super.onCleared()
-        cancel()
+        cancelInternal(silent = true)
     }
 
     // ───────────────────────── Internal evaluation core ─────────────────────────
 
     private fun startEvaluationInternal(
+        runId: Long,
         originalPrompt: String,
-        fullPrompt: String,
+        mode: AiRequestMode,
         timeoutMs: Long
     ): Job = viewModelScope.launch(ioDispatcher) {
 
+        fun isActiveRun(): Boolean = activeRunId.get() == runId
+
+        fun requireActiveRun() {
+            if (!isActiveRun()) throw CancellationException("stale-run")
+        }
+
         val buf = StringBuilder()
+        val eventBuf = StringBuilder()
+
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
         var finalEmitted = false
 
+        // Throttle stream publishing
+        var lastPublishAt = 0L
+        var lastPublishedLen = 0
+
+        fun flushStreamAndEvents(force: Boolean = false) {
+            val now = SystemClock.elapsedRealtime()
+            val len = buf.length
+            val delta = len - lastPublishedLen
+
+            val dueByTime = (now - lastPublishAt) >= STREAM_PUBLISH_MIN_INTERVAL_MS
+            val dueByChars = delta >= STREAM_PUBLISH_MIN_NEW_CHARS
+
+            if (force || dueByTime || dueByChars) {
+                if (isActiveRun()) {
+                    _stream.value = buf.toString()
+                }
+
+                // Emit stream events as a batched chunk to reduce UI load.
+                if (eventBuf.isNotEmpty()) {
+                    _events.tryEmit(AiEvent.Stream(eventBuf.toString()))
+                    eventBuf.setLength(0)
+                }
+
+                lastPublishAt = now
+                lastPublishedLen = len
+            }
+        }
+
+        val debugFullPrompt: String? =
+            if (DEBUG_LOGS) runCatching { repo.buildPrompt(originalPrompt) }.getOrElse { originalPrompt } else null
+
+        if (DEBUG_LOGS) {
+            Log.d(
+                TAG,
+                "run.start: runId=$runId mode=${mode.javaClass.simpleName}, prompt.len=${originalPrompt.length}, " +
+                        "dbgFull.len=${debugFullPrompt?.length ?: -1}, timeoutMs=$timeoutMs"
+            )
+            Log.d(TAG, "run.sha: prompt=${sha256Hex(originalPrompt)}, dbgFull=${debugFullPrompt?.let { sha256Hex(it) } ?: "<off>"}")
+        }
+
         try {
             try {
                 withTimeout(timeoutMs) {
-                    repo.request(fullPrompt).collect { part ->
-                        if (part.isNotEmpty()) {
-                            chunkCount++
-                            buf.append(part)
-                            totalChars += part.length
+                    repo.requestWithMode(
+                        userPrompt = originalPrompt,
+                        mode = mode
+                    ).collect { part ->
+                        requireActiveRun()
+                        if (part.isEmpty()) return@collect
 
-                            _stream.update { it + part }
-                            _events.tryEmit(AiEvent.Stream(part))
+                        chunkCount++
+                        buf.append(part)
+                        eventBuf.append(part)
+                        totalChars += part.length
 
-                            if (DEBUG_LOGS && DEBUG_WHITESPACE && chunkCount <= DEBUG_CHUNK_LOG_LIMIT) {
-                                // Log chunk boundary/whitespace diagnostics.
-                                val head = part.take(12)
-                                val tail = part.takeLast(12)
-                                Log.d(
-                                    TAG,
-                                    "chunk[$chunkCount]: len=${part.length}, " +
-                                            "leadWS=${part.firstOrNull()?.isWhitespace() == true}, " +
-                                            "tailWS=${part.lastOrNull()?.isWhitespace() == true}, " +
-                                            "head='${debugVisible(head)}', tail='${debugVisible(tail)}'"
-                                )
+                        flushStreamAndEvents(force = false)
 
-                                // Also log a short preview to see if spaces are present within the chunk.
-                                Log.d(TAG, "chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
-                            }
+                        if (DEBUG_LOGS && DEBUG_WHITESPACE && chunkCount <= DEBUG_CHUNK_LOG_LIMIT) {
+                            val head = part.take(12)
+                            val tail = part.takeLast(12)
+                            Log.d(
+                                TAG,
+                                "chunk[$chunkCount]: len=${part.length}, " +
+                                        "leadWS=${part.firstOrNull()?.isWhitespace() == true}, " +
+                                        "tailWS=${part.lastOrNull()?.isWhitespace() == true}, " +
+                                        "head='${debugVisible(head)}', tail='${debugVisible(tail)}'"
+                            )
+                            Log.d(TAG, "chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
                         }
                     }
                 }
             } catch (e: TimeoutCancellationException) {
                 timedOut = true
-                Log.w(TAG, "evaluate: timeout after ${timeoutMs}ms", e)
+                if (DEBUG_LOGS) Log.w(TAG, "evaluate: timeout after ${timeoutMs}ms", e)
             } catch (e: CancellationException) {
+                // Stale run should exit quietly with no UI updates.
+                if (!isActiveRun()) {
+                    if (DEBUG_LOGS) Log.d(TAG, "run.stale: runId=$runId cancelled/invalidated")
+                    return@launch
+                }
+
+                // Some timeouts arrive as cancellation-like exceptions in certain stacks.
                 if (looksLikeTimeout(e)) {
                     timedOut = true
-                    Log.w(TAG, "evaluate: timeout-like cancellation (${e.javaClass.name})")
+                    if (DEBUG_LOGS) Log.w(TAG, "evaluate: timeout-like cancellation (${e.javaClass.name})")
                 } else {
                     throw e
                 }
             }
+
+            requireActiveRun()
+
+            // Ensure latest snapshot is visible to UI and parsing code.
+            flushStreamAndEvents(force = true)
 
             val rawText = buf.toString().ifBlank { _stream.value }
 
             if (DEBUG_LOGS) {
                 Log.d(
                     TAG,
-                    "Evaluate[stats]: prompt.len=${originalPrompt.length}, full.len=${fullPrompt.length}, chunks=$chunkCount, chars=$totalChars"
+                    "Evaluate[stats]: runId=$runId mode=${mode.javaClass.simpleName}, chunks=$chunkCount, " +
+                            "chars=$totalChars, raw.len=${rawText.length}"
                 )
-                Log.d(
-                    TAG,
-                    "Evaluate[sha]: prompt=${sha256Hex(originalPrompt)}, full=${sha256Hex(fullPrompt)}, raw=${sha256Hex(rawText)}"
-                )
+                Log.d(TAG, "Evaluate[sha]: raw=${sha256Hex(rawText)}")
             }
 
             if (DEBUG_LOGS && DEBUG_WHITESPACE) {
-                // Visualize raw buffer to check whether whitespace exists BEFORE parsing.
                 Log.d(TAG, "rawVisible='${debugVisible(preview(rawText))}'")
             }
 
             if (rawText.isNotBlank()) {
-                val parsedScore = clampScore(FollowupExtractor.extractScore(rawText))
-                val top3 = FollowupExtractor.fromRaw(rawText, max = 3)
+                val parsedScore = runCatching { clampScore(FollowupExtractor.extractScore(rawText)) }
+                    .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "extractScore failed (non-fatal)", t) }
+                    .getOrNull()
+
+                val top3 = runCatching { FollowupExtractor.fromRaw(rawText, max = 3) }
+                    .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "extractFollowups failed (non-fatal)", t) }
+                    .getOrElse { emptyList() }
+
                 val q0 = top3.firstOrNull()
 
                 if (DEBUG_LOGS && DEBUG_WHITESPACE) {
-                    // If raw has spaces but q0 doesn't, FollowupExtractor is stripping them.
                     Log.d(TAG, "q0Visible='${debugVisible(preview(q0 ?: ""))}'")
                     Log.d(TAG, "top3.count=${top3.size}, top3[0].len=${q0?.length ?: 0}")
                 }
@@ -490,7 +611,12 @@ class AiViewModel(
                     Log.i(TAG, "Score=$parsedScore, FU[0]=${q0 ?: "<none>"} FU[1..]=${top3.drop(1)}")
                 }
             } else {
-                Log.w(TAG, "evaluate: no output produced (stream & buffer empty)")
+                if (DEBUG_LOGS) Log.w(TAG, "evaluate: no output produced (stream & buffer empty)")
+                _raw.value = ""
+                _score.value = null
+                _followups.value = emptyList()
+                _followupQuestion.value = null
+
                 _events.tryEmit(AiEvent.Final("", null, emptyList()))
                 finalEmitted = true
             }
@@ -500,30 +626,82 @@ class AiViewModel(
                 _events.tryEmit(AiEvent.Timeout)
             }
         } catch (e: CancellationException) {
+            // If run was invalidated, stay silent.
+            if (!isActiveRun()) {
+                if (DEBUG_LOGS) Log.d(TAG, "run.stale: runId=$runId cancelled in outer catch")
+                return@launch
+            }
+
             _error.value = "cancelled"
+            flushStreamAndEvents(force = true)
 
             if (!finalEmitted) {
                 _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
             }
 
+            // IMPORTANT: Do not emit Cancelled here when cancel() path already emits it.
+            // This path covers "unexpected" cancellation (e.g., upstream cancellation without invalidation).
             _events.tryEmit(AiEvent.Cancelled)
-            Log.w(TAG, "evaluate: cancelled", e)
+
+            if (DEBUG_LOGS) Log.w(TAG, "evaluate: cancelled", e)
             throw e
         } catch (t: Throwable) {
+            if (!isActiveRun()) {
+                if (DEBUG_LOGS) Log.d(TAG, "run.stale: runId=$runId error after invalidation: ${t.message}")
+                return@launch
+            }
+
             val msg = t.message ?: "error"
             _error.value = msg
             _events.tryEmit(AiEvent.Error(msg))
             Log.e(TAG, "evaluate: error", t)
 
+            flushStreamAndEvents(force = true)
             if (!finalEmitted) {
                 _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
             }
+        } finally {
+            finalizeRunFlags(runId)
         }
     }
 
     /**
-     * Prepare all UI-visible states for a new evaluation run.
+     * Cancel helper used by both user-driven cancel and internal resets.
+     *
+     * @param silent When true, do not surface "cancelled" error nor emit Cancelled event.
      */
+    private fun cancelInternal(silent: Boolean) {
+        val job = evalJob
+        val wasActive = (job?.isActive == true)
+
+        if (DEBUG_LOGS) {
+            Log.i(
+                TAG,
+                "cancelInternal: silent=$silent (isRunning=${running.get()}, loading=${_loading.value}, jobActive=$wasActive)"
+            )
+        }
+
+        // Invalidate current run id so late emissions are ignored.
+        activeRunId.set(0L)
+
+        runCatching { job?.cancel() }
+            .onFailure { t -> Log.w(TAG, "cancelInternal: exception during cancel (ignored)", t) }
+
+        // Make UI reflect cancellation immediately.
+        if (!silent) {
+            _error.value = "cancelled"
+        }
+        _loading.value = false
+        running.set(false)
+        evalJob = null
+
+        // Emit Cancelled exactly once from here for user-driven cancels.
+        if (!silent) {
+            _events.tryEmit(AiEvent.Cancelled)
+        }
+    }
+
+    /** Prepare all UI-visible states for a new evaluation run. */
     private fun prepareUiForNewRun() {
         _loading.value = true
         _score.value = null
@@ -532,18 +710,19 @@ class AiViewModel(
         _followups.value = emptyList()
         _raw.value = null
 
-        if (_error.value != "timeout" && _error.value != "cancelled") {
-            _error.value = null
-        }
+        // Always clear previous errors at the start of a new run to avoid "sticky" UI states.
+        _error.value = null
     }
 
-    /**
-     * Finalize flags after an evaluation completes.
-     */
-    private fun finalizeRunFlags() {
+    /** Finalize flags after an evaluation completes (only if still the active run). */
+    private fun finalizeRunFlags(runId: Long) {
+        // Only clear if this runId is still current.
+        if (activeRunId.get() != runId) return
+
         _loading.value = false
         running.set(false)
         evalJob = null
+        activeRunId.set(0L)
     }
 
     // ───────────────────────── helpers ─────────────────────────
@@ -564,9 +743,7 @@ class AiViewModel(
         bytes.joinToString("") { b -> "%02x".format(b.toInt() and 0xff) }
     }.getOrElse { "sha256_error" }
 
-    /**
-     * Convert whitespace/newlines/tabs to visible markers for logs.
-     */
+    /** Convert whitespace/newlines/tabs to visible markers for logs. */
     private fun debugVisible(s: String): String {
         if (s.isEmpty()) return ""
         return buildString(s.length) {
@@ -584,9 +761,7 @@ class AiViewModel(
         }
     }
 
-    /**
-     * Safe preview for logs (avoid huge lines).
-     */
+    /** Safe preview for logs (avoid huge lines). */
     private fun preview(s: String): String {
         if (s.isEmpty()) return ""
         val n = min(DEBUG_PREVIEW_CHARS, s.length)
