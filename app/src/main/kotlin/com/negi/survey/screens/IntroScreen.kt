@@ -43,6 +43,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -71,13 +72,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -113,6 +113,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 private const val TAG = "IntroScreen"
@@ -211,13 +212,11 @@ private fun IntroCardMono(
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
-    // Readability palette (explicit, monotone).
     val textPrimary = Color(0xFFF2F2F2)
     val textSecondary = Color(0xFFD2D2D2)
     val textMuted = Color(0xFFB0B0B0)
     val textHint = Color(0xFF9A9A9A)
 
-    // A slightly stronger card scrim to lift text from the animated background.
     val cardBg = Color(0xFF101010).copy(alpha = 0.86f)
 
     val optionIds = remember(options) { options.map { it.id } }
@@ -238,19 +237,21 @@ private fun IntroCardMono(
 
     val selectedOption = options.firstOrNull { it.id == selectedId } ?: options.first()
 
-    // ───────────────────── Resolve current config details ─────────────────────
     var detailsState by remember(restartEpoch, selectedId) {
         mutableStateOf<ResolvedDetailsState>(ResolvedDetailsState.Loading)
     }
 
     LaunchedEffect(restartEpoch, selectedId) {
         detailsState = ResolvedDetailsState.Loading
-        detailsState = try {
+        try {
             val d = onResolveConfigDetails(selectedId)
-            ResolvedDetailsState.Ready(d)
+            detailsState = ResolvedDetailsState.Ready(d)
+        } catch (e: CancellationException) {
+            // Important: do not treat cancellation as an error.
+            throw e
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to resolve config details for id=$selectedId", t)
-            ResolvedDetailsState.Error(t)
+            detailsState = ResolvedDetailsState.Error(t)
         }
     }
 
@@ -287,7 +288,6 @@ private fun IntroCardMono(
 
         Column(
             modifier = Modifier
-                // Critical: clamp the whole card height so expanded details remain reachable.
                 .heightIn(max = screenH * 0.82f)
                 .verticalScroll(scroll)
                 .padding(horizontal = 22.dp, vertical = 20.dp),
@@ -339,7 +339,6 @@ private fun IntroCardMono(
                 }
             }
 
-            // ───────────────────── Selected details panel ─────────────────────
             Spacer(Modifier.height(10.dp))
 
             SelectedConfigDetailsMono(
@@ -355,7 +354,7 @@ private fun IntroCardMono(
             Spacer(Modifier.height(12.dp))
 
             HorizontalDivider(
-                thickness = DividerDefaults.Thickness,
+                thickness = 1.dp,
                 color = cs.outlineVariant.copy(alpha = 0.22f)
             )
 
@@ -377,21 +376,7 @@ private sealed class ResolvedDetailsState {
     data class Error(val error: Throwable) : ResolvedDetailsState()
 }
 
-/**
- * Details panel for the currently selected configuration.
- *
- * Shows:
- * - UI label/desc (always)
- * - Resolved config details (loading/ready/error)
- *
- * Debug fixes applied:
- * - "Show more" appears only if it can actually expand content:
- *   - For Ready: only when summary/longText actually overflows when collapsed.
- *   - For Loading/Error: no pointless toggle.
- * - When expanding, auto-scroll this panel into view.
- * - Long text is contained within the card scroll (card is height-clamped + scrollable).
- */
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun SelectedConfigDetailsMono(
     configId: String,
@@ -407,7 +392,6 @@ private fun SelectedConfigDetailsMono(
 
     var expanded by remember(configId) { mutableStateOf(false) }
 
-    // Overflow detection for collapse-mode only.
     var descOverflow by remember(configId) { mutableStateOf(false) }
     var summaryOverflow by remember(configId) { mutableStateOf(false) }
     var longOverflow by remember(configId) { mutableStateOf(false) }
@@ -448,7 +432,6 @@ private fun SelectedConfigDetailsMono(
 
         Spacer(Modifier.height(4.dp))
 
-        // Always-visible short description (about this option)
         Text(
             text = optionDescription,
             style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
@@ -456,7 +439,6 @@ private fun SelectedConfigDetailsMono(
             maxLines = if (expanded) Int.MAX_VALUE else 2,
             overflow = TextOverflow.Ellipsis,
             onTextLayout = { r ->
-                // Only compute overflow while collapsed, otherwise it flips false and hides button.
                 if (!expanded) descOverflow = r.hasVisualOverflow
             },
             modifier = Modifier.testTag("SelectedConfigDesc")
@@ -464,7 +446,6 @@ private fun SelectedConfigDetailsMono(
 
         Spacer(Modifier.height(10.dp))
 
-        // Resolved current-config details
         when (state) {
             is ResolvedDetailsState.Loading -> {
                 Text(
@@ -546,15 +527,12 @@ private fun SelectedConfigDetailsMono(
             }
         }
 
-        // Toggle row
         Spacer(Modifier.height(10.dp))
 
         val canExpandReadyContent = summaryOverflow || longOverflow
         val canExpandOptionDesc = descOverflow
 
-        // Only show toggle when there is actual overflow in collapsed state.
         val showToggle = (!expanded) && (canExpandReadyContent || canExpandOptionDesc)
-        // When expanded, always allow collapsing back.
         val showCollapse = expanded
 
         Row(
@@ -588,12 +566,6 @@ private fun SelectedConfigDetailsMono(
     }
 }
 
-/**
- * Small monotone key/value chip.
- *
- * NOTE:
- * - testTag cannot contain many special characters reliably; sanitize.
- */
 @Composable
 private fun MetaChipMono(label: String, value: String) {
     val safeLabel = remember(label) { label.safeTestTagToken(24) }
@@ -628,9 +600,6 @@ private fun MetaChipMono(label: String, value: String) {
     }
 }
 
-/**
- * CTA row that hosts the primary Start button and an optional Restart button.
- */
 @Composable
 private fun CtaRowMono(
     onStart: () -> Unit,
@@ -655,7 +624,7 @@ private fun CtaRowMono(
             modifier = Modifier.testTag("StartButton")
         ) {
             Icon(
-                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                imageVector = Icons.Filled.ArrowForward,
                 contentDescription = null
             )
             Spacer(Modifier.width(8.dp))
@@ -714,9 +683,6 @@ private fun CtaRowMono(
     }
 }
 
-/**
- * Monotone headline with a subtle vertical gradient (high-contrast).
- */
 @Composable
 private fun GradientHeadlineMono(
     text: String,
@@ -743,9 +709,6 @@ private fun GradientHeadlineMono(
     )
 }
 
-/**
- * Single monotone configuration chip (readability-tuned).
- */
 @Composable
 private fun MonoConfigOptionChip(
     option: ConfigOptionUi,
@@ -824,8 +787,6 @@ private fun MonoConfigOptionChip(
     }
 }
 
-/* ────────────────────────── Background (monotone) ───────────────────────── */
-
 @Composable
 private fun animatedMonotoneBackground(): Brush {
     val t = rememberInfiniteTransition(label = "mono-bg")
@@ -853,8 +814,6 @@ private fun animatedMonotoneBackground(): Brush {
         end = Offset(endX, endY)
     )
 }
-
-/* ────────────────────────── TestTag Sanitizer ────────────────────────── */
 
 private fun String.safeTestTagToken(maxLen: Int): String {
     val cleaned = buildString(length) {

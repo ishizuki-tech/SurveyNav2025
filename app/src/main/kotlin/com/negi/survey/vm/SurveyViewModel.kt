@@ -12,18 +12,12 @@
  *  ---------------------------------------------------------------------
  *  Main ViewModel responsible for managing survey navigation and state.
  *
- *  Key upgrade points in this version:
- *   • Adds Two-step prompting support: EVAL -> optional Follow-up.
- *   • Reads `two_step` knobs from SurveyConfig and exposes them via TwoStepPolicy.
- *   • Keeps audio manifest (recordedAudioRefs) as stable export truth.
- *   • Provides helper APIs for run-scoped retrieval and replace semantics.
- *   • Avoids double-pushing FlowHome when NavBackStack is pre-seeded.
- *   • Avoids reliance on NavBackStack.clear() for broader compatibility.
- *
- *  Notes:
- *   • Prompt templates are resolved by stage with robust fallbacks.
- *   • This ViewModel intentionally does not depend on file-system scans.
- *     Physical WAV discovery remains an Export/Repository responsibility.
+ *  Hardening (accident-rate reduction) upgrades in this revision:
+ *   • Fix: Kotlin init-order NPE in reflection getter cache (getterCache now initialized before graph build).
+ *   • Fix: Prompt normalization loop compile error (no `return@for`; uses labeled continue).
+ *   • Option: HardeningOptions to reduce crash probability by failing open (skip bad DTOs) in release.
+ *   • Option: Reflection caching can be disabled for ultra-safe mode.
+ *   • Feature: onVoiceExported() implemented with policy-based safe routing to avoid mis-attachment.
  * =====================================================================
  */
 
@@ -35,9 +29,11 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
+import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.screens.TwoStepPolicy
 import com.negi.survey.screens.TwoStepPromptProvider
+import java.lang.reflect.Method
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -56,8 +52,6 @@ private const val TAG = "SurveyVM"
 
 /**
  * Survey node types used by the runtime flow.
- *
- * These values represent the logical type of nodes in the survey graph.
  */
 enum class NodeType {
     START,
@@ -71,9 +65,6 @@ enum class NodeType {
 
 /**
  * Runtime node model built from survey configuration.
- *
- * This is the in-memory representation of a survey node that the
- * ViewModel manipulates during the flow.
  *
  * @property id Unique identifier of the node.
  * @property type Node type that determines which screen to show.
@@ -93,9 +84,6 @@ data class Node(
 
 /* ───────────────────────────── Nav Keys ───────────────────────────── */
 
-/**
- * NavKey definitions for each flow node destination.
- */
 @Serializable object FlowHome : NavKey
 @Serializable object FlowText : NavKey
 @Serializable object FlowSingle : NavKey
@@ -116,9 +104,6 @@ sealed interface UiEvent {
 
 /* ───────────────────────────── Prompts ───────────────────────────── */
 
-/**
- * Prompt stages used by the Two-step flow.
- */
 private enum class PromptStage {
     BASE,
     EVAL,
@@ -127,103 +112,282 @@ private enum class PromptStage {
 
 /**
  * Normalized prompt template representation.
+ *
+ * @property baseNodeId Node id without any embedded stage suffix/prefix.
+ * @property stage Prompt stage.
+ * @property prompt Prompt body.
+ * @property rawKey Original raw node key as it appeared in config (debug only).
  */
 private data class PromptTemplate(
-    val nodeId: String,
+    val baseNodeId: String,
     val stage: PromptStage,
-    val prompt: String
+    val prompt: String,
+    val rawKey: String
+)
+
+/* ───────────────────────────── Voice Export Policy ───────────────────────────── */
+
+enum class VoiceExportPolicy {
+    /** Strict: drop exports without a valid questionId (best for DEBUG). */
+    STRICT_DROP,
+
+    /** Safe: store under a dedicated bucket to avoid mis-attachment. */
+    STORE_UNASSIGNED,
+
+    /** Risky: attach to current nodeId (can mis-attach if export is delayed). */
+    ATTACH_TO_CURRENT_NODE
+}
+
+/* ───────────────────────────── Hardening Options ───────────────────────────── */
+
+/**
+ * Hardening options that reduce crash probability by failing open in non-strict mode.
+ *
+ * NOTE:
+ * - Default behavior is stricter in DEBUG builds and more tolerant in RELEASE builds.
+ * - You can set ultraSafeMode=true to avoid reflection caching entirely.
+ * - Voice export policy defaults:
+ *   - DEBUG: STRICT_DROP (surface issues early)
+ *   - RELEASE: STORE_UNASSIGNED (avoid wrong attachment)
+ */
+data class HardeningOptions(
+    val debugLogs: Boolean = BuildConfig.DEBUG,
+    val strictConfig: Boolean = BuildConfig.DEBUG,
+    val skipInvalidGraphNodes: Boolean = !BuildConfig.DEBUG,
+    val skipInvalidPromptDtos: Boolean = true,
+    val ultraSafeMode: Boolean = false,
+
+    val voiceExportPolicy: VoiceExportPolicy =
+        if (BuildConfig.DEBUG) VoiceExportPolicy.STRICT_DROP else VoiceExportPolicy.STORE_UNASSIGNED,
+
+    val unassignedVoiceBucketId: String = "__unassigned_audio__"
 )
 
 /* ───────────────────────────── Main ViewModel ───────────────────────────── */
 
-/**
- * Main ViewModel responsible for managing survey navigation and state.
- *
- * Responsibilities:
- * - Tracks the current node and navigation history.
- * - Keeps questions and answers per node.
- * - Manages AI follow-up questions and answers.
- * - Tracks recorded audio references per node (logical manifest).
- * - Exposes navigation helpers (advance, back, reset).
- * - Provides a stable UUID per survey run for export correlation.
- * - Builds prompts for BASE/EVAL/FOLLOWUP stages (Two-step).
- *
- * @property nav Navigation back-stack.
- * @property config Survey configuration loaded from JSON/YAML.
- */
 open class SurveyViewModel(
     private val nav: NavBackStack<NavKey>,
-    private val config: SurveyConfig
+    private val config: SurveyConfig,
+    private val hardening: HardeningOptions = HardeningOptions()
 ) : ViewModel(), TwoStepPromptProvider {
 
-    /**
-     * Survey graph as a map from node ID to [Node].
-     *
-     * NOTE:
-     * Must be initialized eagerly (val cannot be assigned in init).
-     */
-    private val graph: Map<String, Node> = buildGraphFromConfig(config)
+    private val DEBUG_LOGS: Boolean = hardening.debugLogs
+    private val STRICT_CONFIG: Boolean = hardening.strictConfig
+
+    // ----------------------------------------------------------
+    // DTO Access (No Kotlin-Reflect) — MUST be initialized BEFORE graph build
+    // ----------------------------------------------------------
 
     /**
-     * Read-only view of the runtime survey graph, keyed by node ID.
+     * Cache: (Class -> methodNameLower -> Method)
+     *
+     * IMPORTANT:
+     * This MUST be declared before graph/prompt parsing to avoid Kotlin init-order NPE.
      */
+    private val getterCache: ConcurrentHashMap<Class<*>, ConcurrentHashMap<String, Method>> =
+        ConcurrentHashMap()
+
+    private fun Any.cachedNoArgMethod(name: String): Method? {
+        val cls = this.javaClass
+
+        val map = if (hardening.ultraSafeMode) {
+            null
+        } else {
+            getterCache.getOrPut(cls) { ConcurrentHashMap() }
+        }
+
+        val key = name.lowercase(Locale.US)
+
+        if (map != null) {
+            map[key]?.let { return it }
+        }
+
+        val m = runCatching {
+            cls.methods.firstOrNull { it.parameterTypes.isEmpty() && it.name.equals(name, ignoreCase = true) }
+        }.getOrNull()
+
+        if (m != null && map != null) {
+            map[key] = m
+        }
+        return m
+    }
+
+    private fun Any.readStringGetter(names: List<String>): String {
+        if (this is Map<*, *>) {
+            for (n in names) {
+                val v = this.entries
+                    .firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }
+                    ?.value
+                val s = (v as? String)?.trim()
+                if (!s.isNullOrBlank()) return s
+            }
+        }
+
+        for (n in names) {
+            val cap = n.cap()
+            val m = cachedNoArgMethod("get$cap") ?: cachedNoArgMethod(n) ?: continue
+            val v = runCatching { m.invoke(this) }.getOrNull()
+            if (v is String) return v.trim()
+        }
+        return ""
+    }
+
+    private fun Any.readStringListGetter(names: List<String>): List<String> {
+        if (this is Map<*, *>) {
+            for (n in names) {
+                val v = this.entries
+                    .firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }
+                    ?.value
+                when (v) {
+                    is List<*> -> return v.filterIsInstance<String>()
+                    is Array<*> -> return v.filterIsInstance<String>()
+                }
+            }
+        }
+
+        for (n in names) {
+            val cap = n.cap()
+            val m = cachedNoArgMethod("get$cap") ?: cachedNoArgMethod(n) ?: continue
+            val v = runCatching { m.invoke(this) }.getOrNull()
+            when (v) {
+                is List<*> -> return v.filterIsInstance<String>()
+                is Array<*> -> return v.filterIsInstance<String>()
+            }
+        }
+        return emptyList()
+    }
+
+    private fun Any.readStringGetterOrNull(names: List<String>): String? =
+        readStringGetter(names).ifBlank { null }
+
+    private fun Any.readObjectGetterOrNull(names: List<String>): Any? {
+        if (this is Map<*, *>) {
+            for (n in names) {
+                val v = this.entries
+                    .firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }
+                    ?.value
+                if (v != null) return v
+            }
+        }
+
+        for (n in names) {
+            val cap = n.cap()
+            val m = cachedNoArgMethod("get$cap") ?: cachedNoArgMethod(n) ?: continue
+            return runCatching { m.invoke(this) }.getOrNull()
+        }
+        return null
+    }
+
+    private fun Any.readBooleanGetter(names: List<String>, defaultValue: Boolean): Boolean {
+        if (this is Map<*, *>) {
+            for (n in names) {
+                val v = this.entries
+                    .firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }
+                    ?.value
+                when (v) {
+                    is Boolean -> return v
+                    is Number -> return v.toInt() != 0
+                    is String -> {
+                        val s = v.trim().lowercase(Locale.US)
+                        when (s) {
+                            "true", "1", "yes", "y" -> return true
+                            "false", "0", "no", "n" -> return false
+                        }
+                    }
+                }
+            }
+        }
+
+        for (n in names) {
+            val cap = n.cap()
+            val m = cachedNoArgMethod("get$cap") ?: cachedNoArgMethod(n) ?: continue
+            val v = runCatching { m.invoke(this) }.getOrNull()
+            when (v) {
+                is Boolean -> return v
+                is String -> {
+                    val s = v.trim().lowercase(Locale.US)
+                    when (s) {
+                        "true", "1", "yes", "y" -> return true
+                        "false", "0", "no", "n" -> return false
+                    }
+                }
+                is Number -> return v.toInt() != 0
+            }
+        }
+        return defaultValue
+    }
+
+    private fun Any.readIntGetter(names: List<String>, defaultValue: Int): Int {
+        if (this is Map<*, *>) {
+            for (n in names) {
+                val v = this.entries
+                    .firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }
+                    ?.value
+                when (v) {
+                    is Int -> return v
+                    is Number -> return v.toInt()
+                    is String -> v.trim().toIntOrNull()?.let { return it }
+                }
+            }
+        }
+
+        for (n in names) {
+            val cap = n.cap()
+            val m = cachedNoArgMethod("get$cap") ?: cachedNoArgMethod(n) ?: continue
+            val v = runCatching { m.invoke(this) }.getOrNull()
+            when (v) {
+                is Int -> return v
+                is Number -> return v.toInt()
+                is String -> v.trim().toIntOrNull()?.let { return it }
+            }
+        }
+        return defaultValue
+    }
+
+    private fun String.cap(): String =
+        replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() }
+
+    // ----------------------------------------------------------
+    // Graph + Prompts (built from config)
+    // ----------------------------------------------------------
+
+    private val graph: Map<String, Node> = buildGraphFromConfig(config)
+
     val nodes: Map<String, Node>
         get() = graph
 
-    /**
-     * ID of the starting node defined in [SurveyConfig.graph.startId].
-     */
     private val startId: String = config.graph.startId
 
-    /**
-     * Internal stack that tracks the sequence of visited node IDs.
-     *
-     * The last element corresponds to the currently active node.
-     */
+    private val perNodeTwoStepPolicy = ConcurrentHashMap<String, TwoStepPolicy>()
+    private val globalTwoStepPolicy: TwoStepPolicy = readTwoStepPolicyFromConfig(config)
+    private val promptTemplates: List<PromptTemplate> = normalizePromptTemplates(config)
+    private val templateRegexCache = ConcurrentHashMap<String, Regex>()
+
+    // ----------------------------------------------------------
+    // Runtime state
+    // ----------------------------------------------------------
+
     private val nodeStack = ArrayDeque<String>()
 
-    /**
-     * Monotonically increasing survey session ID.
-     */
     private val _sessionId = MutableStateFlow(0L)
     val sessionId: StateFlow<Long> = _sessionId.asStateFlow()
 
-    /**
-     * Stable UUID for the active survey run.
-     */
     private val _surveyUuid = MutableStateFlow(UUID.randomUUID().toString())
     val surveyUuid: StateFlow<String> = _surveyUuid.asStateFlow()
 
-    /**
-     * Regenerate the survey UUID for a brand-new run.
-     */
     private fun regenerateSurveyUuid() {
         _surveyUuid.value = UUID.randomUUID().toString()
     }
 
-    /**
-     * StateFlow representing the currently active [Node].
-     */
-    private val _currentNode = MutableStateFlow(
-        Node(id = "Loading", type = NodeType.START)
-    )
+    private val _currentNode = MutableStateFlow(Node(id = "Loading", type = NodeType.START))
     val currentNode: StateFlow<Node> = _currentNode.asStateFlow()
 
-    /**
-     * Convenience accessor for the current node ID.
-     */
     val currentNodeId: String
         get() = _currentNode.value.id
 
-    /**
-     * Whether backwards navigation is currently possible.
-     */
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
 
-    /**
-     * UI-level event stream (snackbars, dialogs, etc.).
-     */
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 8)
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
 
@@ -280,13 +444,6 @@ open class SurveyViewModel(
         }
     }
 
-    /**
-     * Clear both single- and multi-choice selections for the current node.
-     *
-     * NOTE:
-     * This is intentionally aggressive. If you want "back preserves selection",
-     * remove calls to this in back/replace/push.
-     */
     fun clearSelections() {
         _single.value = null
         _multi.value = emptySet()
@@ -333,19 +490,6 @@ open class SurveyViewModel(
         }
     }
 
-    fun answerFollowupAt(nodeId: String, index: Int, answer: String) {
-        val a = answer.trim()
-        if (a.isBlank()) return
-
-        _followups.update { old ->
-            val mutable = old.mutableLinkedLists<FollowupEntry>()
-            val list = mutable[nodeId] ?: return@update old
-            if (index !in list.indices) return@update old
-            list[index] = list[index].copy(answer = a, answeredAt = System.currentTimeMillis())
-            mutable.toImmutableLists()
-        }
-    }
-
     fun clearFollowups(nodeId: String) {
         _followups.update { old ->
             val mutable = old.mutableLinkedLists<FollowupEntry>()
@@ -372,6 +516,69 @@ open class SurveyViewModel(
     private val _recordedAudioRefs = MutableStateFlow<Map<String, List<AudioRef>>>(LinkedHashMap())
     val recordedAudioRefs: StateFlow<Map<String, List<AudioRef>>> = _recordedAudioRefs.asStateFlow()
 
+    /**
+     * Records a voice export reference in the survey state.
+     *
+     * Accident-rate reduction:
+     * - If questionId is missing/blank, behavior depends on [hardening.voiceExportPolicy].
+     * - Default in RELEASE: store under a dedicated unassigned bucket to avoid mis-attachment.
+     */
+    @Synchronized
+    fun onVoiceExported(
+        questionId: String?,
+        fileName: String,
+        byteSize: Long? = null,
+        checksum: String? = null,
+        replace: Boolean = false
+    ) {
+        val qidFromArg = questionId?.trim().orEmpty()
+
+        val resolvedQid = when {
+            qidFromArg.isNotBlank() -> qidFromArg
+            else -> when (hardening.voiceExportPolicy) {
+                VoiceExportPolicy.STRICT_DROP -> {
+                    if (DEBUG_LOGS) Log.w(TAG, "onVoiceExported: missing questionId -> dropped. file=$fileName")
+                    emitSnack("Voice export missing questionId; ignored to avoid mis-attachment.")
+                    return
+                }
+                VoiceExportPolicy.STORE_UNASSIGNED -> hardening.unassignedVoiceBucketId
+                VoiceExportPolicy.ATTACH_TO_CURRENT_NODE -> currentNodeId
+            }
+        }
+
+        // Validate that questionId exists in the graph (fail-open in non-strict mode).
+        val finalQid = if (graph.containsKey(resolvedQid) || resolvedQid == hardening.unassignedVoiceBucketId) {
+            resolvedQid
+        } else {
+            if (STRICT_CONFIG) {
+                error("onVoiceExported: unknown questionId='$resolvedQid' (file=$fileName)")
+            }
+            if (DEBUG_LOGS) Log.w(TAG, "onVoiceExported: unknown questionId='$resolvedQid' -> storing unassigned. file=$fileName")
+            hardening.unassignedVoiceBucketId
+        }
+
+        if (replace) {
+            removeAudioRefsForQuestionInThisRun(finalQid)
+        }
+
+        addAudioRef(
+            questionId = finalQid,
+            fileName = fileName,
+            byteSize = byteSize,
+            checksum = checksum,
+            dedupByFileName = true
+        )
+    }
+
+    /**
+     * Adds a single audio reference entry.
+     *
+     * @param questionId Node id the audio belongs to.
+     * @param fileName File name of the exported audio.
+     * @param byteSize Optional file size.
+     * @param checksum Optional checksum.
+     * @param dedupByFileName If true, skip adding if same fileName already exists for the current run.
+     */
     @Synchronized
     fun addAudioRef(
         questionId: String,
@@ -389,105 +596,47 @@ open class SurveyViewModel(
             val list = mutable.getOrPut(questionId) { mutableListOf() }
             val existsSameRun = list.any { it.fileName == fn && it.surveyId == sid }
             if (!dedupByFileName || !existsSameRun) {
-                list.add(AudioRef(surveyId = sid, questionId = questionId, fileName = fn, byteSize = byteSize, checksum = checksum))
+                list.add(
+                    AudioRef(
+                        surveyId = sid,
+                        questionId = questionId,
+                        fileName = fn,
+                        byteSize = byteSize,
+                        checksum = checksum
+                    )
+                )
             }
             mutable.toImmutableLists()
         }
 
-        Log.d(TAG, "addAudioRef -> q=$questionId, file=$fn, sid=$sid")
+        if (DEBUG_LOGS) Log.d(TAG, "addAudioRef -> q=$questionId, file=$fn, sid=$sid")
     }
 
+    /**
+     * Removes audio refs for the given questionId in the current survey run (same surveyUuid).
+     */
     @Synchronized
-    fun replaceAudioRef(
-        questionId: String,
-        fileName: String,
-        byteSize: Long? = null,
-        checksum: String? = null
-    ) {
+    private fun removeAudioRefsForQuestionInThisRun(questionId: String) {
         val sid = surveyUuid.value
-        val fn = fileName.trim()
-        if (fn.isBlank()) return
-
-        _recordedAudioRefs.update { old ->
-            val mutable = old.mutableLinkedLists<AudioRef>()
-            mutable[questionId] = mutableListOf(
-                AudioRef(surveyId = sid, questionId = questionId, fileName = fn, byteSize = byteSize, checksum = checksum)
-            )
-            mutable.toImmutableLists()
-        }
-
-        Log.d(TAG, "replaceAudioRef -> q=$questionId, file=$fn, sid=$sid")
-    }
-
-    @Synchronized
-    fun removeAudioRef(questionId: String, fileName: String) {
-        val fn = fileName.trim()
-        if (fn.isBlank()) return
-
         _recordedAudioRefs.update { old ->
             val mutable = old.mutableLinkedLists<AudioRef>()
             val list = mutable[questionId] ?: return@update old
-            list.removeAll { it.fileName == fn }
+            list.removeAll { it.surveyId == sid }
             if (list.isEmpty()) mutable.remove(questionId)
             mutable.toImmutableLists()
         }
-
-        Log.d(TAG, "removeAudioRef -> q=$questionId, file=$fn")
-    }
-
-    @Synchronized
-    fun clearAudioRefs(questionId: String) {
-        _recordedAudioRefs.update { old ->
-            val mutable = old.mutableLinkedLists<AudioRef>()
-            mutable.remove(questionId)
-            mutable.toImmutableLists()
-        }
-        Log.d(TAG, "clearAudioRefs -> q=$questionId")
     }
 
     @Synchronized
     fun resetAudioRefs() {
         _recordedAudioRefs.value = LinkedHashMap()
-        Log.d(TAG, "resetAudioRefs -> cleared")
+        if (DEBUG_LOGS) Log.d(TAG, "resetAudioRefs -> cleared")
     }
 
     fun getAudioRefs(questionId: String): List<AudioRef> =
         recordedAudioRefs.value[questionId].orEmpty()
 
-    fun getAudioRefsForRun(surveyId: String = surveyUuid.value): Map<String, List<AudioRef>> {
-        return recordedAudioRefs.value
-            .mapValues { (_, list) -> list.filter { it.surveyId == surveyId } }
-            .filterValues { it.isNotEmpty() }
-    }
-
-    fun getAudioRefsForRunFlat(surveyId: String = surveyUuid.value): List<AudioRef> {
-        return getAudioRefsForRun(surveyId).values.flatten().sortedBy { it.createdAt }
-    }
-
-    fun hasAudioRef(questionId: String, surveyId: String = surveyUuid.value): Boolean {
-        return getAudioRefs(questionId).any { it.surveyId == surveyId }
-    }
-
-    fun onVoiceExported(
-        questionId: String,
-        fileName: String,
-        byteSize: Long? = null,
-        checksum: String? = null,
-        replace: Boolean = false
-    ) {
-        if (replace) {
-            replaceAudioRef(questionId, fileName, byteSize, checksum)
-        } else {
-            addAudioRef(questionId, fileName, byteSize, checksum, dedupByFileName = true)
-        }
-        Log.d(TAG, "onVoiceExported -> q=$questionId, file=$fileName, replace=$replace")
-    }
-
-    /* ───────────────────────────── Two-step Policy & Prompt Templates ───────────────────────────── */
-
-    private val perNodeTwoStepPolicy = ConcurrentHashMap<String, TwoStepPolicy>()
-    private val globalTwoStepPolicy: TwoStepPolicy = readTwoStepPolicyFromConfig(config)
-    private val promptTemplates: List<PromptTemplate> = normalizePromptTemplates(config)
+    /* ───────────────────────────── Two-step Prompt Provider ───────────────────────────── */
 
     fun setTwoStepPolicyOverride(nodeId: String, policy: TwoStepPolicy) {
         perNodeTwoStepPolicy[nodeId] = policy
@@ -497,18 +646,17 @@ open class SurveyViewModel(
         perNodeTwoStepPolicy.clear()
     }
 
-    /**
-     * Legacy BASE prompt builder (used by non-two-step flow too).
-     */
     fun getPrompt(nodeId: String, question: String, answer: String): String {
         val template =
             findTemplate(nodeId, PromptStage.BASE)
-                ?: findTemplate(nodeId, PromptStage.EVAL) // if only staged
+                ?: findTemplate(nodeId, PromptStage.EVAL)
                 ?: findAnyStageTemplateFallback(nodeId)
-                ?: run {
-                    Log.e(TAG, "No prompt defined for nodeId=$nodeId (BASE/EVAL/ANY).")
-                    throw IllegalArgumentException("No prompt defined for nodeId=$nodeId")
-                }
+
+        if (template == null) {
+            val msg = "No prompt defined for nodeId=$nodeId (BASE/EVAL/ANY)."
+            Log.e(TAG, msg)
+            if (STRICT_CONFIG) error(msg) else return buildDefaultBasePrompt(nodeId, question, answer)
+        }
 
         return renderTemplate(
             template = template,
@@ -525,10 +673,12 @@ open class SurveyViewModel(
             findTemplate(nodeId, PromptStage.EVAL)
                 ?: findTemplate(nodeId, PromptStage.BASE)
                 ?: findAnyStageTemplateFallback(nodeId)
-                ?: run {
-                    Log.e(TAG, "No prompt defined for nodeId=$nodeId (EVAL/BASE/ANY).")
-                    throw IllegalArgumentException("No prompt defined for nodeId=$nodeId (EVAL/BASE)")
-                }
+
+        if (template == null) {
+            val msg = "No prompt defined for nodeId=$nodeId (EVAL/BASE/ANY)."
+            Log.e(TAG, msg)
+            if (STRICT_CONFIG) error(msg) else return buildDefaultEvalPrompt(nodeId, question, answer)
+        }
 
         return renderTemplate(
             template = template,
@@ -569,10 +719,28 @@ open class SurveyViewModel(
     private fun renderTemplate(template: String, vars: Map<String, String>): String {
         var out = template
         for ((key, value) in vars) {
-            val pattern = Regex("\\{\\{\\s*$key\\s*\\}\\}")
-            out = out.replace(pattern, value)
+            val rx = templateRegexCache.getOrPut(key) {
+                Regex("\\{\\{\\s*${Regex.escape(key)}\\s*\\}\\}")
+            }
+            out = out.replace(rx) { value }
         }
         return out
+    }
+
+    private fun buildDefaultBasePrompt(nodeId: String, question: String, answer: String): String {
+        return """
+            You are a survey expert.
+            Task: Evaluate if the respondent's answer matches the intended question.
+            Output: JSON with fields: score (0-100), reasons, followups (0-3).
+
+            NodeId: ${nodeId.trim()}
+            Question: ${question.trim()}
+            Answer: ${answer.trim()}
+        """.trimIndent()
+    }
+
+    private fun buildDefaultEvalPrompt(nodeId: String, question: String, answer: String): String {
+        return buildDefaultBasePrompt(nodeId, question, answer)
     }
 
     private fun buildDefaultFollowupPrompt(
@@ -588,7 +756,7 @@ open class SurveyViewModel(
             - Output plain text only (no JSON, no markdown).
             - Keep it single-scope and answerable immediately.
             - Do not introduce new topics. Do not ask multiple questions.
-            
+
             NodeId: ${nodeId.trim()}
             Question: ${question.trim()}
             Answer: ${answer.trim()}
@@ -599,36 +767,12 @@ open class SurveyViewModel(
 
     private fun findTemplate(nodeId: String, stage: PromptStage): String? {
         val n = nodeId.trim()
-        val hit = promptTemplates.firstOrNull { it.nodeId == n && it.stage == stage && it.prompt.isNotBlank() }
-        if (hit != null) return hit.prompt
-
-        // Compatibility lookups for older key formats (stage embedded in key).
-        val legacyKeys = buildLegacyPromptKeys(n, stage)
-        for (k in legacyKeys) {
-            val legacyHit = promptTemplates.firstOrNull { it.nodeId == k && it.stage == stage && it.prompt.isNotBlank() }
-            if (legacyHit != null) return legacyHit.prompt
-        }
-        return null
+        return promptTemplates.firstOrNull { it.baseNodeId == n && it.stage == stage && it.prompt.isNotBlank() }?.prompt
     }
 
     private fun findAnyStageTemplateFallback(nodeId: String): String? {
         val n = nodeId.trim()
-        return promptTemplates.firstOrNull { it.nodeId == n && it.prompt.isNotBlank() }?.prompt
-    }
-
-    private fun buildLegacyPromptKeys(nodeId: String, stage: PromptStage): List<String> {
-        val s = stage.name.lowercase(Locale.US)
-        return listOf(
-            "$nodeId#$s",
-            "$nodeId:$s",
-            "$nodeId.$s",
-            "${nodeId}_$s",
-            "${nodeId}-$s",
-            "$s/$nodeId",
-            "$s:$nodeId",
-            "$s#$nodeId",
-            "$s.$nodeId"
-        ).distinct()
+        return promptTemplates.firstOrNull { it.baseNodeId == n && it.prompt.isNotBlank() }?.prompt
     }
 
     /* ───────────────────────────── Navigation ───────────────────────────── */
@@ -644,6 +788,10 @@ open class SurveyViewModel(
             NodeType.DONE -> FlowDone
         }
 
+    private fun safePopNavOne() {
+        if (nav.size > 0) nav.removeAt(nav.size - 1)
+    }
+
     @Synchronized
     private fun push(node: Node) {
         _currentNode.value = node
@@ -654,7 +802,7 @@ open class SurveyViewModel(
         nav.add(navKeyFor(node))
         updateCanGoBack()
 
-        Log.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
+        if (DEBUG_LOGS) Log.d(TAG, "push -> ${node.id}, navSize=${nav.size}, stackSize=${nodeStack.size}")
     }
 
     private fun ensureQuestion(id: String) {
@@ -669,29 +817,6 @@ open class SurveyViewModel(
         val node = nodeOf(nodeId)
         ensureQuestion(node.id)
         push(node)
-    }
-
-    @Synchronized
-    fun replaceTo(nodeId: String) {
-        val node = nodeOf(nodeId)
-        ensureQuestion(node.id)
-
-        if (nodeStack.isNotEmpty()) {
-            nodeStack.removeLast()
-            if (nav.size > 0) nav.removeAt(nav.size - 1)
-        }
-
-        push(node)
-        Log.d(TAG, "replaceTo -> ${node.id}")
-    }
-
-    @Synchronized
-    private fun resetNavToStart(start: Node) {
-        while (nav.size > 0) {
-            nav.removeAt(nav.size - 1)
-        }
-        nav.add(navKeyFor(start))
-        Log.d(TAG, "resetNavToStart -> navSize=${nav.size}")
     }
 
     @Synchronized
@@ -717,17 +842,19 @@ open class SurveyViewModel(
 
         _sessionId.update { it + 1 }
 
-        Log.d(TAG, "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}")
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "resetToStart -> ${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}")
+        }
     }
 
     @Synchronized
     fun backToPrevious() {
         if (nodeStack.size <= 1) {
-            Log.d(TAG, "backToPrevious: at root (no-op)")
+            if (DEBUG_LOGS) Log.d(TAG, "backToPrevious: at root (no-op)")
             return
         }
 
-        if (nav.size > 0) nav.removeAt(nav.size - 1)
+        safePopNavOne()
         nodeStack.removeLast()
 
         val prevId = nodeStack.last()
@@ -736,19 +863,19 @@ open class SurveyViewModel(
 
         clearSelections()
 
-        Log.d(TAG, "backToPrevious -> $prevId")
+        if (DEBUG_LOGS) Log.d(TAG, "backToPrevious -> $prevId")
     }
 
     @Synchronized
     fun advanceToNext() {
         val cur = _currentNode.value
         val nextId = cur.nextId ?: run {
-            Log.d(TAG, "advanceToNext: no nextId from ${cur.id}")
+            if (DEBUG_LOGS) Log.d(TAG, "advanceToNext: no nextId from ${cur.id}")
             return
         }
 
         if (!graph.containsKey(nextId)) {
-            throw IllegalStateException("nextId '$nextId' from node '${cur.id}' does not exist in graph.")
+            error("nextId '$nextId' from node '${cur.id}' does not exist in graph (graphSize=${graph.size}).")
         }
 
         ensureQuestion(nextId)
@@ -756,10 +883,37 @@ open class SurveyViewModel(
     }
 
     private fun nodeOf(id: String): Node =
-        graph[id] ?: error("Node not found: id=$id (defined nodes=${graph.keys})")
+        graph[id] ?: error("Node not found: id=$id (graphSize=${graph.size})")
 
     private fun updateCanGoBack() {
         _canGoBack.value = nodeStack.size > 1
+    }
+
+    private fun resetNavToStart(start: Node) {
+        while (nav.size > 0) nav.removeAt(nav.size - 1)
+        nav.add(navKeyFor(start))
+        if (DEBUG_LOGS) Log.d(TAG, "resetNavToStart -> navSize=${nav.size}")
+    }
+
+    private fun sanitizePreseededNavForStart(start: Node) {
+        val startKey = navKeyFor(start)
+
+        if (nav.size == 0) {
+            nav.add(startKey)
+            return
+        }
+
+        val last = runCatching { nav[nav.size - 1] }.getOrNull()
+        if (last != startKey) {
+            Log.w(TAG, "init: nav pre-seeded but last != startKey -> resetting to start. navSize=${nav.size}, last=$last, startKey=$startKey")
+            resetNavToStart(start)
+            return
+        }
+
+        if (nav.size > 1) {
+            Log.w(TAG, "init: nav pre-seeded with extra entries (navSize=${nav.size}) -> resetting to start to avoid desync with nodeStack.")
+            resetNavToStart(start)
+        }
     }
 
     /* ───────────────────────────── Initialization ───────────────────────────── */
@@ -772,37 +926,43 @@ open class SurveyViewModel(
         nodeStack.clear()
         nodeStack.addLast(start.id)
 
-        if (nav.size == 0) {
-            nav.add(navKeyFor(start))
-        } else {
-            Log.d(TAG, "init -> nav pre-seeded (navSize=${nav.size}), skipping initial nav.add()")
-        }
-
+        sanitizePreseededNavForStart(start)
         updateCanGoBack()
 
-        Log.d(
-            TAG,
-            "init -> start=${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, navSize=${nav.size}, " +
-                    "nodes=${graph.size}, prompts=${promptTemplates.size}, globalTwoStep=$globalTwoStepPolicy"
-        )
+        if (DEBUG_LOGS) {
+            Log.d(
+                TAG,
+                "init -> start=${start.id}, session=${_sessionId.value}, uuid=${_surveyUuid.value}, navSize=${nav.size}, " +
+                        "nodes=${graph.size}, prompts=${promptTemplates.size}, globalTwoStep=$globalTwoStepPolicy, hardening=$hardening"
+            )
+        }
     }
 
     /* ───────────────────────────── Config Parsing Helpers ───────────────────────────── */
 
     private fun buildGraphFromConfig(cfg: SurveyConfig): Map<String, Node> {
         val rawNodes = cfg.graph.nodes
-        val built = LinkedHashMap<String, Node>(rawNodes.size)
+        val capacity = (rawNodes as? Collection<*>)?.size ?: 16
+        val built = LinkedHashMap<String, Node>(capacity)
 
         for (dto in rawNodes) {
-            val any = dto as Any
+            val any = dto as? Any ?: continue
 
-            val id = any.readStringGetter(listOf("id", "nodeId", "key")).ifBlank {
-                throw IllegalStateException("Graph node DTO missing id: ${any.javaClass.name}")
+            val id = any.readStringGetter(listOf("id", "nodeId", "key")).trim()
+            if (id.isBlank()) {
+                val msg = "Graph node DTO missing id: ${any.javaClass.name}"
+                Log.e(TAG, msg)
+                if (STRICT_CONFIG) error(msg)
+                if (hardening.skipInvalidGraphNodes) continue
+                continue
             }
 
             val typeRaw = any.readStringGetter(listOf("type", "nodeType")).ifBlank { "TEXT" }
             val type = runCatching { NodeType.valueOf(typeRaw.trim().uppercase(Locale.US)) }
-                .getOrElse { NodeType.TEXT }
+                .getOrElse {
+                    Log.w(TAG, "Unknown node type='$typeRaw' for id=$id -> defaulting to TEXT")
+                    NodeType.TEXT
+                }
 
             val title = any.readStringGetter(listOf("title", "label"))
             val question = any.readStringGetter(listOf("question", "text", "prompt"))
@@ -828,62 +988,76 @@ open class SurveyViewModel(
 
     private fun normalizePromptTemplates(cfg: SurveyConfig): List<PromptTemplate> {
         val raw = cfg.prompts
-        val out = ArrayList<PromptTemplate>(raw.size)
+        val capacity = (raw as? Collection<*>)?.size ?: 16
+        val out = ArrayList<PromptTemplate>(capacity)
 
-        for (dto in raw) {
-            val any = dto as Any
+        PROMPTS@ for (dto in raw) {
+            val any = dto as? Any ?: continue@PROMPTS
 
-            val rawNodeId = any.readStringGetter(listOf("nodeId", "id", "key")).ifBlank {
+            val rawNodeKey = any.readStringGetter(listOf("nodeId", "id", "key")).trim()
+            if (rawNodeKey.isBlank()) {
                 Log.w(TAG, "Prompt DTO missing nodeId/id/key: ${any.javaClass.name}")
-                continue
+                if (hardening.skipInvalidPromptDtos) continue@PROMPTS
+                if (STRICT_CONFIG) error("Prompt DTO missing nodeId/id/key: ${any.javaClass.name}")
+                continue@PROMPTS
             }
 
             val promptText = any.readStringGetter(listOf("prompt", "template", "text", "body"))
-            if (promptText.isBlank()) continue
+            if (promptText.isBlank()) continue@PROMPTS
 
             val rawStage = any.readStringGetterOrNull(listOf("stage", "kind", "mode", "type"))
+            val (baseNodeId, stage) = decodePromptNodeAndStage(rawNodeKey, rawStage)
 
-            val (nodeId, stage) = decodePromptNodeAndStage(rawNodeId, rawStage)
-            out.add(PromptTemplate(nodeId = nodeId, stage = stage, prompt = promptText))
+            out.add(
+                PromptTemplate(
+                    baseNodeId = baseNodeId,
+                    stage = stage,
+                    prompt = promptText,
+                    rawKey = rawNodeKey
+                )
+            )
         }
 
         if (out.isEmpty()) {
             Log.w(TAG, "normalizePromptTemplates -> 0 templates (config.prompts was empty or unparseable)")
-        } else {
+        } else if (DEBUG_LOGS) {
             val stageCount = out.groupingBy { it.stage }.eachCount()
-            Log.d(TAG, "normalizePromptTemplates -> total=${out.size}, stages=$stageCount, distinctNodes=${out.map { it.nodeId }.distinct().size}")
+            Log.d(
+                TAG,
+                "normalizePromptTemplates -> total=${out.size}, stages=$stageCount, distinctNodes=${out.map { it.baseNodeId }.distinct().size}"
+            )
         }
 
         return out
     }
 
-    private fun decodePromptNodeAndStage(nodeIdRaw: String, stageRaw: String?): Pair<String, PromptStage> {
-        val nid = nodeIdRaw.trim()
-        val s = stageRaw?.trim()?.lowercase(Locale.US)
+    private fun decodePromptNodeAndStage(nodeKeyRaw: String, stageRaw: String?): Pair<String, PromptStage> {
+        val rawKey = nodeKeyRaw.trim()
+        val stageField = stageRaw?.trim()?.lowercase(Locale.US)
 
-        val (baseFromId, stageFromId) = decodeStageFromNodeId(nid)
+        val (baseFromKey, stageFromKey) = decodeStageFromNodeKey(rawKey)
 
-        val stageFromField = when (s) {
+        val stageFromField = when (stageField) {
             "eval" -> PromptStage.EVAL
             "followup", "follow_up", "follow-up", "fu" -> PromptStage.FOLLOWUP
             "base", null, "" -> PromptStage.BASE
             else -> PromptStage.BASE
         }
 
-        val stage = if (!s.isNullOrBlank()) stageFromField else (stageFromId ?: PromptStage.BASE)
-        return baseFromId to stage
+        val stage = if (!stageField.isNullOrBlank()) stageFromField else (stageFromKey ?: PromptStage.BASE)
+        return baseFromKey to stage
     }
 
-    private fun decodeStageFromNodeId(nodeId: String): Pair<String, PromptStage?> {
-        val nid = nodeId.trim()
+    private fun decodeStageFromNodeKey(nodeKey: String): Pair<String, PromptStage?> {
+        val k = nodeKey.trim()
 
-        val partsHash = nid.split("#", limit = 2)
+        val partsHash = k.split("#", limit = 2)
         if (partsHash.size == 2) {
             val st = partsHash[1].toStageOrNull()
             if (st != null) return partsHash[0] to st
         }
 
-        val partsColon = nid.split(":", limit = 2)
+        val partsColon = k.split(":", limit = 2)
         if (partsColon.size == 2) {
             val left = partsColon[0]
             val right = partsColon[1]
@@ -892,31 +1066,31 @@ open class SurveyViewModel(
             return when {
                 rightStage != null -> left to rightStage
                 leftStage != null -> right to leftStage
-                else -> nid to null
+                else -> k to null
             }
         }
 
-        val partsDot = nid.split(".", limit = 2)
+        val partsDot = k.split(".", limit = 2)
         if (partsDot.size == 2) {
             val rightStage = partsDot[1].toStageOrNull()
             if (rightStage != null) return partsDot[0] to rightStage
         }
 
-        val slash = nid.split("/", limit = 2)
+        val slash = k.split("/", limit = 2)
         if (slash.size == 2) {
             val leftStage = slash[0].toStageOrNull()
             if (leftStage != null) return slash[1] to leftStage
         }
 
         listOf("_", "-").forEach { sep ->
-            val p = nid.split(sep, limit = 2)
+            val p = k.split(sep, limit = 2)
             if (p.size == 2) {
                 val rightStage = p[1].toStageOrNull()
                 if (rightStage != null) return p[0] to rightStage
             }
         }
 
-        return nid to null
+        return k to null
     }
 
     private fun String.toStageOrNull(): PromptStage? {
@@ -928,8 +1102,13 @@ open class SurveyViewModel(
         }
     }
 
-    private fun defaultGlobalTwoStepPolicy(): TwoStepPolicy =
-        TwoStepPolicy(enabled = false, okScoreThreshold = 85, skipFollowupWhenOk = true)
+    private fun defaultGlobalTwoStepPolicy(): TwoStepPolicy {
+        return TwoStepPolicy(
+            enabled = false,
+            okScoreThreshold = 85,
+            skipFollowupWhenOk = true
+        )
+    }
 
     private fun readTwoStepPolicyFromConfig(cfg: SurveyConfig): TwoStepPolicy {
         val root = cfg as Any
@@ -948,7 +1127,11 @@ open class SurveyViewModel(
             defaultValue = true
         )
 
-        return TwoStepPolicy(enabled = enabled, okScoreThreshold = threshold, skipFollowupWhenOk = skip)
+        return TwoStepPolicy(
+            enabled = enabled,
+            okScoreThreshold = threshold,
+            skipFollowupWhenOk = skip
+        )
     }
 
     /* ───────────────────────────── Map Helpers ───────────────────────────── */
@@ -963,157 +1146,4 @@ open class SurveyViewModel(
 
     private fun <T> LinkedHashMap<String, MutableList<T>>.toImmutableLists(): Map<String, List<T>> =
         this.mapValues { (_, list) -> list.toList() }
-
-    /* ───────────────────────────── DTO Access (No Kotlin-Reflect) ───────────────────────────── */
-
-    private fun Any.readStringGetter(names: List<String>): String {
-        if (this is Map<*, *>) {
-            val hit = names.firstNotNullOfOrNull { name ->
-                val v = this.entries.firstOrNull { (k, _) -> (k as? String)?.equals(name, ignoreCase = true) == true }?.value
-                (v as? String)?.trim()
-            }
-            if (!hit.isNullOrBlank()) return hit
-        }
-
-        for (n in names) {
-            val m = javaClass.methods.firstOrNull {
-                it.parameterTypes.isEmpty() && (
-                        it.name.equals("get${n.cap()}", ignoreCase = true) ||
-                                it.name.equals(n, ignoreCase = true)
-                        )
-            } ?: continue
-
-            val v = runCatching { m.invoke(this) }.getOrNull()
-            if (v is String) return v
-        }
-        return ""
-    }
-
-    private fun Any.readStringListGetter(names: List<String>): List<String> {
-        if (this is Map<*, *>) {
-            for (n in names) {
-                val v = this.entries.firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }?.value
-                when (v) {
-                    is List<*> -> return v.filterIsInstance<String>()
-                    is Array<*> -> return v.filterIsInstance<String>()
-                }
-            }
-        }
-
-        for (n in names) {
-            val m = javaClass.methods.firstOrNull {
-                it.parameterTypes.isEmpty() && (
-                        it.name.equals("get${n.cap()}", ignoreCase = true) ||
-                                it.name.equals(n, ignoreCase = true)
-                        )
-            } ?: continue
-
-            val v = runCatching { m.invoke(this) }.getOrNull()
-            when (v) {
-                is List<*> -> return v.filterIsInstance<String>()
-                is Array<*> -> return v.filterIsInstance<String>()
-            }
-        }
-        return emptyList()
-    }
-
-    private fun Any.readStringGetterOrNull(names: List<String>): String? {
-        val s = readStringGetter(names)
-        return s.ifBlank { null }
-    }
-
-    private fun Any.readObjectGetterOrNull(names: List<String>): Any? {
-        if (this is Map<*, *>) {
-            for (n in names) {
-                val v = this.entries.firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }?.value
-                if (v != null) return v
-            }
-        }
-
-        for (n in names) {
-            val m = javaClass.methods.firstOrNull {
-                it.parameterTypes.isEmpty() && (
-                        it.name.equals("get${n.cap()}", ignoreCase = true) ||
-                                it.name.equals(n, ignoreCase = true)
-                        )
-            } ?: continue
-            return runCatching { m.invoke(this) }.getOrNull()
-        }
-        return null
-    }
-
-    private fun Any.readBooleanGetter(names: List<String>, defaultValue: Boolean): Boolean {
-        if (this is Map<*, *>) {
-            for (n in names) {
-                val v = this.entries.firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }?.value
-                when (v) {
-                    is Boolean -> return v
-                    is Number -> return v.toInt() != 0
-                    is String -> {
-                        val s = v.trim().lowercase(Locale.US)
-                        when (s) {
-                            "true", "1", "yes", "y" -> return true
-                            "false", "0", "no", "n" -> return false
-                        }
-                    }
-                }
-            }
-        }
-
-        for (n in names) {
-            val m = javaClass.methods.firstOrNull {
-                it.parameterTypes.isEmpty() && (
-                        it.name.equals("get${n.cap()}", ignoreCase = true) ||
-                                it.name.equals(n, ignoreCase = true)
-                        )
-            } ?: continue
-
-            val v = runCatching { m.invoke(this) }.getOrNull()
-            when (v) {
-                is Boolean -> return v
-                is String -> {
-                    val s = v.trim().lowercase(Locale.US)
-                    when (s) {
-                        "true", "1", "yes", "y" -> return true
-                        "false", "0", "no", "n" -> return false
-                    }
-                }
-                is Number -> return v.toInt() != 0
-            }
-        }
-        return defaultValue
-    }
-
-    private fun Any.readIntGetter(names: List<String>, defaultValue: Int): Int {
-        if (this is Map<*, *>) {
-            for (n in names) {
-                val v = this.entries.firstOrNull { (k, _) -> (k as? String)?.equals(n, ignoreCase = true) == true }?.value
-                when (v) {
-                    is Int -> return v
-                    is Number -> return v.toInt()
-                    is String -> v.trim().toIntOrNull()?.let { return it }
-                }
-            }
-        }
-
-        for (n in names) {
-            val m = javaClass.methods.firstOrNull {
-                it.parameterTypes.isEmpty() && (
-                        it.name.equals("get${n.cap()}", ignoreCase = true) ||
-                                it.name.equals(n, ignoreCase = true)
-                        )
-            } ?: continue
-
-            val v = runCatching { m.invoke(this) }.getOrNull()
-            when (v) {
-                is Int -> return v
-                is Number -> return v.toInt()
-                is String -> v.trim().toIntOrNull()?.let { return it }
-            }
-        }
-        return defaultValue
-    }
-
-    private fun String.cap(): String =
-        replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() }
 }

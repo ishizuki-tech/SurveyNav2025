@@ -17,6 +17,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
@@ -28,14 +29,17 @@ import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -64,12 +68,30 @@ private const val DEFAULT_TOPP = 0.9f
 private const val DEFAULT_TEMPERATURE = 0.7f
 
 /**
+ * Idle cleanup delay:
+ * - Calling cleanUp() schedules a deferred cleanup instead of immediate teardown.
+ * - Any new init/runInference cancels the scheduled cleanup.
+ *
+ * WHY:
+ * - Prevents "rid=1 cleaned up -> rid=2 starts -> not initialized" races.
+ * - Greatly reduces back-to-back native teardown / init churn.
+ */
+private const val IDLE_CLEANUP_MS = 12_000L
+
+/**
  * Grace windows:
  * - After we "logically terminate" (cancel/watchdog), allow some time before closing native objects.
  * - This reduces late-callback-vs-close races.
  */
 private const val CLOSE_GRACE_MS = 5_000L
 private const val RETIRED_CLOSE_GRACE_MS = 1_500L
+
+/**
+ * Post-terminate cooldown:
+ * - Even if onDone() arrived, native teardown may still be in progress.
+ * - We delay the next start a little to reduce back-to-back SIGSEGV risk.
+ */
+private const val POST_TERMINATE_COOLDOWN_MS = 250L
 
 /**
  * Streaming debug toggles.
@@ -108,6 +130,10 @@ data class LiteRtLmInstance(
  * - Ignore late callbacks using a monotonically increasing runId.
  * - Defer cleanup/reset/replace until after stream termination.
  * - Provide a "logical cancel" (SDK may not truly cancel).
+ *
+ * Maintenance goals:
+ * - Make cleanUp() safe even if called after every request.
+ * - Centralize teardown policy (idle cleanup + cancellation).
  */
 object LiteRtLM {
 
@@ -117,7 +143,7 @@ object LiteRtLM {
     /** Dedicated IO scope for init/cleanup work. */
     private val ioScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /** Global lock for instance map + state transitions. */
+    /** Global lock for instance map + lifecycle transitions. */
     private val stateMutex: Mutex = Mutex()
 
     /** Per-runtime LiteRT-LM runtime instances keyed by runtimeKey(model). */
@@ -138,6 +164,9 @@ object LiteRtLM {
     /** Busy flag used only by generateText() (suspend API). */
     private val busy: AtomicBoolean = AtomicBoolean(false)
 
+    /** Scheduled idle cleanup jobs (per key). */
+    private val cleanupJobs: ConcurrentHashMap<String, Job> = ConcurrentHashMap()
+
     /** Returns `true` when a generateText call is currently in progress. */
     fun isBusy(): Boolean = busy.get()
 
@@ -155,20 +184,197 @@ object LiteRtLM {
         val terminated: AtomicBoolean = AtomicBoolean(false),
         val cancelRequested: AtomicBoolean = AtomicBoolean(false),
         val runId: AtomicLong = AtomicLong(0L),
+
+        /** Monotonic timestamp (elapsedRealtime) when terminateOnce() ran. */
         val lastTerminateAtMs: AtomicLong = AtomicLong(0L),
+
+        /** Monotonic timestamp (elapsedRealtime) of last "use" (init/run/reset). */
+        val lastUseAtMs: AtomicLong = AtomicLong(0L),
+
+        /** Do not allow a new start until this monotonic time (elapsedRealtime). */
+        val cooldownUntilMs: AtomicLong = AtomicLong(0L),
+
+        /** Best-effort logical terminator installed by runInference(). */
         val terminator: AtomicReference<(() -> Unit)?> = AtomicReference(null),
+
+        /**
+         * Cleanup generation token.
+         *
+         * IMPORTANT:
+         * - Idle cleanup captures a token value. It must match at close time.
+         * - Any "use" (init/run/reset) increments this to invalidate stale cleanups.
+         * - This prevents races where a cleanup job passes pre-checks and then closes
+         *   right when a new run begins.
+         */
+        val cleanupToken: AtomicLong = AtomicLong(0L),
     )
 
-    private val runStates: MutableMap<String, RunState> = ConcurrentHashMap()
+    private val runStates: ConcurrentHashMap<String, RunState> = ConcurrentHashMap()
 
-    /** Get or create per-key run state. */
-    private fun getRunState(key: String): RunState = runStates.getOrPut(key) { RunState() }
+    /** Get or create per-key run state (thread-safe). */
+    private fun getRunState(key: String): RunState {
+        val existing = runStates[key]
+        if (existing != null) return existing
+        val created = RunState()
+        val prev = runStates.putIfAbsent(key, created)
+        return prev ?: created
+    }
+
+    /**
+     * Touch last-use time and invalidate any scheduled cleanup.
+     *
+     * WHY:
+     * - Even if a cleanup Job cannot be cancelled in time, token invalidation
+     *   ensures it becomes a no-op at the final close check.
+     */
+    private fun markUsed(key: String) {
+        val now = SystemClock.elapsedRealtime()
+        val rs = getRunState(key)
+        rs.lastUseAtMs.set(now)
+        rs.cleanupToken.incrementAndGet()
+    }
+
+    /** Cancel any scheduled idle cleanup for this key. */
+    private fun cancelScheduledCleanup(key: String, reason: String) {
+        val job = cleanupJobs.remove(key)
+        if (job != null) {
+            job.cancel()
+            Log.d(TAG, "Idle cleanup cancelled: key='$key' reason='$reason'")
+        }
+    }
+
+    /**
+     * Schedule an idle cleanup:
+     * - Debounced: cancels previous scheduled cleanup for this key.
+     * - Safe: checks lastUse/active/initInFlight before closing native objects.
+     * - Token-guarded: will not close if a newer "use" happened.
+     */
+    private fun scheduleIdleCleanup(key: String, delayMs: Long, reason: String) {
+        cancelScheduledCleanup(key, "reschedule:$reason")
+
+        val tokenAtSchedule = getRunState(key).cleanupToken.get()
+
+        val job = ioScope.launch {
+            Log.d(TAG, "Idle cleanup scheduled: key='$key' in ${delayMs}ms reason='$reason'")
+            delay(delayMs)
+
+            // Close under lock with token + idleness checks.
+            closeInstanceIfStillIdle(
+                key = key,
+                requiredIdleMs = delayMs,
+                requiredToken = tokenAtSchedule,
+                reason = "idle:$reason"
+            )
+        }
+
+        cleanupJobs[key] = job
+    }
+
+    /**
+     * Close and remove an instance NOW (best-effort).
+     *
+     * IMPORTANT:
+     * - This method is the only place that removes from instances + closes native objects.
+     * - It respects CLOSE_GRACE_MS after termination to avoid late-callback-vs-close races.
+     */
+    private suspend fun closeInstanceNowBestEffort(key: String, reason: String) {
+        val instance: LiteRtLmInstance? = stateMutex.withLock {
+            // Refuse to close while streaming.
+            val rs = getRunState(key)
+            if (rs.active.get()) return@withLock null
+            pendingAfterStream.remove(key)
+            instances.remove(key)
+        }
+
+        if (instance == null) {
+            Log.d(TAG, "closeInstanceNowBestEffort: nothing to close (or active): key='$key' reason='$reason'")
+            return
+        }
+
+        val rs = getRunState(key)
+        val now = SystemClock.elapsedRealtime()
+        val sinceTerminate = now - rs.lastTerminateAtMs.get()
+        val extraDelay = if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
+        if (extraDelay > 0) delay(extraDelay)
+
+        runCatching { instance.conversation.close() }
+            .onFailure { Log.e(TAG, "Failed to close conversation: key='$key' reason='$reason' err=${it.message}", it) }
+        runCatching { instance.engine.close() }
+            .onFailure { Log.e(TAG, "Failed to close engine: key='$key' reason='$reason' err=${it.message}", it) }
+
+        Log.d(TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
+    }
+
+    /**
+     * Token + idleness guarded closer for idle cleanup.
+     *
+     * It will only close if:
+     * - No active stream
+     * - No init in flight
+     * - Still idle for >= requiredIdleMs
+     * - cleanupToken has not changed since scheduling
+     */
+    private suspend fun closeInstanceIfStillIdle(
+        key: String,
+        requiredIdleMs: Long,
+        requiredToken: Long,
+        reason: String,
+    ) {
+        val (instance, now, idleFor, tokenNow) = stateMutex.withLock {
+            val rs = getRunState(key)
+            val nowInner = SystemClock.elapsedRealtime()
+            val idleForInner = nowInner - rs.lastUseAtMs.get()
+            val tokenInner = rs.cleanupToken.get()
+
+            if (rs.active.get()) {
+                Log.d(TAG, "Idle cleanup skipped (active stream): key='$key'")
+                return
+            }
+            if (initInFlight.contains(key)) {
+                Log.d(TAG, "Idle cleanup skipped (init in flight): key='$key'")
+                return
+            }
+            if (tokenInner != requiredToken) {
+                Log.d(TAG, "Idle cleanup skipped (token changed): key='$key' required=$requiredToken now=$tokenInner")
+                return
+            }
+            if (idleForInner < requiredIdleMs) {
+                Log.d(TAG, "Idle cleanup skipped (recent use): key='$key' idleFor=${idleForInner}ms < ${requiredIdleMs}ms")
+                return
+            }
+
+            pendingAfterStream.remove(key)
+            val inst = instances.remove(key)
+            if (inst == null) {
+                Log.d(TAG, "Idle cleanup: nothing to close: key='$key'")
+                return
+            }
+
+            Quad(inst, nowInner, idleForInner, tokenInner)
+        } ?: return
+
+        // Apply close grace based on lastTerminateAtMs.
+        val rs = getRunState(key)
+        val sinceTerminate = now - rs.lastTerminateAtMs.get()
+        val extraDelay = if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
+        if (extraDelay > 0) delay(extraDelay)
+
+        runCatching { instance.conversation.close() }
+            .onFailure { Log.e(TAG, "Failed to close conversation: key='$key' reason='$reason' err=${it.message}", it) }
+        runCatching { instance.engine.close() }
+            .onFailure { Log.e(TAG, "Failed to close engine: key='$key' reason='$reason' err=${it.message}", it) }
+
+        Log.d(TAG, "LiteRT-LM closed: key='$key' reason='$reason' idleFor=${idleFor}ms token=$tokenNow")
+    }
+
+    /** Small tuple helper (avoids Pair nesting). */
+    private data class Quad<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
 
     /** Normalize accelerator string for stable backend selection. */
     private fun normalizedAccelerator(model: Model): String {
         return model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
             .trim()
-            .uppercase()
+            .uppercase(Locale.US)
             .ifBlank { Accelerator.GPU.label }
     }
 
@@ -309,7 +515,6 @@ object LiteRtLM {
 
         // Bounded O(n^2) but maxWindow is small; OK for streaming.
         for (k in maxK downTo 1) {
-            // aWin suffix length k equals b prefix length k
             val aPos = aWin.length - k
             if (aWin.regionMatches(aPos, b, 0, k, ignoreCase = false)) return k
         }
@@ -328,18 +533,15 @@ object LiteRtLM {
         if (newSnapshot.isEmpty()) return "" to emittedSoFar
         if (emittedSoFar.isEmpty()) return newSnapshot to newSnapshot
 
-        // Mode A: cumulative snapshot.
         if (newSnapshot.length >= emittedSoFar.length && newSnapshot.startsWith(emittedSoFar)) {
             val delta = newSnapshot.substring(emittedSoFar.length)
             return delta to newSnapshot
         }
 
-        // Regression (older snapshot): ignore.
         if (emittedSoFar.length > newSnapshot.length && emittedSoFar.startsWith(newSnapshot)) {
             return "" to emittedSoFar
         }
 
-        // Mode B/C: chunk or tail-with-overlap.
         val ov = overlapSuffixPrefix(emittedSoFar, newSnapshot)
         val delta = newSnapshot.substring(ov)
         return delta to (emittedSoFar + delta)
@@ -347,13 +549,9 @@ object LiteRtLM {
 
     /**
      * Heuristic default max tokens by model name.
-     *
-     * NOTE:
-     * - Many chat-ready LiteRT-LM models are 4096 context.
-     * - FunctionGemma-270M is commonly 1024 context.
      */
     private fun defaultMaxTokensForModel(modelName: String): Int {
-        val n = modelName.lowercase()
+        val n = modelName.lowercase(Locale.US)
         return if (n.contains("functiongemma") || n.contains("270m") || n.contains("tinygarden")) 1024 else 4096
     }
 
@@ -363,6 +561,7 @@ object LiteRtLM {
      * Rules:
      * - If a stream is active, init is rejected (caller should retry after termination).
      * - If init is already in progress for the same key, returns an error.
+     * - Cancels any pending idle cleanup (init is a "use").
      */
     fun initialize(
         context: Context,
@@ -374,6 +573,10 @@ object LiteRtLM {
         tools: List<Any> = emptyList(),
     ) {
         val key = runtimeKey(model)
+
+        // Mark "use" early so any idle cleanup that wakes up will skip closing.
+        markUsed(key)
+        cancelScheduledCleanup(key, "initialize")
 
         val accepted = initInFlight.add(key)
         if (!accepted) {
@@ -435,7 +638,6 @@ object LiteRtLM {
                         it.initialize()
                     }
                 }.getOrElse { first ->
-                    // Safe fallback to CPU only for text-only models.
                     if (backend == Backend.GPU && !supportImage && !supportAudio) {
                         Log.w(TAG, "GPU init failed; falling back to CPU: ${first.message}")
                         engineConfig = buildConfig(Backend.CPU)
@@ -500,6 +702,7 @@ object LiteRtLM {
      * Suspend-style initializer.
      *
      * Uses apiMutex to prevent double init and to avoid init-vs-generateText overlap.
+     * Cancels any pending idle cleanup (init is a "use").
      */
     suspend fun initializeIfNeeded(
         context: Context,
@@ -510,6 +713,9 @@ object LiteRtLM {
         tools: List<Any> = emptyList(),
     ) {
         val key = runtimeKey(model)
+
+        markUsed(key)
+        cancelScheduledCleanup(key, "initializeIfNeeded")
 
         stateMutex.withLock {
             if (instances.containsKey(key)) return
@@ -550,6 +756,7 @@ object LiteRtLM {
      * Reset conversation (reuse engine) safely.
      *
      * If a stream is active, reset is deferred until the stream terminates.
+     * Cancels any pending idle cleanup (reset is a "use").
      */
     fun resetConversation(
         model: Model,
@@ -559,6 +766,9 @@ object LiteRtLM {
         tools: List<Any> = emptyList(),
     ) {
         val key = runtimeKey(model)
+
+        markUsed(key)
+        cancelScheduledCleanup(key, "resetConversation")
 
         ioScope.launch {
             val action: () -> Unit = {
@@ -629,37 +839,57 @@ object LiteRtLM {
     }
 
     /**
-     * Fully release Engine + Conversation safely.
+     * Request a deferred idle cleanup.
      *
-     * If a stream is active, cleanup is deferred until stream termination.
+     * IMPORTANT CHANGE:
+     * - This no longer destroys the model immediately.
+     * - It schedules cleanup after [IDLE_CLEANUP_MS] of idleness and cancels if used again.
+     *
+     * WHY:
+     * - Prevents "cleanUp after every request" from causing "not initialized" on back-to-back calls.
      */
     fun cleanUp(model: Model, onDone: () -> Unit) {
         val key = runtimeKey(model)
 
+        // Do NOT markUsed() here; cleanup is not a "use".
+
+        ioScope.launch {
+            val action: () -> Unit = {
+                scheduleIdleCleanup(key, IDLE_CLEANUP_MS, "explicit-cleanUp")
+                postToMain { onDone() }
+            }
+
+            val defer = stateMutex.withLock { getRunState(key).active.get() }
+            if (defer) {
+                stateMutex.withLock { pendingAfterStream.getOrPut(key) { mutableListOf() }.add(action) }
+                Log.w(TAG, "cleanUp deferred (will schedule after stream): key='$key'")
+                postToMain { onDone() }
+                return@launch
+            }
+
+            action.invoke()
+        }
+    }
+
+    /**
+     * Force immediate teardown (use sparingly).
+     *
+     * Use cases:
+     * - App shutdown / explicit memory pressure response.
+     * - You truly want to free native memory now.
+     *
+     * NOTE:
+     * - If a stream is active, the teardown is deferred until termination.
+     */
+    fun forceCleanUp(model: Model, onDone: () -> Unit) {
+        val key = runtimeKey(model)
+
+        cancelScheduledCleanup(key, "forceCleanUp")
+
         ioScope.launch {
             val action: () -> Unit = {
                 ioScope.launch {
-                    val instance: LiteRtLmInstance? = stateMutex.withLock { instances.remove(key) }
-                    if (instance == null) {
-                        postToMain { onDone() }
-                        return@launch
-                    }
-
-                    // If we terminated recently (cancel/watchdog), give extra grace before closing native objects.
-                    val rs = stateMutex.withLock { getRunState(key) }
-                    val now = System.currentTimeMillis()
-                    val sinceTerminate = now - rs.lastTerminateAtMs.get()
-                    val extraDelay =
-                        if (sinceTerminate in 0..CLOSE_GRACE_MS) (CLOSE_GRACE_MS - sinceTerminate) else 0L
-
-                    if (extraDelay > 0) delay(extraDelay)
-
-                    runCatching { instance.conversation.close() }
-                        .onFailure { Log.e(TAG, "Failed to close conversation: ${it.message}", it) }
-                    runCatching { instance.engine.close() }
-                        .onFailure { Log.e(TAG, "Failed to close engine: ${it.message}", it) }
-
-                    Log.d(TAG, "LiteRT-LM cleaned up: key='$key'")
+                    closeInstanceNowBestEffort(key, "forceCleanUp")
                     postToMain { onDone() }
                 }
             }
@@ -667,7 +897,8 @@ object LiteRtLM {
             val defer = stateMutex.withLock { getRunState(key).active.get() }
             if (defer) {
                 stateMutex.withLock { pendingAfterStream.getOrPut(key) { mutableListOf() }.add(action) }
-                Log.w(TAG, "cleanUp deferred: active stream in progress for key='$key'")
+                Log.w(TAG, "forceCleanUp deferred: active stream in progress for key='$key'")
+                postToMain { onDone() }
                 return@launch
             }
 
@@ -694,10 +925,64 @@ object LiteRtLM {
     ) {
         val key = runtimeKey(model)
 
+        // Mark as used and cancel any scheduled cleanup immediately.
+        markUsed(key)
+        cancelScheduledCleanup(key, "runInference")
+
         ioScope.launch {
-            val instance = stateMutex.withLock { instances[key] }
-            if (instance == null) {
-                val msg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
+
+            // Start-window race fix:
+            // Acquire stateMutex and set rs.active BEFORE any lifecycle ops can swap/close conversations.
+            var instance: LiteRtLmInstance? = null
+            var rs: RunState? = null
+            var myRunId = 0L
+            var conversation: Conversation? = null
+            var rejectMsg: String? = null
+            var cooldownDelayMs = 0L
+
+            stateMutex.withLock {
+                instance = instances[key]
+                if (instance == null) {
+                    rejectMsg = "LiteRT-LM model '${model.name}' is not initialized. Call initializeIfNeeded() first."
+                    return@withLock
+                }
+
+                if (images.isNotEmpty() && instance?.supportImage != true) {
+                    rejectMsg = "Vision input rejected: supportImage=false for key='$key'. Reinitialize with supportImage=true."
+                    return@withLock
+                }
+                if (audioClips.isNotEmpty() && instance?.supportAudio != true) {
+                    rejectMsg = "Audio input rejected: supportAudio=false for key='$key'. Reinitialize with supportAudio=true."
+                    return@withLock
+                }
+
+                rs = getRunState(key)
+
+                // Enforce post-terminate cooldown.
+                val now = SystemClock.elapsedRealtime()
+                val until = rs!!.cooldownUntilMs.get()
+                cooldownDelayMs = max(0L, until - now)
+
+                val acquired = rs!!.active.compareAndSet(false, true)
+                if (!acquired) {
+                    rejectMsg = "LiteRT-LM runInference rejected: another stream is already active for key='$key'."
+                    return@withLock
+                }
+
+                // New runId; late callbacks from older runs will be ignored.
+                myRunId = rs!!.runId.incrementAndGet()
+                rs!!.terminated.set(false)
+                rs!!.cancelRequested.set(false)
+
+                // Install a minimal early terminator that only marks cancel.
+                // This closes the tiny window where cancel() can happen before the full terminator is installed.
+                rs!!.terminator.set { rs!!.cancelRequested.set(true) }
+
+                conversation = instance!!.conversation
+            }
+
+            if (rejectMsg != null || instance == null || rs == null || conversation == null) {
+                val msg = rejectMsg ?: "LiteRT-LM start rejected: unknown reason."
                 Log.w(TAG, msg)
                 postToMain {
                     onError(msg)
@@ -707,54 +992,14 @@ object LiteRtLM {
                 return@launch
             }
 
-            if (images.isNotEmpty() && !instance.supportImage) {
-                val msg =
-                    "Vision input rejected: supportImage=false for key='$key'. Reinitialize with supportImage=true."
-                Log.w(TAG, msg)
-                postToMain {
-                    onError(msg)
-                    resultListener("", true)
-                    runCatching { cleanUpListener.invoke() }
-                }
-                return@launch
+            // Apply cooldown outside lock.
+            if (cooldownDelayMs > 0) {
+                Log.d(TAG, "Post-terminate cooldown: delaying start ${cooldownDelayMs}ms for key='$key'")
+                delay(cooldownDelayMs)
             }
 
-            if (audioClips.isNotEmpty() && !instance.supportAudio) {
-                val msg =
-                    "Audio input rejected: supportAudio=false for key='$key'. Reinitialize with supportAudio=true."
-                Log.w(TAG, msg)
-                postToMain {
-                    onError(msg)
-                    resultListener("", true)
-                    runCatching { cleanUpListener.invoke() }
-                }
-                return@launch
-            }
-
-            val rs = stateMutex.withLock { getRunState(key) }
-
-            // Acquire per-key active flag.
-            val acquired = rs.active.compareAndSet(false, true)
-            if (!acquired) {
-                val msg = "LiteRT-LM runInference rejected: another stream is already active for key='$key'."
-                Log.w(TAG, msg)
-                postToMain {
-                    onError(msg)
-                    resultListener("", true)
-                    runCatching { cleanUpListener.invoke() }
-                }
-                return@launch
-            }
-
-            // New runId; late callbacks from older runs will be ignored.
-            val myRunId = rs.runId.incrementAndGet()
-            rs.terminated.set(false)
-            rs.cancelRequested.set(false)
-
-            val conversation: Conversation = instance.conversation
             val contents = buildContents(input = input, images = images, audioClips = audioClips)
 
-            // This holds what we have *logically emitted so far* (not just last callback payload).
             var emittedSoFar = ""
             var msgCount = 0
 
@@ -769,21 +1014,22 @@ object LiteRtLM {
             }
 
             fun terminateOnce(errorMessage: String? = null) {
-                if (!rs.terminated.compareAndSet(false, true)) return
+                val rsLocal = rs!!
+                if (!rsLocal.terminated.compareAndSet(false, true)) return
 
-                rs.lastTerminateAtMs.set(System.currentTimeMillis())
+                val now = SystemClock.elapsedRealtime()
+                rsLocal.lastTerminateAtMs.set(now)
+                rsLocal.cooldownUntilMs.set(now + POST_TERMINATE_COOLDOWN_MS)
 
                 // Mark inactive before deferred actions.
-                rs.active.set(false)
+                rsLocal.active.set(false)
 
                 // Clear terminator.
-                rs.terminator.set(null)
+                rsLocal.terminator.set(null)
 
                 postToMain {
                     if (!errorMessage.isNullOrBlank()) onError(errorMessage)
-                    // Terminal signal exactly once.
                     resultListener("", true)
-                    // Hook: must never throw.
                     runCatching { cleanUpListener.invoke() }
                         .onFailure { t -> Log.w(TAG, "cleanUpListener failed: ${t.message}", t) }
                 }
@@ -791,23 +1037,29 @@ object LiteRtLM {
                 ioScope.launch { runDeferredActions() }
             }
 
-            // Expose a safe logical terminator for cancel/watchdogs.
-            rs.terminator.set { terminateOnce("Cancelled") }
+            // Install the real terminator.
+            stateMutex.withLock {
+                rs!!.terminator.set { terminateOnce("Cancelled") }
+            }
+
+            // If cancel was requested during the start window, terminate immediately before calling native.
+            if (rs!!.cancelRequested.get()) {
+                Log.i(TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
+                terminateOnce("Cancelled")
+                return@launch
+            }
 
             try {
-                conversation.sendMessageAsync(
+                conversation!!.sendMessageAsync(
                     Message.of(contents),
                     object : MessageCallback {
 
                         override fun onMessage(message: Message) {
-                            // Ignore callbacks from older runs.
-                            if (rs.runId.get() != myRunId) return
-                            // Ignore after termination.
-                            if (rs.terminated.get()) return
+                            if (rs!!.runId.get() != myRunId) return
+                            if (rs!!.terminated.get()) return
 
                             msgCount++
 
-                            // IMPORTANT: pick best candidate text.
                             val snapshotRaw = extractRenderedText(message)
                             if (snapshotRaw.isEmpty()) return
 
@@ -817,7 +1069,6 @@ object LiteRtLM {
                                 return
                             }
 
-                            // Normalize only the delta to avoid breaking prefix matching.
                             val delta = normalizeDeltaText(deltaRaw)
                             emittedSoFar = nextEmitted
 
@@ -842,15 +1093,15 @@ object LiteRtLM {
                         }
 
                         override fun onDone() {
-                            if (rs.runId.get() != myRunId) return
+                            if (rs!!.runId.get() != myRunId) return
                             terminateOnce()
                         }
 
                         override fun onError(throwable: Throwable) {
-                            if (rs.runId.get() != myRunId) return
-                            if (rs.terminated.get()) return
+                            if (rs!!.runId.get() != myRunId) return
+                            if (rs!!.terminated.get()) return
 
-                            if (throwable is CancellationException || rs.cancelRequested.get()) {
+                            if (throwable is CancellationException || rs!!.cancelRequested.get()) {
                                 Log.i(TAG, "LiteRT-LM inference cancelled: key='$key'")
                                 terminateOnce()
                             } else {
@@ -880,6 +1131,10 @@ object LiteRtLM {
         onPartial: (String) -> Unit = {},
     ): String = apiMutex.withLock {
         val key = runtimeKey(model)
+
+        // Mark use + cancel any pending cleanup (generateText implies use).
+        markUsed(key)
+        cancelScheduledCleanup(key, "generateText")
 
         if (!busy.compareAndSet(false, true)) {
             throw IllegalStateException("LiteRT-LM is already busy with another request.")
@@ -934,19 +1189,15 @@ object LiteRtLM {
      * IMPORTANT:
      * - The SDK may not truly cancel an in-flight conversation.
      * - We request cancellation and then "logically terminate" if possible.
-     * - Cleanup is still deferred with a grace delay before closing native objects.
      */
     fun cancel(model: Model) {
         val key = runtimeKey(model)
 
         ioScope.launch {
             val rs = stateMutex.withLock { getRunState(key) }
-
             if (!rs.active.get()) return@launch
 
             rs.cancelRequested.set(true)
-
-            // If runInference installed a terminator, invoke it to unblock callers/watchdogs.
             rs.terminator.get()?.invoke()
         }
     }

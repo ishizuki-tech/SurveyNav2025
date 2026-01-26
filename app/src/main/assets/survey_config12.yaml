@@ -60,11 +60,12 @@ graph:
 
 qa_eval:
   enabled: true
-  mode: one_call
+  mode: two_call
   followup_trigger: needs_followup
   eval_ok_score_threshold: 85
   skip_followup_when_ok: true
   fallback_to_inline_followup: true
+
 
 slm:
   accelerator: "GPU"
@@ -119,7 +120,6 @@ slm:
     - Must validate/clarify the SAME answer; do not introduce new topics.
 
 prompts:
-  # -------------------- Q1 --------------------
   - node_id: "Q1#eval"
     prompt: |-
       Task:
@@ -145,7 +145,6 @@ prompts:
       Answer: {{ANSWER}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  # -------------------- Q2 --------------------
   - node_id: "Q2#eval"
     prompt: |-
       Task:
@@ -168,7 +167,6 @@ prompts:
       Answer: {{ANSWER}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  # -------------------- Q3 --------------------
   - node_id: "Q3#eval"
     prompt: |-
       Task:
@@ -191,7 +189,6 @@ prompts:
       Answer: {{ANSWER}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  # -------------------- Q4 --------------------
   - node_id: "Q4#eval"
     prompt: |-
       Task:
@@ -214,7 +211,6 @@ prompts:
       Answer: {{ANSWER}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  # -------------------- Q5 --------------------
   - node_id: "Q5#eval"
     prompt: |-
       Task:
@@ -237,7 +233,6 @@ prompts:
       Answer: {{ANSWER}}
       EVAL_JSON: {{EVAL_JSON}}
 
-  # -------------------- Q6 --------------------
   - node_id: "Q6#eval"
     prompt: |-
       Task:
