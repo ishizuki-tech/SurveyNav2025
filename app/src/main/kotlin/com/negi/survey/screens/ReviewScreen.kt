@@ -47,10 +47,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -69,8 +72,8 @@ import com.negi.survey.vm.SurveyViewModel
  *
  * Implementation details:
  *  - Uses [LazyColumn] for scalable performance on large interviews.
- *  - Typography is intentionally tightened (smaller font + line height) but
- *    still tied to [MaterialTheme.typography] for consistency.
+ *    NOTE: The two-card layout still renders card contents eagerly within each card.
+ *    For extremely large sessions, consider adding a collapse/expand or paging strategy.
  *
  * @param vm Backing ViewModel providing the survey state.
  * @param onNext Invoked when the user presses the “Next” button.
@@ -103,6 +106,13 @@ fun ReviewScreen(
     val allAnswers by vm.answers.collectAsState(initial = emptyMap())
     val allFollowups by vm.followups.collectAsState(initial = emptyMap())
 
+    // Sorting strategy:
+    // - Default: lexical (stable, simplest).
+    // - Swap in a "natural order" comparator if needed (e.g., Q2 < Q10).
+    val nodeIdComparator = remember {
+        Comparator<String> { a, b -> a.compareTo(b) }
+    }
+
     /**
      * Build a stable union of node IDs that own either a question or an answer.
      *
@@ -111,23 +121,27 @@ fun ReviewScreen(
      *  - question-only nodes,
      *  - legacy call sites that set answers before questions.
      */
-    val qaOwnerIds = remember(allQuestions, allAnswers) {
-        (allQuestions.keys + allAnswers.keys)
-            .toSet()
-            .toList()
-            .sorted()
+    val qaOwnerIds by remember(allQuestions, allAnswers) {
+        derivedStateOf {
+            (allQuestions.keys + allAnswers.keys)
+                .toSet()
+                .toList()
+                .sortedWith(nodeIdComparator)
+        }
     }
 
     /**
      * Stable Q/A entries derived from the union list above.
      */
-    val qaEntries = remember(qaOwnerIds, allQuestions, allAnswers) {
-        qaOwnerIds.map { id ->
-            QaEntry(
-                nodeId = id,
-                question = allQuestions[id].orEmpty(),
-                answer = allAnswers[id].orEmpty()
-            )
+    val qaEntries by remember(qaOwnerIds, allQuestions, allAnswers) {
+        derivedStateOf {
+            qaOwnerIds.map { id ->
+                QaEntry(
+                    nodeId = id,
+                    question = allQuestions[id].orEmpty(),
+                    answer = allAnswers[id].orEmpty()
+                )
+            }
         }
     }
 
@@ -136,16 +150,22 @@ fun ReviewScreen(
      *
      * The per-node list order is preserved as-is to respect insertion/creation order.
      */
-    val sortedFollowups = remember(allFollowups) {
-        allFollowups.toSortedMap()
+    val sortedFollowups by remember(allFollowups) {
+        derivedStateOf {
+            allFollowups.entries
+                .sortedWith(compareBy(nodeIdComparator) { it.key })
+        }
     }
 
-    Scaffold(containerColor = Color.Transparent) { pad ->
+    Scaffold(
+        containerColor = Color.Transparent
+    ) { pad ->
         LazyColumn(
             modifier = Modifier
                 .padding(pad)
                 .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .testTag("ReviewScreenRoot"),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // Header.
@@ -153,13 +173,18 @@ fun ReviewScreen(
                 Text(
                     text = "Review",
                     style = titleTight,
-                    color = cs.onSurface
+                    color = cs.onSurface,
+                    modifier = Modifier.testTag("ReviewHeader")
                 )
             }
 
             // Q & A Card.
             item {
-                ElevatedCard(Modifier.fillMaxWidth()) {
+                ElevatedCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ReviewQaCard")
+                ) {
                     Column(Modifier.padding(12.dp)) {
                         Text(
                             text = "All Original Questions and Answers",
@@ -193,7 +218,11 @@ fun ReviewScreen(
 
             // Follow-ups Card.
             item {
-                ElevatedCard(Modifier.fillMaxWidth()) {
+                ElevatedCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ReviewFollowupCard")
+                ) {
                     Column(Modifier.padding(12.dp)) {
                         Text(
                             text = "Follow-up History",
@@ -209,7 +238,7 @@ fun ReviewScreen(
                                 color = cs.onSurfaceVariant
                             )
                         } else {
-                            sortedFollowups.entries.forEachIndexed { idx, (nodeId, list) ->
+                            sortedFollowups.forEachIndexed { idx, (nodeId, list) ->
                                 if (idx > 0) {
                                     HorizontalDivider(Modifier.padding(vertical = 6.dp))
                                 }
@@ -229,13 +258,21 @@ fun ReviewScreen(
                                 } else {
                                     list.forEachIndexed { i, entry ->
                                         Spacer(Modifier.height(4.dp))
+
+                                        val q = entry.question.takeIf { it.isNotBlank() } ?: "– No Question."
+                                        val a = entry.answer?.takeIf { it.isNotBlank() } ?: "– No Answer."
+
                                         Text(
-                                            text = "${i + 1}. Q: ${entry.question}",
+                                            text = "${i + 1}. Q: $q",
                                             style = bodyTight,
-                                            color = cs.onSurface
+                                            color = if (entry.question.isBlank()) {
+                                                cs.onSurface.copy(alpha = 0.6f)
+                                            } else {
+                                                cs.onSurface
+                                            }
                                         )
                                         Text(
-                                            text = "   A: ${entry.answer ?: "– No Answer."}",
+                                            text = "   A: $a",
                                             style = bodyTight,
                                             color = if (entry.answer.isNullOrBlank()) {
                                                 cs.onSurface.copy(alpha = 0.6f)
@@ -258,16 +295,21 @@ fun ReviewScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 4.dp, bottom = 8.dp)
+                        .testTag("ReviewNavRow")
                 ) {
                     Button(
                         onClick = onBack,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("ReviewBackButton")
                     ) {
                         Text("Back")
                     }
                     Button(
                         onClick = onNext,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("ReviewNextButton")
                     ) {
                         Text("Next")
                     }
@@ -292,8 +334,8 @@ private data class QaEntry(
 @Composable
 private fun QaRow(
     entry: QaEntry,
-    labelStyle: androidx.compose.ui.text.TextStyle,
-    bodyStyle: androidx.compose.ui.text.TextStyle
+    labelStyle: TextStyle,
+    bodyStyle: TextStyle
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -305,9 +347,9 @@ private fun QaRow(
         )
         Spacer(Modifier.height(2.dp))
 
-        val qText = if (entry.question.isBlank()) "– No Question." else "Q: ${entry.question}"
+        val q = entry.question.takeIf { it.isNotBlank() } ?: "– No Question."
         Text(
-            text = qText,
+            text = if (entry.question.isBlank()) q else "Q: $q",
             style = bodyStyle,
             color = if (entry.question.isBlank()) {
                 cs.onSurface.copy(alpha = 0.6f)
@@ -318,9 +360,9 @@ private fun QaRow(
 
         Spacer(Modifier.height(2.dp))
 
-        val aText = if (entry.answer.isBlank()) "– No Answer." else entry.answer
+        val a = entry.answer.takeIf { it.isNotBlank() } ?: "– No Answer."
         Text(
-            text = "A: $aText",
+            text = "A: $a",
             maxLines = 6,
             overflow = TextOverflow.Ellipsis,
             style = bodyStyle,

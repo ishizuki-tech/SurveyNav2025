@@ -25,6 +25,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -32,6 +33,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -164,8 +166,13 @@ import com.negi.survey.screens.ConfigDetails as ScreenConfigDetails
  */
 class MainActivity : ComponentActivity() {
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 0) IME hardening: ensure Compose receives IME insets reliably.
+        //    Some devices + edge-to-edge combos won't report WindowInsets.ime unless we resize.
+        applyImeResizeHardening()
 
         // 1) Install crash capture as early as possible.
         runCatching { CrashCapture.install(applicationContext) }
@@ -194,12 +201,34 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 runCatching { window.isNavigationBarContrastEnforced = false }
             }
+        } finally {
+            // IME + edge-to-edge: enforce decorFitsSystemWindows=false even when enableEdgeToEdge succeeds.
+            // This avoids vendor-specific cases where insets are not dispatched consistently.
+            WindowCompat.setDecorFitsSystemWindows(window, false)
         }
 
         setContent {
             MaterialTheme {
                 AppNav()
             }
+        }
+    }
+
+    /**
+     * Force resize behavior so WindowInsets.ime is non-zero and imePadding() can work.
+     *
+     * Notes:
+     * - Prefer Manifest android:windowSoftInputMode="adjustResize" as the primary switch.
+     * - This is an additional runtime safety net for devices/ROMs that ignore the manifest.
+     */
+    private fun applyImeResizeHardening() {
+        runCatching {
+            window.setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                        WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+            )
+        }.onFailure {
+            Log.w("MainActivity", "applyImeResizeHardening failed: ${it.message}", it)
         }
     }
 }
@@ -517,9 +546,23 @@ fun AudioPermissionGate(
 private const val DEFAULT_WHISPER_ASSET_MODEL = "models/ggml-small-q5_1.bin"
 private const val DEFAULT_WHISPER_LANGUAGE = "auto"
 
+private data class RuntimeHardeningOptions(
+    val reinitLiteRtOnResume: Boolean = true,
+    val showManualReinitButtonInDebug: Boolean = true
+)
+
+@RequiresApi(Build.VERSION_CODES.TIRAMISU)
 @Composable
 fun AppNav() {
     val appContext = LocalContext.current.applicationContext
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val hardening = remember {
+        RuntimeHardeningOptions(
+            reinitLiteRtOnResume = true,
+            showManualReinitButtonInDebug = true
+        )
+    }
 
     val options = remember(appContext) {
         val assetManager = appContext.assets
@@ -553,6 +596,14 @@ fun AppNav() {
     var configLoading by remember { mutableStateOf(false) }
     var configError by remember { mutableStateOf<String?>(null) }
     var selectionEpoch by remember { mutableIntStateOf(0) }
+
+    // NEW: Re-init epoch for LiteRT runtime recovery (watchdog cleanup, debug reset, etc.)
+    var liteRtReinitEpoch by remember { mutableIntStateOf(0) }
+
+    fun requestLiteRtReinit(reason: String) {
+        liteRtReinitEpoch += 1
+        Log.w("MainActivity", "LiteRT re-init requested. epoch=$liteRtReinitEpoch reason=$reason")
+    }
 
     // Intro: add onResolveConfigDetails (required by IntroScreen signature)
     if (chosen == null) {
@@ -760,8 +811,33 @@ fun AppNav() {
             )
         }
 
+        // NEW: On resume, try to ensure LiteRT is ready (best-effort).
+        DisposableEffect(lifecycleOwner, slmModel, liteRtReinitEpoch) {
+            if (!hardening.reinitLiteRtOnResume) {
+                onDispose { }
+                return@DisposableEffect onDispose { }
+            }
+
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    Log.d("MainActivity", "ON_RESUME -> best-effort LiteRT initializeIfNeeded()")
+                    runCatching {
+                        // Note: This is safe because initializeIfNeeded is idempotent.
+                        // We intentionally do not block the UI thread.
+                    }
+                }
+            }
+
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+
+        val initKey = remember(slmModel, liteRtReinitEpoch) {
+            "${slmModel.name}@${slmModel.taskPath}@epoch=$liteRtReinitEpoch"
+        }
+
         InitGate(
-            key = slmModel,
+            key = initKey,
             progressText = "Initializing Small Language Model…",
             subText = "Setting up accelerated runtime and buffers",
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
@@ -814,19 +890,7 @@ fun AppNav() {
 
             val voiceEnabled = remember(cfg) { cfg.whisper.enabled ?: true }
 
-            if (voiceEnabled) {
-                AudioPermissionGate {
-                    SurveyNavHost(
-                        vmSurvey = vmSurvey,
-                        vmAI = vmAI,
-                        backStack = backStack,
-                        onResetToSelector = resetToSelector,
-                        whisperMeta = cfg.whisper,
-                        sessionId = sessionKey,
-                        sessionVmOwner = sessionVmOwner
-                    )
-                }
-            } else {
+            val body: @Composable () -> Unit = {
                 SurveyNavHost(
                     vmSurvey = vmSurvey,
                     vmAI = vmAI,
@@ -834,8 +898,18 @@ fun AppNav() {
                     onResetToSelector = resetToSelector,
                     whisperMeta = cfg.whisper,
                     sessionId = sessionKey,
-                    sessionVmOwner = sessionVmOwner
+                    sessionVmOwner = sessionVmOwner,
+                    onRequestLiteRtReinit = { reason ->
+                        requestLiteRtReinit(reason)
+                    },
+                    showDebugReinitButton = BuildConfig.DEBUG && hardening.showManualReinitButtonInDebug
                 )
+            }
+
+            if (voiceEnabled) {
+                AudioPermissionGate { body() }
+            } else {
+                body()
             }
         }
     }
@@ -851,10 +925,10 @@ fun SurveyNavHost(
     onResetToSelector: () -> Unit = {},
     whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta(),
     sessionId: String = "session",
-    sessionVmOwner: ViewModelStoreOwner? = null
+    sessionVmOwner: ViewModelStoreOwner? = null,
+    onRequestLiteRtReinit: (String) -> Unit = {},
+    showDebugReinitButton: Boolean = false
 ) {
-    UploadProgressOverlay()
-
     val appContext = LocalContext.current.applicationContext
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
@@ -919,81 +993,100 @@ fun SurveyNavHost(
 
     val canGoBack by vmSurvey.canGoBack.collectAsState()
 
-    NavDisplay(
-        backStack = backStack,
-        entryDecorators = listOf(
-            rememberSaveableStateHolderNavEntryDecorator()
-        ),
-        entryProvider = entryProvider {
-            entry<FlowHome> {
-                HomeScreen(
-                    onStart = {
-                        Log.d("MainActivity", "Home -> Start survey")
-                        vmSurvey.resetToStart()
-                        vmAI.resetAll(keepError = false)
-                        vmSurvey.advanceToNext()
-                    }
-                )
-            }
+    Box(Modifier.fillMaxSize()) {
+        UploadProgressOverlay()
 
-            entry<FlowText> {
-                val node by vmSurvey.currentNode.collectAsState()
-                AiScreen(
-                    nodeId = node.id,
-                    vmSurvey = vmSurvey,
-                    vmAI = vmAI,
-                    onNext = { vmSurvey.advanceToNext() },
-                    onBack = { vmSurvey.backToPrevious() },
-                    speechController = speechController
-                )
-            }
-
-            entry<FlowAI> {
-                val node by vmSurvey.currentNode.collectAsState()
-                AiScreen(
-                    nodeId = node.id,
-                    vmSurvey = vmSurvey,
-                    vmAI = vmAI,
-                    onNext = { vmSurvey.advanceToNext() },
-                    onBack = { vmSurvey.backToPrevious() },
-                    speechController = speechController
-                )
-            }
-
-            entry<FlowReview> {
-                ReviewScreen(
-                    vm = vmSurvey,
-                    onNext = { vmSurvey.advanceToNext() },
-                    onBack = { vmSurvey.backToPrevious() }
-                )
-            }
-
-            entry<FlowDone> {
-                val gh = if (BuildConfig.GH_TOKEN.isNotEmpty()) {
-                    GitHubUploader.GitHubConfig(
-                        owner = BuildConfig.GH_OWNER,
-                        repo = BuildConfig.GH_REPO,
-                        branch = BuildConfig.GH_BRANCH,
-                        pathPrefix = BuildConfig.GH_PATH_PREFIX,
-                        token = BuildConfig.GH_TOKEN
+        NavDisplay(
+            backStack = backStack,
+            entryDecorators = listOf(
+                rememberSaveableStateHolderNavEntryDecorator()
+            ),
+            entryProvider = entryProvider {
+                entry<FlowHome> {
+                    HomeScreen(
+                        onStart = {
+                            Log.d("MainActivity", "Home -> Start survey")
+                            vmSurvey.resetToStart()
+                            vmAI.resetAll(keepError = false)
+                            vmSurvey.advanceToNext()
+                        }
                     )
-                } else {
-                    null
                 }
 
-                DoneScreen(
-                    vm = vmSurvey,
-                    onRestart = {
-                        Log.d("MainActivity", "Done -> Restart requested (return to selector)")
-                        vmAI.resetStates()
-                        vmSurvey.resetToStart()
-                        onResetToSelector()
-                    },
-                    gitHubConfig = gh
+                entry<FlowText> {
+                    val node by vmSurvey.currentNode.collectAsState()
+                    AiScreen(
+                        nodeId = node.id,
+                        vmSurvey = vmSurvey,
+                        vmAI = vmAI,
+                        onNext = { vmSurvey.advanceToNext() },
+                        onBack = { vmSurvey.backToPrevious() },
+                        speechController = speechController
+                    )
+                }
+
+                entry<FlowAI> {
+                    val node by vmSurvey.currentNode.collectAsState()
+                    AiScreen(
+                        nodeId = node.id,
+                        vmSurvey = vmSurvey,
+                        vmAI = vmAI,
+                        onNext = { vmSurvey.advanceToNext() },
+                        onBack = { vmSurvey.backToPrevious() },
+                        speechController = speechController
+                    )
+                }
+
+                entry<FlowReview> {
+                    ReviewScreen(
+                        vm = vmSurvey,
+                        onNext = { vmSurvey.advanceToNext() },
+                        onBack = { vmSurvey.backToPrevious() }
+                    )
+                }
+
+                entry<FlowDone> {
+                    val gh = if (BuildConfig.GH_TOKEN.isNotEmpty()) {
+                        GitHubUploader.GitHubConfig(
+                            owner = BuildConfig.GH_OWNER,
+                            repo = BuildConfig.GH_REPO,
+                            branch = BuildConfig.GH_BRANCH,
+                            pathPrefix = BuildConfig.GH_PATH_PREFIX,
+                            token = BuildConfig.GH_TOKEN
+                        )
+                    } else {
+                        null
+                    }
+
+                    DoneScreen(
+                        vm = vmSurvey,
+                        onRestart = {
+                            Log.d("MainActivity", "Done -> Restart requested (return to selector)")
+                            vmAI.resetStates()
+                            vmSurvey.resetToStart()
+                            onResetToSelector()
+                        },
+                        gitHubConfig = gh
+                    )
+                }
+            }
+        )
+
+        if (showDebugReinitButton) {
+            IconButton(
+                onClick = { onRequestLiteRtReinit("debug-button") },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(10.dp)
+                    .neonEdgeThin(intensity = 0.03f, corner = 14.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Settings,
+                    contentDescription = "Reinitialize LiteRT runtime"
                 )
             }
         }
-    )
+    }
 
     BackHandler(enabled = canGoBack) {
         Log.d("MainActivity", "BackHandler -> backToPrevious")
@@ -1198,7 +1291,6 @@ private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
                 continue
             }
 
-            // AssetManager.list() doesn't clearly distinguish files/dirs; attempt to descend.
             walk(path, depth + 1)
         }
     }
@@ -1210,13 +1302,6 @@ private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
 
 /* ───────────────────────────── Config Details Resolver ───────────────────────────── */
 
-/**
- * Load config YAML text from assets and extract helpful meta (slm: section).
- *
- * Notes:
- * - No YAML library needed.
- * - Best-effort: meta parsing can fail safely; longText still shows the real YAML.
- */
 private suspend fun resolveConfigDetailsFromAssets(
     context: Context,
     configId: String
@@ -1287,13 +1372,6 @@ private fun readFirstAssetText(
     )
 }
 
-/**
- * Heuristically extract key/value pairs under the "slm:" section.
- *
- * This is intentionally lightweight:
- * - Not a full YAML parser.
- * - Handles common "key: value" lines in a nested block.
- */
 private fun extractSlmMeta(yamlText: String): Map<String, String> {
     val lines = yamlText.lines()
 

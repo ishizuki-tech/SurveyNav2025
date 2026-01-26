@@ -239,7 +239,7 @@ slm:
   model_family: "llama"
   backend: "local"
   accelerator: "CPU"
-  max_tokens: 256
+  max_tokens: 4096
   top_k: 40
   top_p: 0.95
   temperature: 0.7
