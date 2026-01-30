@@ -5,7 +5,7 @@
  *  File: IntroScreen.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
@@ -15,7 +15,6 @@
  *  Update (2026-01):
  *   • Added a "Selected configuration details" panel.
  *   • Supports long details with expand/collapse.
- *   • Optional key/value meta rendering for configs.
  *
  *  Debug/UX fix (2026-01):
  *   • Fix: "Show more" appeared to do nothing when expanded content was clipped off-screen.
@@ -23,12 +22,15 @@
  *   • Fix: Show more button now appears only if it would actually expand something.
  *     - Uses onTextLayout overflow detection.
  *   • UX: When toggling "Show more", auto-scroll the details panel into view.
- *     - Uses BringIntoViewRequester so it feels responsive.
+ *     - Uses BringIntoViewRequester.
  *   • Added test tags for UI testing.
  *
- *  New (2026-01):
- *   • Show details of the CURRENT config by resolving details from selected id.
- *     - Pass onResolveConfigDetails(configId) to load YAML/config text asynchronously.
+ *  Strengthen (2026-01):
+ *   • Treat CancellationException correctly (do not show as error).
+ *   • BringIntoView runs after layout settles (delay one tick).
+ *   • animateContentSize only while collapsed to reduce jank on huge text.
+ *   • Stable meta rendering order (sorted).
+ *   • Retry button for failed detail resolution.
  * =====================================================================
  */
 
@@ -58,11 +60,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -72,12 +74,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -88,9 +91,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -112,18 +118,23 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.max
+import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.max
+import kotlin.math.min
 
 private const val TAG = "IntroScreen"
+private const val BRING_INTO_VIEW_DELAY_MS = 24L
 
 /**
  * UI-facing descriptor of a survey configuration option.
  *
  * NOTE:
- * - details/meta here are optional and can be empty.
- * - The actual "current config details" are resolved via onResolveConfigDetails(configId).
+ * - Details are resolved via onResolveConfigDetails(configId).
  */
 data class ConfigOptionUi(
     val id: String,
@@ -150,7 +161,7 @@ data class ConfigDetails(
  * Intro screen rendered in a strict grayscale palette.
  *
  * @param onResolveConfigDetails Called when selected config id changes.
- *        Implement this in your ViewModel/Repository to load YAML or config and return a display-ready ConfigDetails.
+ *        Implement this in your ViewModel/Repository to load YAML or config and return display-ready ConfigDetails.
  */
 @Composable
 fun IntroScreen(
@@ -212,48 +223,71 @@ private fun IntroCardMono(
     val cs = MaterialTheme.colorScheme
     val corner = 20.dp
 
+    /** Readability palette (explicit, monotone). */
     val textPrimary = Color(0xFFF2F2F2)
     val textSecondary = Color(0xFFD2D2D2)
     val textMuted = Color(0xFFB0B0B0)
     val textHint = Color(0xFF9A9A9A)
 
+    /** A slightly stronger card scrim to lift text from the animated background. */
     val cardBg = Color(0xFF101010).copy(alpha = 0.86f)
 
     val optionIds = remember(options) { options.map { it.id } }
+    val optionIdSet = remember(optionIds) { optionIds.toHashSet() }
+    val defaultIdNorm = remember(defaultOptionId) { defaultOptionId?.trim().orEmpty() }
 
-    var selectedId by remember(optionIds, defaultOptionId, restartEpoch) {
+    var selectedId by remember(optionIds, defaultIdNorm, restartEpoch) {
         mutableStateOf(
-            defaultOptionId
-                ?.takeIf { it.isNotBlank() && optionIds.contains(it) }
+            defaultIdNorm
+                .takeIf { it.isNotBlank() && optionIdSet.contains(it) }
                 ?: options.first().id
         )
     }
 
     LaunchedEffect(optionIds, restartEpoch) {
-        if (!optionIds.contains(selectedId)) {
+        if (!optionIdSet.contains(selectedId)) {
             selectedId = options.first().id
         }
     }
 
     val selectedOption = options.firstOrNull { it.id == selectedId } ?: options.first()
 
+    // ───────────────────── Resolve current config details ─────────────────────
+
+    val resolveDetails by rememberUpdatedState(newValue = onResolveConfigDetails)
+
     var detailsState by remember(restartEpoch, selectedId) {
         mutableStateOf<ResolvedDetailsState>(ResolvedDetailsState.Loading)
     }
 
-    LaunchedEffect(restartEpoch, selectedId) {
+    /** Manual reload epoch for Retry. */
+    var detailsReloadEpoch by remember(selectedId, restartEpoch) { mutableLongStateOf(0L) }
+
+    LaunchedEffect(restartEpoch, selectedId, detailsReloadEpoch) {
+        val startMs = System.currentTimeMillis()
         detailsState = ResolvedDetailsState.Loading
-        try {
-            val d = onResolveConfigDetails(selectedId)
-            detailsState = ResolvedDetailsState.Ready(d)
-        } catch (e: CancellationException) {
-            // Important: do not treat cancellation as an error.
-            throw e
+
+        detailsState = try {
+            val d = resolveDetails(selectedId)
+            val dt = System.currentTimeMillis() - startMs
+            Log.d(TAG, "Resolved config details: id=$selectedId in ${dt}ms")
+            ResolvedDetailsState.Ready(d)
+        } catch (ce: CancellationException) {
+            /** Cancellation should not be surfaced as an error state. */
+            Log.d(TAG, "Resolve cancelled: id=$selectedId")
+            throw ce
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed to resolve config details for id=$selectedId", t)
-            detailsState = ResolvedDetailsState.Error(t)
+            Log.e(TAG, "Failed to resolve config details: id=$selectedId", t)
+            ResolvedDetailsState.Error(t)
         }
     }
+
+    val screen = LocalConfiguration.current
+    val screenH = screen.screenHeightDp.dp
+    val screenW = screen.screenWidthDp.dp
+
+    /** Responsive clamp: keep it readable on phones + not absurd on tablets. */
+    val cardMaxWidth = min(760.dp, max(520.dp, screenW * 0.92f))
 
     ElevatedCard(
         shape = RoundedCornerShape(corner),
@@ -263,6 +297,7 @@ private fun IntroCardMono(
         ),
         modifier = Modifier
             .padding(horizontal = 24.dp)
+            .widthIn(max = cardMaxWidth)
             .wrapContentHeight()
             .wrapContentWidth()
             .drawBehind {
@@ -282,12 +317,13 @@ private fun IntroCardMono(
                     cornerRadius = CornerRadius(corner.toPx(), corner.toPx())
                 )
             }
+            .testTag("IntroCard")
     ) {
-        val screenH = LocalConfiguration.current.screenHeightDp.dp
         val scroll = rememberScrollState()
 
         Column(
             modifier = Modifier
+                /** Clamp the whole card height so expanded details remain reachable. */
                 .heightIn(max = screenH * 0.82f)
                 .verticalScroll(scroll)
                 .padding(horizontal = 22.dp, vertical = 20.dp),
@@ -299,7 +335,7 @@ private fun IntroCardMono(
                 colorBottom = Color(0xFFCFCFCF)
             )
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.padding(top = 8.dp))
 
             Text(
                 text = subtitle,
@@ -310,7 +346,7 @@ private fun IntroCardMono(
                 overflow = TextOverflow.Ellipsis
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.padding(top = 16.dp))
 
             Text(
                 text = "Select survey configuration",
@@ -328,18 +364,26 @@ private fun IntroCardMono(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 options.forEach { option ->
-                    MonoConfigOptionChip(
-                        option = option,
-                        selected = option.id == selectedId,
-                        onClick = { selectedId = option.id },
-                        textPrimary = textPrimary,
-                        textSecondary = textHint
-                    )
-                    Spacer(Modifier.height(8.dp))
+                    key(option.id) {
+                        MonoConfigOptionChip(
+                            option = option,
+                            selected = option.id == selectedId,
+                            onClick = {
+                                if (selectedId != option.id) {
+                                    Log.d(TAG, "Config selected: ${selectedId} -> ${option.id}")
+                                    selectedId = option.id
+                                }
+                            },
+                            textPrimary = textPrimary,
+                            textSecondary = textHint
+                        )
+                        Spacer(Modifier.padding(top = 8.dp))
+                    }
                 }
             }
 
-            Spacer(Modifier.height(10.dp))
+            // ───────────────────── Selected details panel ─────────────────────
+            Spacer(Modifier.padding(top = 10.dp))
 
             SelectedConfigDetailsMono(
                 configId = selectedId,
@@ -349,16 +393,20 @@ private fun IntroCardMono(
                 textPrimary = textPrimary,
                 textSecondary = textSecondary,
                 textMuted = textMuted,
+                onRetry = {
+                    Log.d(TAG, "Retry resolve details: id=$selectedId")
+                    detailsReloadEpoch = System.currentTimeMillis()
+                }
             )
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.padding(top = 12.dp))
 
             HorizontalDivider(
-                thickness = 1.dp,
+                thickness = DividerDefaults.Thickness,
                 color = cs.outlineVariant.copy(alpha = 0.22f)
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.padding(top = 16.dp))
 
             CtaRowMono(
                 onStart = { onStart(selectedOption) },
@@ -376,6 +424,19 @@ private sealed class ResolvedDetailsState {
     data class Error(val error: Throwable) : ResolvedDetailsState()
 }
 
+/**
+ * Details panel for the currently selected configuration.
+ *
+ * Shows:
+ * - UI label/desc (always)
+ * - Resolved config details (loading/ready/error)
+ *
+ * Debug fixes applied:
+ * - "Show more" appears only if it can actually expand content.
+ * - When expanding, auto-scroll this panel into view (after layout settles).
+ * - animateContentSize only while collapsed to reduce jank on huge expansions.
+ * - Retry action for errors.
+ */
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun SelectedConfigDetailsMono(
@@ -386,12 +447,14 @@ private fun SelectedConfigDetailsMono(
     textPrimary: Color,
     textSecondary: Color,
     textMuted: Color,
+    onRetry: () -> Unit,
 ) {
     val bg = Color(0xFF0E0E0E).copy(alpha = 0.85f)
     val border = Color(0xFF7A7A7A).copy(alpha = 0.35f)
 
     var expanded by remember(configId) { mutableStateOf(false) }
 
+    /** Overflow detection for collapse-mode only. */
     var descOverflow by remember(configId) { mutableStateOf(false) }
     var summaryOverflow by remember(configId) { mutableStateOf(false) }
     var longOverflow by remember(configId) { mutableStateOf(false) }
@@ -399,16 +462,27 @@ private fun SelectedConfigDetailsMono(
     val bringIntoViewRequester = remember(configId) { BringIntoViewRequester() }
     val scope = rememberCoroutineScope()
 
+    /**
+     * Bring the panel into view after expanding, once layout has a chance to settle.
+     */
+    LaunchedEffect(expanded, configId) {
+        if (expanded) {
+            delay(BRING_INTO_VIEW_DELAY_MS)
+            bringIntoViewRequester.bringIntoView()
+        }
+    }
+
+    val panelModifier = Modifier
+        .fillMaxWidth()
+        .bringIntoViewRequester(bringIntoViewRequester)
+        .clip(RoundedCornerShape(14.dp))
+        .background(bg)
+        .border(BorderStroke(1.dp, border), RoundedCornerShape(14.dp))
+        .padding(horizontal = 14.dp, vertical = 12.dp)
+        .testTag("SelectedConfigDetails")
+
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .bringIntoViewRequester(bringIntoViewRequester)
-            .animateContentSize()
-            .clip(RoundedCornerShape(14.dp))
-            .background(bg)
-            .border(BorderStroke(1.dp, border), RoundedCornerShape(14.dp))
-            .padding(horizontal = 14.dp, vertical = 12.dp)
-            .testTag("SelectedConfigDetails"),
+        modifier = if (!expanded) panelModifier.animateContentSize() else panelModifier,
         horizontalAlignment = Alignment.Start
     ) {
         Text(
@@ -417,7 +491,7 @@ private fun SelectedConfigDetailsMono(
             color = textMuted
         )
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.padding(top = 6.dp))
 
         Text(
             text = optionLabel,
@@ -430,8 +504,9 @@ private fun SelectedConfigDetailsMono(
             overflow = TextOverflow.Ellipsis
         )
 
-        Spacer(Modifier.height(4.dp))
+        Spacer(Modifier.padding(top = 4.dp))
 
+        /** Always-visible short description (about this option). */
         Text(
             text = optionDescription,
             style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
@@ -439,12 +514,15 @@ private fun SelectedConfigDetailsMono(
             maxLines = if (expanded) Int.MAX_VALUE else 2,
             overflow = TextOverflow.Ellipsis,
             onTextLayout = { r ->
-                if (!expanded) descOverflow = r.hasVisualOverflow
+                if (!expanded) {
+                    val v = r.hasVisualOverflow
+                    if (descOverflow != v) descOverflow = v
+                }
             },
             modifier = Modifier.testTag("SelectedConfigDesc")
         )
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.padding(top = 10.dp))
 
         when (state) {
             is ResolvedDetailsState.Loading -> {
@@ -463,13 +541,33 @@ private fun SelectedConfigDetailsMono(
                     color = Color(0xFFFFC8C8),
                     modifier = Modifier.testTag("ConfigDetailsErrorTitle")
                 )
-                Spacer(Modifier.height(6.dp))
+
+                Spacer(Modifier.padding(top = 6.dp))
+
                 Text(
                     text = (state.error.message ?: state.error::class.java.simpleName).take(240),
                     style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
                     color = Color(0xFFE0A0A0),
                     modifier = Modifier.testTag("ConfigDetailsErrorMessage")
                 )
+
+                Spacer(Modifier.padding(top = 10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = onRetry,
+                        modifier = Modifier.testTag("ConfigDetailsRetryButton")
+                    ) {
+                        Text(
+                            text = "Retry",
+                            style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 0.2.sp),
+                            color = Color(0xFFE6E6E6)
+                        )
+                    }
+                }
             }
 
             is ResolvedDetailsState.Ready -> {
@@ -482,7 +580,7 @@ private fun SelectedConfigDetailsMono(
                     modifier = Modifier.testTag("ConfigDetailsTitle")
                 )
 
-                Spacer(Modifier.height(6.dp))
+                Spacer(Modifier.padding(top = 6.dp))
 
                 Text(
                     text = d.summary,
@@ -491,12 +589,15 @@ private fun SelectedConfigDetailsMono(
                     maxLines = if (expanded) Int.MAX_VALUE else 3,
                     overflow = TextOverflow.Ellipsis,
                     onTextLayout = { r ->
-                        if (!expanded) summaryOverflow = r.hasVisualOverflow
+                        if (!expanded) {
+                            val v = r.hasVisualOverflow
+                            if (summaryOverflow != v) summaryOverflow = v
+                        }
                     },
                     modifier = Modifier.testTag("ConfigDetailsSummary")
                 )
 
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.padding(top = 8.dp))
 
                 Text(
                     text = d.longText,
@@ -505,13 +606,16 @@ private fun SelectedConfigDetailsMono(
                     maxLines = if (expanded) Int.MAX_VALUE else 6,
                     overflow = TextOverflow.Ellipsis,
                     onTextLayout = { r ->
-                        if (!expanded) longOverflow = r.hasVisualOverflow
+                        if (!expanded) {
+                            val v = r.hasVisualOverflow
+                            if (longOverflow != v) longOverflow = v
+                        }
                     },
                     modifier = Modifier.testTag("ConfigDetailsLongText")
                 )
 
                 if (d.meta.isNotEmpty()) {
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.padding(top = 10.dp))
                     FlowRow(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -519,20 +623,25 @@ private fun SelectedConfigDetailsMono(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        d.meta.forEach { (k, v) ->
-                            MetaChipMono(label = k, value = v)
-                        }
+                        /** Stable order for predictable UI + tests. */
+                        d.meta.entries
+                            .sortedBy { it.key.lowercase() }
+                            .forEach { (k, v) ->
+                                MetaChipMono(label = k, value = v)
+                            }
                     }
                 }
             }
         }
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.padding(top = 10.dp))
 
-        val canExpandReadyContent = summaryOverflow || longOverflow
         val canExpandOptionDesc = descOverflow
+        val canExpandReadyContent = (state is ResolvedDetailsState.Ready) && (summaryOverflow || longOverflow)
 
-        val showToggle = (!expanded) && (canExpandReadyContent || canExpandOptionDesc)
+        /** Only show expand when there is actual overflow in collapsed state. */
+        val showExpand = (!expanded) && (canExpandReadyContent || canExpandOptionDesc)
+        /** When expanded, always allow collapsing back. */
         val showCollapse = expanded
 
         Row(
@@ -542,14 +651,18 @@ private fun SelectedConfigDetailsMono(
         ) {
             MetaChipMono(label = "id", value = configId)
 
-            if (showToggle || showCollapse) {
+            if (showExpand || showCollapse) {
                 TextButton(
                     onClick = {
                         val next = !expanded
                         expanded = next
                         Log.d(TAG, "ShowMore toggle: optionId=$configId expanded=$expanded")
                         if (next) {
-                            scope.launch { bringIntoViewRequester.bringIntoView() }
+                            /** Defensive: also request bring into view in case effect is delayed. */
+                            scope.launch {
+                                delay(BRING_INTO_VIEW_DELAY_MS)
+                                bringIntoViewRequester.bringIntoView()
+                            }
                         }
                     },
                     modifier = Modifier.testTag("ShowMoreButton"),
@@ -566,10 +679,16 @@ private fun SelectedConfigDetailsMono(
     }
 }
 
+/**
+ * Small monotone key/value chip.
+ *
+ * Notes:
+ * - Keep testTag stable: avoid embedding values that can change.
+ * - Validate values in tests via Text assertions instead.
+ */
 @Composable
 private fun MetaChipMono(label: String, value: String) {
-    val safeLabel = remember(label) { label.safeTestTagToken(24) }
-    val safeValue = remember(value) { value.safeTestTagToken(24) }
+    val safeLabel = remember(label) { label.safeTestTagToken(32) }
 
     Row(
         modifier = Modifier
@@ -580,7 +699,7 @@ private fun MetaChipMono(label: String, value: String) {
                 RoundedCornerShape(999.dp)
             )
             .padding(horizontal = 10.dp, vertical = 6.dp)
-            .testTag("MetaChip_${safeLabel}_${safeValue}")
+            .testTag("MetaChip_$safeLabel")
     ) {
         Text(
             text = "$label: ",
@@ -600,6 +719,9 @@ private fun MetaChipMono(label: String, value: String) {
     }
 }
 
+/**
+ * CTA row that hosts the primary Start button and an optional Restart button.
+ */
 @Composable
 private fun CtaRowMono(
     onStart: () -> Unit,
@@ -624,7 +746,7 @@ private fun CtaRowMono(
             modifier = Modifier.testTag("StartButton")
         ) {
             Icon(
-                imageVector = Icons.Filled.ArrowForward,
+                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = null
             )
             Spacer(Modifier.width(8.dp))
@@ -683,6 +805,9 @@ private fun CtaRowMono(
     }
 }
 
+/**
+ * Monotone headline with a subtle vertical gradient (high-contrast).
+ */
 @Composable
 private fun GradientHeadlineMono(
     text: String,
@@ -709,6 +834,9 @@ private fun GradientHeadlineMono(
     )
 }
 
+/**
+ * Single monotone configuration chip (readability-tuned).
+ */
 @Composable
 private fun MonoConfigOptionChip(
     option: ConfigOptionUi,
@@ -756,7 +884,7 @@ private fun MonoConfigOptionChip(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.padding(top = 4.dp))
             Text(
                 text = option.description,
                 style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
@@ -787,6 +915,11 @@ private fun MonoConfigOptionChip(
     }
 }
 
+/* ────────────────────────── Background (monotone) ───────────────────────── */
+
+/**
+ * Animated grayscale background brush for the intro screen.
+ */
 @Composable
 private fun animatedMonotoneBackground(): Brush {
     val t = rememberInfiniteTransition(label = "mono-bg")
@@ -815,6 +948,16 @@ private fun animatedMonotoneBackground(): Brush {
     )
 }
 
+/* ────────────────────────── TestTag Sanitizer ────────────────────────── */
+
+/**
+ * Sanitize strings for use in test tags.
+ *
+ * Notes:
+ * - Allow only [A-Za-z0-9_.-]
+ * - Replace other characters with underscore.
+ * - Truncate to [maxLen].
+ */
 private fun String.safeTestTagToken(maxLen: Int): String {
     val cleaned = buildString(length) {
         for (ch in this@safeTestTagToken) {

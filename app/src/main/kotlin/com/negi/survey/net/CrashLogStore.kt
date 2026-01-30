@@ -25,6 +25,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import androidx.room.util.copy
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.PrintWriter
@@ -118,7 +119,7 @@ object CrashLogStore {
 
         // Oldest first (stable behavior).
         files.sortedBy { it.lastModified() }.forEach { f ->
-            GitHubUploadWorker.enqueueExistingPayload(
+            GitHubUploadWorker.Companion.enqueueExistingPayload(
                 context = context,
                 cfg = cfg,
                 file = f

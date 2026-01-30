@@ -3,180 +3,288 @@ graph:
   nodes:
     - id: Start
       type: START
-      title: Anza
-      question: Anza
+      title: Start
+      question: Start
       nextId: Q1
 
     - id: Q1
       type: AI
-      title: Hasara ya Mavuno kutokana na Funza wa Jeshi Vamizi (Misimu 3)
+      title: FAW Yield Loss (3 Seasons)
       question: >-
-        Unapoteza mavuno kiasi gani kutokana na funza wa jeshi vamizi (FAW)? Tafadhali fikiria misimu mitatu iliyopita. (Asilimia au magunia kwa ekari ni sawa.)
+        How much yield do you lose because of fall armyworm? Please think back over the last 3 seasons. (Percent or bags per acre are fine.)
       nextId: Q2
 
     - id: Q2
       type: AI
-      title: Ubadilishanaji kwa Kuvuna Mapema kwa Siku 10
+      title: Trade-off for 10-Day Earlier Harvest
       question: >-
-        Ikiwa ungeweza kuvuna siku 10 mapema, ungekuwa tayari kupunguza mavuno kiasi gani? (Asilimia au magunia kwa ekari.)
+        If you could harvest 10 days earlier, how much yield would you be willing to give up? (Percent or bags per acre.)
       nextId: Q3
 
     - id: Q3
       type: AI
-      title: Kizingiti cha Uharibifu cha Kubadili Aina ya Mahindi
+      title: Damage Threshold to Switch Variety
       question: >-
-        Ni kiwango gani cha uharibifu wa wadudu au magonjwa kingekufanya uache kutumia aina yako ya sasa ya mahindi na ubadilishe kwenda aina mpya? (Toa kigezo wazi, kwa mfano: asilimia ya mimea au masikio yaliyoharibika, au kiwango cha ukali.)
+        What level of pest or disease damage would make you stop using your current maize variety and switch to a new variety? (Give a clear threshold, e.g., % plants/ears damaged or severity.)
       nextId: Q4
 
     - id: Q4
       type: AI
-      title: Matarajio ya Aina Mpya ya Kuchukua Nafasi
+      title: Expectations for Replacement Variety
       question: >-
-        Ungetarajia nini kutoka kwa aina mpya ya mahindi ili kuchukua nafasi ya ile unayolima sasa? Tafadhali toa maelezo kwa undani kadiri inavyowezekana (kwa mfano, muda wa kukomaa (DTM), uvumilivu wa FAW, uvumilivu wa ukame katika hatua fulani, mavuno ya kawaida).
+        What would you expect from a new maize variety to replace the one you currently grow? Please be as detailed as possible (e.g., DTM, FAW tolerance, drought stage tolerance, typical yield).
       nextId: Q5
 
     - id: Q5
       type: AI
-      title: Mavuno ya Chini Yanayokubalika Katika Mwaka Mbaya
+      title: Minimum Acceptable Harvest in Bad Year
       question: >-
-        Katika mwaka mbaya, ni mavuno madogo kiasi gani ambayo ungeyakubali na bado ukapande mahindi haya tena msimu unaofuata? (Asilimia ya mavuno ya kawaida au magunia kwa ekari.)
+        In a bad year, what is the smallest harvest you would accept and still plant this maize again next season? (Percent of usual harvest or bags per acre.)
       nextId: Q6
 
     - id: Q6
       type: AI
-      title: Wakati wa Ukame Unaoharibu Zaidi
+      title: Most Damaging Drought Timing
       question: >-
-        Ni kipindi gani katika msimu ambapo ukame unaathiri mazao yako kwa kiwango kikubwa zaidi? Ni wakati gani wa ukame ambao ni mgumu zaidi kwako? (Kwa mfano, kabla ya kutoa maua, wakati wa kutoa maua/kuchanua, kujaza punje, kabla ya kuvuna.)
+        When in the season is drought most devastating for your crop? What is the most difficult drought moment? (e.g., pre-tassel, tasseling/silking, grain fill, pre-harvest.)
       nextId: Review
 
     - id: Review
       type: REVIEW
-      title: Kagua
+      title: Review
       question: ''
       nextId: Done
 
     - id: Done
       type: DONE
-      title: Imekamilika
+      title: Done
       question: ''
 
 slm:
+  # Runtime
+  # NOTE: For debugging stability, prefer "CPU" to avoid EGL/OpenGL context issues.
+  # accelerator: "CPU"
   accelerator: "GPU"
+
+  # NOTE: EVAL/FOLLOWUP do not need 4096 tokens; smaller budgets reduce drift and failures.
   max_tokens: 4096
   top_k: 64
   top_p: 0.95
   temperature: 1.0
-  user_turn_prefix: "<start_of_turn>user"
-  model_turn_prefix: "<start_of_turn>model"
-  turn_end: "<end_of_turn>"
+
+  # Turn formatting (LiteRT-LM chat style)
+  # NOTE: Newlines help make boundaries explicit; remove '\n' only if your code already injects them.
+  user_turn_prefix: "<start_of_turn>user\n"
+  model_turn_prefix: "<start_of_turn>model\n"
+  turn_end: "<end_of_turn>\n"
+
+  # System prompt pieces
   empty_json_instruction: "Respond with an empty JSON object: {}"
   preamble: "You are a well-known farmer survey expert. Read the Question and the Answer."
-  key_contract: |
+
+  key_contract_eval: |
     OUTPUT FORMAT:
-    - All Values in Swahili.
-    - Keys:
+    - In English.
+    - Keys exactly:
       • "analysis": short string
-      • "expected answer": short string
-      • "follow-up question": a single short confirm/validate question (NOT an array)
+      • "weakness": short string
+      • "followup_needed": boolean
+      • "followup_target": short string
       • "score": integer 1–100
-    FOLLOW-UP INTENT:
-    - The follow-up must confirm or clarify the respondent's original answer to the SAME question.
-    - It must target the biggest uncertainty: missing unit/scale, missing number, time window, baseline, or method used.
-    - Keep it single-scope (no multi-part), concrete, and answerable immediately.
+
+    RULES:
+    - Judge ONLY content relevance/completeness/accuracy.
+    - Do NOT generate a follow-up question here.
+    - followup_target must be single-scope (one biggest uncertainty).
+    - Do NOT use double quotes (") inside string values. Use single quotes or no quotes.
+    - Do NOT copy the Answer verbatim into the JSON.
+
+  # FOLLOWUP (Call 2) is TEXT ONLY (no JSON).
+  key_contract_followup: |
+    OUTPUT FORMAT:
+    - In English.
+    - Return ONLY the follow-up question as plain text on ONE LINE.
+    - Do NOT output JSON.
+    - Do NOT wrap the question in quotes.
+    - No prefixes, no bullet points, no extra text.
+
+    RULES:
+    - Use ONLY the EVAL JSON input.
+    - If followup_needed is false, output an EMPTY string (no characters).
+    - If true, target exactly followup_target.
+    - Single-scope, concrete, answerable immediately.
     - Do not introduce new topics or additional objectives.
-  length_budget: |
+
+  length_budget_eval: |
     LENGTH LIMITS:
-    - analysis<=60 chars; follow-up<=120; expected answer<=120.
+    - analysis<=60 chars
+    - weakness<=120 chars
+    - followup_target<=80 chars
+    - score is integer 1–100
+
+  length_budget_followup: |
+    LENGTH LIMITS:
+    - follow-up question (text)<=120 chars
+
   scoring_rule: "Scoring rule: Judge ONLY content relevance/completeness/accuracy. Do NOT penalize style or formatting."
+
+  # IMPORTANT: This field may be appended to BOTH calls by your code.
+  # Therefore it contains explicit branching rules for EVAL vs FOLLOWUP.
   strict_output: |-
     STRICT OUTPUT (NO MARKDOWN):
-    - RAW JSON only, ONE LINE.
-    - Use COMPACT JSON (no spaces around ':' and ',').
-    - No extra text.
+    - If the task is EVAL: output RAW JSON only, ONE LINE.
+      - Use COMPACT JSON (no spaces around ':' and ',').
+      - No extra text.
+    - If the task is FOLLOWUP: output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
+      - No JSON, no quotes, no extra text.
 
-whisper:
-  enabled: true
-  asset_model_path: "models/ggml-model-q5_0.bin"
-  language: "sw"
-  translate: false
-  print_timestamp: false
-  target_sample_rate: 16000
-  record_sample_rates: [16000, 48000, 44100]
-  compute_checksum: true
-
-prompts:
+prompts_eval:
   - nodeId: Q1
     prompt: |-
-      Task:
-      - Note weaknesses (e.g., unclear units, missing seasons, outliers).
-      - Provide ONE strong expected answer: avg FAW yield loss over last 3 seasons (% or bags/acre); note high variability if present.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming unit + baseline or per-season values if missing.
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
       - Score 1–100.
-      
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q2
     prompt: |-
-      Task:
-      - Note weaknesses (e.g., vague trade-off, no units, no rationale).
-      - Provide a strong expected answer: willingness-to-accept yield loss to harvest 10 days earlier (% or bags/acre) with a one-clause reason (rain risk/price).
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer clarifying the unit/amount or rationale boundary (max acceptable loss).
-      - Score 1–100 (integer).
-      
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q3
     prompt: |-
-      Task:
-      - Note weaknesses (e.g., no threshold, unclear measure, pest vs disease mixed).
-      - Provide a strong expected answer: a clear switching threshold (e.g., ≥X% plants/ears with moderate+ damage, or a severity level at tasseling).
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the metric/scale or growth stage window.
-      - Score 1–100 (integer).
-      
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q4
     prompt: |-
-      Task:
-      - Note weaknesses (e.g., generic traits, missing numbers).
-      - Provide a strong expected answer listing 2 compact replacement targets with numeric/categorical thresholds.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the top-priority trait or a numeric target.
-      - Score 1–100 (integer).
-      
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q5
     prompt: |-
-      Task:
-      - Note weaknesses (e.g., no baseline, no unit, no decision rule).
-      - Provide a strong expected answer: minimum acceptable harvest in a bad year (% or bags/acre) plus a terse rule.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming baseline average or a concrete bad-year example.
-      - Score 1–100 (integer).
-      
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
   - nodeId: Q6
     prompt: |-
-      Task:
-      - Note weaknesses (e.g., vague timing, no stage, no symptoms).
-      - Provide a strong expected answer: most damaging drought moment as a crop stage with a one-clause reason.
-      - Ask exactly 1 follow-up question to CONFIRM/VALIDATE the same answer (single short sentence). Prefer confirming the stage definition or a concrete season example.
-      - Score 1–100 (integer).
-      
+      Task: EVAL
+      - Evaluate the Answer to the Question.
+      - Write weakness (what is missing/unclear).
+      - Identify the single biggest missing/unclear point as followup_target.
+      - Set followup_needed true if clarification is required, else false.
+      - Score 1–100.
+
       Question: {{QUESTION}}
       Answer: {{ANSWER}}
 
+prompts_followup:
+  - nodeId: Q1
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q2
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q3
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q4
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q5
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
+  - nodeId: Q6
+    prompt: |-
+      Task: FOLLOWUP
+      - Read the EVAL JSON.
+      - If followup_needed is false: output EMPTY (no characters).
+      - If true: output ONE follow-up question as plain text, one line, targeting exactly followup_target.
+      - Do NOT output JSON.
+
+      EVAL_JSON: {{EVAL_JSON}}
+
 model_defaults:
-  # Model download UI defaults
-  model_name: "Gemma3n4B"
   default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
   default_file_name: "Gemma3n4B.litertlm"
-
-  timeout_ms: 1800000          # 30 minutes
+  timeout_ms: 1800000
   ui_throttle_ms: 250
-  ui_min_delta_bytes: 1048576  # 1 MiB
+  ui_min_delta_bytes: 1048576
+
+whisper:
+  enabled: true
+  asset_model_path: "models/ggml-small-q5_1.bin"
+  language: "en"
+  translate: false
+  print_timestamp: false
+  target_sample_rate: 16000
+  record_sample_rates: [16000, 48000, 44100]
+  compute_checksum: true

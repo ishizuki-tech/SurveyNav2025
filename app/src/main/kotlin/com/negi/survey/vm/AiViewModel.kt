@@ -13,119 +13,63 @@
 
 package com.negi.survey.vm
 
-import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.negi.survey.BuildConfig
-import com.negi.survey.slm.AiRequestMode
 import com.negi.survey.slm.FollowupExtractor
-import com.negi.survey.slm.OutputKeyStyle
 import com.negi.survey.slm.Repository
-import com.negi.survey.slm.TwoStepOptions
-import com.negi.survey.slm.requestWithMode
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-
-/**
- * Optional repository hook for engines that require explicit lifecycle handling
- * to avoid native re-entry crashes (e.g., LiteRT-LM session reuse issues).
- */
-interface RepositoryRunHooks {
-
-    /** Called right before the actual request starts (after cooldown). */
-    fun onBeforeAiRun(mode: AiRequestMode) {}
-
-    /** Called after the request finishes/cancels/errors (best-effort). */
-    fun onAfterAiRun(mode: AiRequestMode) {}
-}
-
-/**
- * Optional repository hook for engines that can cooperatively cancel an in-flight run.
- *
- * IMPORTANT:
- * This is the correct place to stop native sessions / GPU kernels / streaming callbacks.
- * ViewModel job cancellation alone might not stop native work if the flow is not cooperative.
- */
-interface RepositoryCancelable {
-    fun cancelInFlight() {}
-}
+import org.json.JSONObject
 
 /**
  * ViewModel dedicated to AI-related operations and chat persistence.
  *
- * Key safety guarantees:
- * - Single-flight: at most one run is considered active at a time.
- * - Run correlation: each run has a monotonically increasing runId.
- * - Staleness guard: late emissions are ignored when runId is stale.
- * - Re-entry safety: timeout/cancel/error paths best-effort stop native work.
- * - Start/Cancel atomicity: eliminates the "running=true but evalJobRef unset" race window.
+ * Concurrency model:
+ * - Single-flight: at most one evaluation/chain at a time.
+ * - [activeRunId] guards against stale emissions.
+ *
+ * Step history model:
+ * - Step1 (EVAL) remains in primary UI state flows: raw/score/followups.
+ * - Step2 (FOLLOWUP) is appended to [stepHistory] without overwriting Step1.
+ * - UI can render both Step1 + Step2 from [stepHistory] while keeping Step1 pinned.
  */
 class AiViewModel(
     private val repo: Repository,
     private val defaultTimeoutMs: Long = DEFAULT_TIMEOUT_MS,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val cooldownAfterRunMs: Long = COOLDOWN_AFTER_RUN_MS
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : ViewModel() {
 
     companion object {
         private const val TAG = "AiViewModel"
+        private const val FULL_PROMPT_TAG = "FullPromptReview"
+        private const val FULL_TEXT_OUT_TAG = "FullTextOut"
 
-        /** Debug toggles (avoid log spam in release). */
-        private const val DEBUG_LOGS = BuildConfig.DEBUG
-        private const val DEBUG_WHITESPACE = BuildConfig.DEBUG
-
-        /** Log only the first N chunks verbosely to avoid log spam. */
-        private const val DEBUG_CHUNK_LOG_LIMIT = 12
-
-        /** Max chars to show in debug previews (avoid huge log lines). */
+        private const val DEBUG_LOGS = true
+        private const val DEBUG_WHITESPACE = true
         private const val DEBUG_PREVIEW_CHARS = 240
 
         private const val DEFAULT_TIMEOUT_MS = 120_000L
-
-        /**
-         * Stream publishing throttle to reduce UI churn / allocations.
-         * Publish stream snapshot at most every N ms OR after N new chars.
-         */
-        private const val STREAM_PUBLISH_MIN_INTERVAL_MS = 40L
-        private const val STREAM_PUBLISH_MIN_NEW_CHARS = 96
-
-        /** Max chat messages per node (soft cap to prevent unbounded growth). */
-        private const val CHAT_MAX_PER_NODE = 200
-
-        /**
-         * Cooldown between runs (helps native engines that crash on immediate re-entry).
-         */
-        private const val COOLDOWN_AFTER_RUN_MS = 250L
-
-        private const val TYPING_ID_PREFIX = "typing-"
     }
 
-    /* ───────────────────────── UI state ───────────────────────── */
+    // ───────────────────────── UI state ─────────────────────────
 
     private val _loading = MutableStateFlow(false)
 
@@ -139,810 +83,949 @@ class AiViewModel(
 
     private val _stream = MutableStateFlow("")
 
-    /** Live concatenation of streamed tokens from the model (throttled). */
+    /** Live concatenation of streamed tokens from the model (for the currently running step). */
     val stream: StateFlow<String> = _stream.asStateFlow()
 
     private val _raw = MutableStateFlow<String?>(null)
 
-    /** Final raw output used for parsing follow-ups and score. */
+    /** Primary raw output (kept as Step1 by default). */
     val raw: StateFlow<String?> = _raw.asStateFlow()
 
     private val _followupQuestion = MutableStateFlow<String?>(null)
 
-    /** First follow-up question extracted from the model output. */
+    /** Primary follow-up question extracted from the model output (kept as Step1 by default). */
     val followupQuestion: StateFlow<String?> = _followupQuestion.asStateFlow()
 
     private val _followups = MutableStateFlow<List<String>>(emptyList())
 
-    /** All extracted follow-up questions (up to top-3). */
+    /** Primary extracted follow-up questions (top-3, kept as Step1 by default). */
     val followups: StateFlow<List<String>> = _followups.asStateFlow()
 
     private val _error = MutableStateFlow<String?>(null)
 
-    /**
-     * Last error string:
-     * - "timeout"
-     * - "cancelled"
-     * - other human-readable message
-     *
-     * Null means no surface-worthy error is present.
-     */
+    /** Last error string or null. */
     val error: StateFlow<String?> = _error.asStateFlow()
 
     private val _events = MutableSharedFlow<AiEvent>(extraBufferCapacity = 32)
 
-    /** Event stream for fine-grained UI reactions (toasts, effects, etc.). */
+    /** Event stream for fine-grained UI reactions. */
     val events: SharedFlow<AiEvent> = _events.asSharedFlow()
 
-    /* ─────────────── Run correlation (Debug & UI gating) ─────────────── */
-
-    private val _activeRunIdFlow = MutableStateFlow(0L)
-
-    /** Current active runId while running, otherwise 0. */
-    val activeRunIdFlow: StateFlow<Long> = _activeRunIdFlow.asStateFlow()
-
-    private val _streamRunId = MutableStateFlow(0L)
-
-    /** runId that most recently updated [stream]. */
-    val streamRunId: StateFlow<Long> = _streamRunId.asStateFlow()
-
-    private val _rawRunId = MutableStateFlow(0L)
-
-    /** runId that most recently updated [raw]. */
-    val rawRunId: StateFlow<Long> = _rawRunId.asStateFlow()
-
-    /* ─────────────────────── Chat persistence ─────────────────────── */
-
-    /** Chat message sender role. */
-    enum class ChatSender { USER, AI }
+    // ─────────────────────── Step history (Step1 + Step2) ───────────────────────
 
     /**
-     * ViewModel-level representation of a chat bubble.
+     * Evaluation output mode.
      *
-     * @param id Stable identifier for diffing.
-     * @param sender Author of the message.
-     * @param text Plain text bubble content for normal messages.
-     * @param json Raw JSON content (for final result bubbles).
-     * @param isTyping True when this bubble represents a typing indicator.
+     * - EVAL_JSON: expects JSON with score + follow-up candidates.
+     * - FOLLOWUP_JSON_OR_TEXT: expects either JSON (preferred) OR raw text as follow-up question.
      */
-    data class ChatMsgVm(
-        val id: String,
-        val sender: ChatSender,
-        val text: String? = null,
-        val json: String? = null,
-        val isTyping: Boolean = false
+    enum class EvalMode {
+        EVAL_JSON,
+        FOLLOWUP_JSON_OR_TEXT
+    }
+
+    /**
+     * Prompt building phase.
+     *
+     * ONE_STEP: single-call evaluation prompt.
+     * EVAL: two-step phase 1 (returns EVAL JSON).
+     * FOLLOWUP: two-step phase 2 (returns follow-up question; may be text-only).
+     */
+    enum class PromptPhase {
+        ONE_STEP,
+        EVAL,
+        FOLLOWUP
+    }
+
+    /**
+     * Immutable record for a completed step to render both Step1 and Step2 in UI.
+     *
+     * @param runId Internal run id.
+     * @param phase Phase of this step.
+     * @param mode Parse mode used.
+     * @param raw Final raw output for this step (may be partial on timeout).
+     * @param score Parsed score (only meaningful for EVAL_JSON).
+     * @param followups Extracted follow-ups (top-3, or single follow-up for FOLLOWUP mode).
+     * @param timedOut True if request timed out.
+     * @param error Error string (if any).
+     */
+    data class StepSnapshot(
+        val runId: Long,
+        val phase: PromptPhase,
+        val mode: EvalMode,
+        val raw: String,
+        val score: Int?,
+        val followups: List<String>,
+        val timedOut: Boolean,
+        val error: String?
     )
 
-    private val _chats = MutableStateFlow<Map<String, List<ChatMsgVm>>>(emptyMap())
+    private val _stepHistory = MutableStateFlow<List<StepSnapshot>>(emptyList())
 
-    /** All chats keyed by nodeId. */
-    val chats: StateFlow<Map<String, List<ChatMsgVm>>> = _chats.asStateFlow()
+    /** Completed steps in order (keeps Step1 + Step2). */
+    val stepHistory: StateFlow<List<StepSnapshot>> = _stepHistory.asStateFlow()
 
-    /**
-     * Cache chat flows per nodeId to avoid creating multiple stateIn flows.
-     *
-     * IMPORTANT:
-     * Use computeIfAbsent on ConcurrentHashMap to avoid rare double-initialization.
-     */
-    private val chatFlowCache = ConcurrentHashMap<String, StateFlow<List<ChatMsgVm>>>()
-
-    /**
-     * Observe chat list for a specific [nodeId] as a [StateFlow].
-     */
-    fun chatFlow(nodeId: String): StateFlow<List<ChatMsgVm>> =
-        chatFlowCache.computeIfAbsent(nodeId) {
-            _chats
-                .map { it[nodeId] ?: emptyList() }
-                .stateIn(
-                    scope = viewModelScope,
-                    started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5000),
-                    initialValue = emptyList()
-                )
-        }
-
-    /**
-     * Ensure the first AI question bubble is inserted only once for a node.
-     *
-     * Behavior:
-     * - If missing, insert at the beginning (even if the chat already has messages).
-     * - If already present, do nothing.
-     */
-    fun chatEnsureSeedQuestion(nodeId: String, question: String) {
-        val q = question.trim()
-        if (q.isBlank()) return
-
-        updateNode(nodeId) { list ->
-            val already =
-                list.any { it.id == "q-$nodeId" } ||
-                        list.any { it.sender == ChatSender.AI && (it.text ?: "").trim() == q }
-
-            if (already) list
-            else listOf(ChatMsgVm(id = "q-$nodeId", sender = ChatSender.AI, text = q)) + list
-        }
-
-        if (DEBUG_LOGS) Log.d(TAG, "chatEnsureSeedQuestion: ensured for $nodeId")
+    /** Clear step history (typically at the start of a new independent run/chain). */
+    private fun clearStepHistory() {
+        _stepHistory.value = emptyList()
     }
 
-    /** Append a new chat message for [nodeId]. */
-    fun chatAppend(nodeId: String, msg: ChatMsgVm) {
-        updateNode(nodeId) { list ->
-            val next = list + msg
-            if (next.size <= CHAT_MAX_PER_NODE) next else next.takeLast(CHAT_MAX_PER_NODE)
-        }
-        if (DEBUG_LOGS) Log.v(TAG, "chatAppend[$nodeId]: ${msg.id}")
-    }
-
-    /** Replace existing typing bubble or append if not present. */
-    fun chatUpsertTyping(nodeId: String, typing: ChatMsgVm) {
-        updateNode(nodeId) { list ->
-            val i = list.indexOfFirst { it.isTyping || it.id.startsWith(TYPING_ID_PREFIX) }
-            val next = if (i >= 0) list.toMutableList().apply { set(i, typing) } else list + typing
-            if (next.size <= CHAT_MAX_PER_NODE) next else next.takeLast(CHAT_MAX_PER_NODE)
+    /** Append one snapshot to history. */
+    private fun appendStepSnapshot(s: StepSnapshot) {
+        _stepHistory.update { it + s }
+        if (DEBUG_LOGS) {
+            val fu0 = s.followups.firstOrNull()?.let { preview(it) } ?: "<none>"
+            Log.d(
+                TAG,
+                "stepHistory+ runId=${s.runId} phase=${s.phase} mode=${s.mode} " +
+                        "raw.len=${s.raw.length} score=${s.score} FU=${s.followups.size} " +
+                        "FU0='${debugVisible(fu0)}' timeout=${s.timedOut} err=${s.error}"
+            )
         }
     }
 
-    /** Remove any typing bubbles for [nodeId]. */
-    fun chatRemoveTyping(nodeId: String) {
-        updateNode(nodeId) { list ->
-            list.filterNot { it.isTyping || it.id.startsWith(TYPING_ID_PREFIX) }
-        }
-    }
+    // ─────────────────────── Execution control ───────────────────────
 
-    /** Replace a typing bubble with [finalMsg], or append if none exists. */
-    fun chatReplaceTypingWith(nodeId: String, finalMsg: ChatMsgVm) {
-        updateNode(nodeId) { list ->
-            val i = list.indexOfFirst { it.isTyping || it.id.startsWith(TYPING_ID_PREFIX) }
-            val next = if (i >= 0) list.toMutableList().apply { set(i, finalMsg) } else list + finalMsg
-            if (next.size <= CHAT_MAX_PER_NODE) next else next.takeLast(CHAT_MAX_PER_NODE)
-        }
-    }
-
-    /** Clear chat history for a single [nodeId]. */
-    fun chatClear(nodeId: String) {
-        _chats.update { it - nodeId }
-        chatFlowCache.remove(nodeId)
-        if (DEBUG_LOGS) Log.w(TAG, "chatClear: cleared chat for $nodeId")
-    }
-
-    /** Clear chat history for all nodes. */
-    fun resetChats() {
-        _chats.value = emptyMap()
-        chatFlowCache.clear()
-        if (DEBUG_LOGS) Log.w(TAG, "resetChats: cleared all chats")
-    }
-
-    private inline fun updateNode(
-        nodeId: String,
-        xform: (List<ChatMsgVm>) -> List<ChatMsgVm>
-    ) {
-        _chats.update { map ->
-            val cur = map[nodeId] ?: emptyList()
-            map + (nodeId to xform(cur))
-        }
-    }
-
-    /* ─────────────────────── Execution control ─────────────────────── */
-
-    /**
-     * A single lock to serialize start/cancel/reset operations.
-     *
-     * IMPORTANT:
-     * This eliminates the "running=true but evalJobRef unset" race window.
-     */
-    private val stateLock = Any()
-
-    private val evalJobRef = AtomicReference<Job?>(null)
+    private var evalJob: Job? = null
     private val running = AtomicBoolean(false)
 
-    /** Run id / staleness guard. */
     private val runSeq = AtomicLong(0L)
     private val activeRunId = AtomicLong(0L)
-
-    /** Cooldown guard. */
-    private val nextAllowedAt = AtomicLong(0L)
 
     /** True when an evaluation coroutine is currently running. */
     val isRunning: Boolean
         get() = running.get()
 
-    /** Public handle for run correlation. */
-    data class RunHandle(
+    /**
+     * Run-local immutable result for chaining.
+     *
+     * @param runId Internal run identifier.
+     * @param raw Final raw output (may be partial on timeout).
+     * @param score Parsed score.
+     * @param followups Extracted follow-ups (top-3).
+     * @param timedOut True if the request timed out.
+     */
+    data class EvalResult(
         val runId: Long,
-        val job: Job
+        val raw: String,
+        val score: Int?,
+        val followups: List<String>,
+        val timedOut: Boolean
     )
 
-    /* ─────────────────────── Mode helpers ─────────────────────── */
-
-    fun defaultTwoStepOptions(): TwoStepOptions {
-        return TwoStepOptions(
-            evalOkScoreThreshold = 85,
-            skipFollowupWhenOk = true,
-            followupOnEvalParseError = true,
-            outputKeyStyle = OutputKeyStyle.LEGACY,
-            emitEvalChunks = false,
-            emitFollowupChunks = false,
-            emitFinalMergedJson = true,
-            followupOverridesAllFields = false,
-            includeGatingFieldsInFinal = false,
-            includeMetaInFinal = false
-        )
-    }
-
-    /* ─────────────────────── Public API ─────────────────────── */
-
     /**
-     * Start a single-step async run and return a handle containing the runId.
+     * Evaluate the given [prompt] and return the parsed score (0..100) or null.
      *
-     * NOTE:
-     * Use this from UI when you need to correlate raw/stream with a specific request.
+     * Single-flight:
+     * - If already running, returns the current score.
      */
-    fun startSingleStepAsync(
-        prompt: String,
-        timeoutMs: Long = defaultTimeoutMs
-    ): RunHandle {
-        return startAsyncWithMode(prompt, AiRequestMode.SingleStep(passThroughStreaming = true), timeoutMs)
-    }
-
-    /**
-     * Start a run (single-step or double-step) and return a handle containing the runId.
-     */
-    fun startAsyncWithMode(
-        prompt: String,
-        mode: AiRequestMode,
-        timeoutMs: Long = defaultTimeoutMs
-    ): RunHandle {
+    suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
         if (prompt.isBlank()) {
-            resetStates(keepError = false)
-            return RunHandle(runId = 0L, job = viewModelScope.launch { })
-        }
-
-        if (DEBUG_LOGS) {
-            Log.d(TAG, "startAsyncWithMode: prompt.len=${prompt.length}, mode=${mode.javaClass.simpleName}")
-        }
-
-        synchronized(stateLock) {
-            if (!running.compareAndSet(false, true)) {
-                _events.tryEmit(AiEvent.Busy)
-                val existingRunId = activeRunId.get()
-                val existingJob = evalJobRef.get()
-
-                if (DEBUG_LOGS) Log.w(TAG, "startAsyncWithMode: busy -> returning existing runId=$existingRunId")
-
-                val job = existingJob ?: viewModelScope.launch(ioDispatcher) {
-                    // Best-effort wait if we ever hit an unexpected null window.
-                    var spins = 0
-                    while (evalJobRef.get() == null && running.get() && spins < 200) {
-                        delay(5)
-                        spins++
-                    }
-                    evalJobRef.get()?.join()
-                }
-
-                return RunHandle(runId = existingRunId, job = job)
-            }
-
-            // If we reached here, we successfully claimed the single-flight.
-            val runId = runSeq.incrementAndGet()
-            activeRunId.set(runId)
-            _activeRunIdFlow.value = runId
-
-            // Cancel any lingering job (should be rare).
-            // IMPORTANT: stop native work first to avoid re-entry crashes.
-            runCatching { (repo as? RepositoryCancelable)?.cancelInFlight() }
-                .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "repo.cancelInFlight failed (ignored)", t) }
-
-            runCatching { evalJobRef.getAndSet(null)?.cancel() }
-                .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "previous job cancel failed (ignored)", t) }
-
-            prepareUiForNewRun(runId)
-
-            // CRITICAL FIX:
-            // Create LAZY job, install it into evalJobRef, then start() it.
-            // This removes the "job finishes before evalJobRef is set" race.
-            val job = startEvaluationInternalLazy(runId = runId, originalPrompt = prompt, mode = mode, timeoutMs = timeoutMs)
-            evalJobRef.set(job)
-            job.start()
-
-            return RunHandle(runId = runId, job = job)
-        }
-    }
-
-    /**
-     * Backward-compatible async entrypoint (single-step).
-     */
-    fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
-        return startSingleStepAsync(prompt, timeoutMs).job
-    }
-
-    /**
-     * Backward-compatible async entrypoint (with mode).
-     */
-    fun evaluateAsyncWithMode(
-        prompt: String,
-        mode: AiRequestMode,
-        timeoutMs: Long = defaultTimeoutMs
-    ): Job {
-        return startAsyncWithMode(prompt, mode, timeoutMs).job
-    }
-
-    /**
-     * Unified async entrypoint for SingleStep / DoubleStep evaluation.
-     */
-    fun evaluateAsyncAuto(
-        prompt: String,
-        useTwoStep: Boolean,
-        twoStepOptions: TwoStepOptions = defaultTwoStepOptions(),
-        timeoutMs: Long = defaultTimeoutMs
-    ): Job {
-        val mode: AiRequestMode =
-            if (useTwoStep) AiRequestMode.DoubleStep(options = twoStepOptions)
-            else AiRequestMode.SingleStep(passThroughStreaming = true)
-
-        return startAsyncWithMode(prompt, mode, timeoutMs).job
-    }
-
-    /**
-     * Unified suspend entrypoint for SingleStep / DoubleStep evaluation.
-     *
-     * NOTE:
-     * If you need runId correlation, use [startAsyncWithMode] + join at the call site.
-     */
-    suspend fun evaluateWithMode(
-        prompt: String,
-        mode: AiRequestMode,
-        timeoutMs: Long = defaultTimeoutMs
-    ): Int? {
-        if (prompt.isBlank()) {
-            if (DEBUG_LOGS) Log.i(TAG, "evaluateWithMode: blank prompt -> reset states and return null")
+            Log.i(TAG, "evaluate: blank prompt -> reset states and return null")
             resetStates(keepError = false)
             return null
         }
 
-        // If already running, keep the original semantics: do not queue.
-        synchronized(stateLock) {
-            if (running.get()) {
-                if (DEBUG_LOGS) Log.w(TAG, "evaluateWithMode: already running -> returning current score=${_score.value}")
-                _events.tryEmit(AiEvent.Busy)
-                return _score.value
-            }
+        if (!running.compareAndSet(false, true)) {
+            Log.w(TAG, "evaluate: already running -> returning current score=${_score.value}")
+            return _score.value
         }
 
-        val handle = startAsyncWithMode(prompt, mode, timeoutMs)
-        try {
-            val elapsed = measureTimeMillis { handle.job.join() }
-            if (DEBUG_LOGS) {
-                Log.d(TAG, "evaluateWithMode: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
-            }
-        } catch (e: CancellationException) {
-            if (DEBUG_LOGS) Log.w(TAG, "evaluateWithMode: caller cancelled -> silent cancel", e)
-            stopInFlightSilently()
-            throw e
+        cancelDanglingJobIfAny(reason = "dangling_before_new_run")
+
+        prepareUiForNewChain(clearHistory = true)
+
+        val runId = runSeq.incrementAndGet()
+        activeRunId.set(runId)
+
+        val elapsed = measureTimeMillis {
+            val job = startEvaluationInternal(
+                runId = runId,
+                userPrompt = prompt,
+                timeoutMs = timeoutMs,
+                mode = EvalMode.EVAL_JSON,
+                phase = PromptPhase.ONE_STEP,
+                commitToPrimaryState = true
+            )
+            evalJob = job
+            job.join()
         }
 
+        Log.d(TAG, "evaluate: finished in ${elapsed}ms, score=${_score.value}, err=${_error.value}")
         return _score.value
     }
 
-    suspend fun evaluate(prompt: String, timeoutMs: Long = defaultTimeoutMs): Int? {
-        return evaluateWithMode(prompt, AiRequestMode.SingleStep(passThroughStreaming = true), timeoutMs)
+    /**
+     * Fire-and-forget variant of [evaluate].
+     *
+     * Single-flight:
+     * - If already running, returns the current [evalJob] without starting a new run.
+     */
+    fun evaluateAsync(prompt: String, timeoutMs: Long = defaultTimeoutMs): Job {
+        if (prompt.isBlank()) {
+            resetStates(keepError = false)
+            return viewModelScope.launch { }
+        }
+
+        if (!running.compareAndSet(false, true)) {
+            Log.w(TAG, "evaluateAsync: already running -> returning existing job")
+            return evalJob ?: viewModelScope.launch { }
+        }
+
+        cancelDanglingJobIfAny(reason = "dangling_before_new_run")
+
+        prepareUiForNewChain(clearHistory = true)
+
+        val runId = runSeq.incrementAndGet()
+        activeRunId.set(runId)
+
+        val job = startEvaluationInternal(
+            runId = runId,
+            userPrompt = prompt,
+            timeoutMs = timeoutMs,
+            mode = EvalMode.EVAL_JSON,
+            phase = PromptPhase.ONE_STEP,
+            commitToPrimaryState = true
+        )
+        evalJob = job
+        return job
     }
 
-    suspend fun evaluateTwoStep(
-        prompt: String,
-        twoStepOptions: TwoStepOptions = defaultTwoStepOptions(),
-        timeoutMs: Long = defaultTimeoutMs
-    ): Int? {
-        return evaluateWithMode(prompt, AiRequestMode.DoubleStep(options = twoStepOptions), timeoutMs)
+    /**
+     * Two-step chaining:
+     * 1) Evaluate [firstPrompt].
+     * 2) Build prompt2 from step1 result via [buildSecondPrompt], then evaluate it.
+     *
+     * This keeps both steps in [stepHistory].
+     */
+    fun evaluateTwoStepFromFirstAsync(
+        firstPrompt: String,
+        timeoutMs: Long = defaultTimeoutMs,
+        proceedOnTimeout: Boolean = true,
+        buildSecondPrompt: (EvalResult) -> String
+    ): Job {
+        val p1 = firstPrompt.trim()
+        if (p1.isEmpty()) {
+            resetStates(keepError = false)
+            return viewModelScope.launch { }
+        }
+
+        if (!running.compareAndSet(false, true)) {
+            Log.w(TAG, "evaluateTwoStepFromFirstAsync: already running -> returning existing job")
+            return evalJob ?: viewModelScope.launch { }
+        }
+
+        cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
+
+        prepareUiForNewChain(clearHistory = true)
+
+        val chainJob = viewModelScope.launch(ioDispatcher) {
+            try {
+                if (DEBUG_LOGS) Log.d(TAG, "chain2: timeoutMs=$timeoutMs")
+
+                // --- step 1 ---
+                val runId1 = runSeq.incrementAndGet()
+                activeRunId.set(runId1)
+
+                val r1 = runEvaluationCore(
+                    runId = runId1,
+                    userPrompt = p1,
+                    timeoutMs = timeoutMs,
+                    mode = EvalMode.EVAL_JSON,
+                    phase = PromptPhase.EVAL,
+                    commitToPrimaryState = true
+                )
+
+                if (!proceedOnTimeout && r1.timedOut) {
+                    if (DEBUG_LOGS) Log.w(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
+                    return@launch
+                }
+
+                // --- step 2 (derived) ---
+                val p2 = runCatching { buildSecondPrompt(r1).trim() }
+                    .onFailure { t -> Log.e(TAG, "chain2: buildSecondPrompt failed", t) }
+                    .getOrElse { "" }
+
+                if (p2.isEmpty()) {
+                    if (DEBUG_LOGS) Log.w(TAG, "chain2: step2 prompt is blank -> done")
+                    return@launch
+                }
+
+                prepareUiForNextStep()
+
+                val runId2 = runSeq.incrementAndGet()
+                activeRunId.set(runId2)
+
+                runEvaluationCore(
+                    runId = runId2,
+                    userPrompt = p2,
+                    timeoutMs = timeoutMs,
+                    mode = EvalMode.FOLLOWUP_JSON_OR_TEXT,
+                    phase = PromptPhase.FOLLOWUP,
+                    commitToPrimaryState = false
+                )
+            } finally {
+                finalizeChainFlags()
+            }
+        }
+
+        evalJob = chainJob
+        return chainJob
+    }
+
+    /**
+     * Conditional two-step:
+     * 1) Run a short EVAL prompt (step1).
+     * 2) Only if [shouldRunSecond] returns true, build prompt2 from step1 result and run step2.
+     *
+     * UI goal:
+     * - Keep Step1 pinned in primary UI state (score/raw/followups).
+     * - Append Step2 into [stepHistory] without overwriting Step1.
+     */
+    fun evaluateConditionalTwoStepAsync(
+        firstPrompt: String,
+        timeoutMs: Long = defaultTimeoutMs,
+        proceedOnTimeout: Boolean = true,
+        shouldRunSecond: (EvalResult) -> Boolean,
+        buildSecondPrompt: (EvalResult) -> String
+    ): Job {
+        val p1 = firstPrompt.trim()
+        if (p1.isEmpty()) {
+            resetStates(keepError = false)
+            return viewModelScope.launch { }
+        }
+
+        if (!running.compareAndSet(false, true)) {
+            Log.w(TAG, "evaluateConditionalTwoStepAsync: already running -> returning existing job")
+            return evalJob ?: viewModelScope.launch { }
+        }
+
+        cancelDanglingJobIfAny(reason = "dangling_before_new_chain")
+
+        prepareUiForNewChain(clearHistory = true)
+
+        val chainJob = viewModelScope.launch(ioDispatcher) {
+            try {
+                // --- step 1 (EVAL JSON) ---
+                val runId1 = runSeq.incrementAndGet()
+                activeRunId.set(runId1)
+
+                val step1 = runEvaluationCore(
+                    runId = runId1,
+                    userPrompt = p1,
+                    timeoutMs = timeoutMs,
+                    mode = EvalMode.EVAL_JSON,
+                    phase = PromptPhase.EVAL,
+                    commitToPrimaryState = true
+                )
+
+                if (step1.timedOut && !proceedOnTimeout) {
+                    if (DEBUG_LOGS) Log.w(TAG, "chain2: step1 timed out -> skipping step2 (proceedOnTimeout=false)")
+                    return@launch
+                }
+
+                val doStep2 = runCatching { shouldRunSecond(step1) }
+                    .onFailure { t -> Log.e(TAG, "chain2: shouldRunSecond failed -> treat as false", t) }
+                    .getOrElse { false }
+
+                if (!doStep2) {
+                    if (DEBUG_LOGS) {
+                        Log.d(
+                            TAG,
+                            "chain2: step2 skipped (score=${step1.score}, followups=${step1.followups.size}, timedOut=${step1.timedOut}, rawPreview='${debugVisible(preview(step1.raw))}')"
+                        )
+                    }
+                    return@launch
+                }
+
+                // --- step 2 (FOLLOWUP; JSON or raw text) ---
+                val p2 = runCatching { buildSecondPrompt(step1).trim() }
+                    .onFailure { t -> Log.e(TAG, "chain2: buildSecondPrompt failed", t) }
+                    .getOrElse { "" }
+
+                if (p2.isEmpty()) {
+                    if (DEBUG_LOGS) Log.w(TAG, "chain2: step2 prompt is blank -> done")
+                    return@launch
+                }
+
+                /**
+                 * Prepare next step without clearing Step1 primary state.
+                 * - Step1 remains visible through score/raw/followups.
+                 * - Step2 streaming uses _stream.
+                 */
+                prepareUiForNextStep()
+
+                val runId2 = runSeq.incrementAndGet()
+                activeRunId.set(runId2)
+
+                runEvaluationCore(
+                    runId = runId2,
+                    userPrompt = p2,
+                    timeoutMs = timeoutMs,
+                    mode = EvalMode.FOLLOWUP_JSON_OR_TEXT,
+                    phase = PromptPhase.FOLLOWUP,
+                    commitToPrimaryState = false
+                )
+            } finally {
+                finalizeChainFlags()
+            }
+        }
+
+        evalJob = chainJob
+        return chainJob
     }
 
     /**
      * Cancel the ongoing evaluation if any.
      *
-     * User-driven cancel semantics:
-     * - Immediately updates UI (loading=false, error="cancelled")
-     * - Invalidates run id to ignore late emissions
-     * - Emits [AiEvent.Cancelled] exactly once from here
+     * This is a user-driven cancellation path.
      */
     fun cancel() {
-        cancelInternal(silent = false)
+        Log.i(TAG, "cancel: invoked (isRunning=${running.get()}, loading=${_loading.value})")
+        stopCurrentRunInternal(reason = "cancelled", emitCancelledEvent = true, setCancelledError = true)
     }
 
     /**
-     * Stop any in-flight run silently (no "cancelled" surfaced to UI).
+     * Reset transient AI-related states.
      *
-     * Use this from UI on navigation / dispose to prevent native engines
-     * from continuing work after leaving the screen.
-     */
-    fun stopInFlightSilently() {
-        cancelInternal(silent = true)
-    }
-
-    /**
-     * Reset transient AI-related states while keeping chat history intact.
-     *
-     * IMPORTANT:
-     * This reset must not surface user-visible "cancelled" errors.
+     * NOTE:
+     * - Also clears [stepHistory] because the UI expects a clean slate.
      */
     fun resetStates(keepError: Boolean = false) {
-        cancelInternal(silent = true)
+        stopCurrentRunInternal(reason = "reset", emitCancelledEvent = false, setCancelledError = false)
+
+        clearStepHistory()
+
         _score.value = null
         _stream.value = ""
         _raw.value = null
-        _rawRunId.value = 0L
-        _streamRunId.value = 0L
         _followupQuestion.value = null
         _followups.value = emptyList()
+        _loading.value = false
         if (!keepError) _error.value = null
     }
 
-    /** Reset all AI-related state including chats. */
-    fun resetAll(keepError: Boolean = false) {
-        resetStates(keepError = keepError)
-        resetChats()
-    }
-
     override fun onCleared() {
-        if (DEBUG_LOGS) Log.i(TAG, "onCleared: ViewModel is being cleared -> silent cancel")
+        Log.i(TAG, "onCleared: ViewModel is being cleared -> stopCurrentRunInternal()")
         super.onCleared()
-        cancelInternal(silent = true)
+        stopCurrentRunInternal(reason = "cleared", emitCancelledEvent = false, setCancelledError = false)
     }
-
-    /* ───────────────────────── Internal evaluation core ───────────────────────── */
 
     /**
-     * Create a LAZY evaluation job.
+     * Backward-compatible alias for older call sites.
      *
-     * IMPORTANT:
-     * The caller must set evalJobRef to this job and call start() while holding stateLock.
-     * This prevents the rare race where a very fast coroutine completes before evalJobRef
-     * is installed, leaving the ViewModel stuck in a running state.
+     * Prefer [resetStates] for new code.
+     *
+     * @param keepError Whether to preserve the last error string.
      */
-    private fun startEvaluationInternalLazy(
+    @Deprecated(
+        message = "Use resetStates(keepError) instead.",
+        replaceWith = ReplaceWith("resetStates(keepError = keepError)")
+    )
+    fun resetAll(keepError: Boolean = false) {
+        resetStates(keepError = keepError)
+    }
+
+    // ───────────────────────── Internal evaluation core ─────────────────────────
+
+    private fun startEvaluationInternal(
         runId: Long,
-        originalPrompt: String,
-        mode: AiRequestMode,
-        timeoutMs: Long
-    ): Job = viewModelScope.launch(
-        context = ioDispatcher,
-        start = CoroutineStart.LAZY
-    ) {
-
-        fun isActiveRun(): Boolean = activeRunId.get() == runId
-
-        fun requireActiveRun() {
-            if (!isActiveRun()) throw CancellationException("stale-run")
+        userPrompt: String,
+        timeoutMs: Long,
+        mode: EvalMode,
+        phase: PromptPhase,
+        commitToPrimaryState: Boolean
+    ): Job = viewModelScope.launch(ioDispatcher) {
+        try {
+            runEvaluationCore(
+                runId = runId,
+                userPrompt = userPrompt,
+                timeoutMs = timeoutMs,
+                mode = mode,
+                phase = phase,
+                commitToPrimaryState = commitToPrimaryState
+            )
+        } finally {
+            finalizeRunFlagsIfActive(runId)
         }
+    }
 
-        suspend fun awaitCooldownIfNeeded() {
-            while (true) {
-                val now = SystemClock.elapsedRealtime()
-                val allowAt = nextAllowedAt.get()
-                val waitMs = allowAt - now
-                if (waitMs <= 0) return
-                if (DEBUG_LOGS) Log.w(TAG, "cooldown.wait: ${waitMs}ms (runId=$runId)")
-                delay(min(waitMs, 1_000L))
-            }
-        }
-
-        fun stopNativeBestEffort(tag: String) {
-            runCatching { (repo as? RepositoryCancelable)?.cancelInFlight() }
-                .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "stopNativeBestEffort[$tag] failed (ignored)", t) }
-        }
-
-        val hooks = repo as? RepositoryRunHooks
-
+    /**
+     * Run one inference call and parse its output according to [mode].
+     *
+     * Key behavior:
+     * - Always appends a [StepSnapshot] to [stepHistory].
+     * - If [commitToPrimaryState] is false, Step1 primary state (score/raw/followups) is NOT overwritten.
+     */
+    private suspend fun runEvaluationCore(
+        runId: Long,
+        userPrompt: String,
+        timeoutMs: Long,
+        mode: EvalMode,
+        phase: PromptPhase,
+        commitToPrimaryState: Boolean
+    ): EvalResult {
         val buf = StringBuilder()
-        val eventBuf = StringBuilder()
-
         var chunkCount = 0
         var totalChars = 0
         var timedOut = false
-        var finalEmitted = false
 
-        /** Throttle stream publishing. */
-        var lastPublishAt = 0L
-        var lastPublishedLen = 0
+        fun isActiveRun(): Boolean = activeRunId.get() == runId
 
-        fun flushStreamAndEvents(force: Boolean = false) {
-            val now = SystemClock.elapsedRealtime()
-            val len = buf.length
-            val delta = len - lastPublishedLen
+        /**
+         * Return true if the output is a trivial empty JSON object (optionally with whitespace).
+         */
+        fun isEmptyJsonObject(text: String): Boolean {
+            val t = text.trim()
+            return t == "{}" || t == "{ }"
+        }
 
-            val dueByTime = (now - lastPublishAt) >= STREAM_PUBLISH_MIN_INTERVAL_MS
-            val dueByChars = delta >= STREAM_PUBLISH_MIN_NEW_CHARS
+        /**
+         * Return true if the string starts like JSON. Used for filtering follow-up candidates.
+         */
+        fun isJsonLike(text: String): Boolean {
+            val t = text.trim()
+            return t.startsWith("{") || t.startsWith("[")
+        }
 
-            if (force || dueByTime || dueByChars) {
-                if (isActiveRun()) {
-                    _stream.value = buf.toString()
-                    _streamRunId.value = runId
+        /**
+         * Filter out garbage follow-up candidates.
+         *
+         * - Removes empty lines and trivial "{}".
+         * - Removes JSON-like values to avoid polluting shouldRunSecond() with invalid followups.
+         */
+        fun sanitizeFollowups(list: List<String>): List<String> {
+            return list
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .filterNot { isEmptyJsonObject(it) }
+                .filterNot { isJsonLike(it) }
+                .distinct()
+                .take(3)
+                .toList()
+        }
 
-                    if (eventBuf.isNotEmpty()) {
-                        _events.tryEmit(AiEvent.Stream(runId = runId, chunk = eventBuf.toString()))
-                        eventBuf.setLength(0)
+        /** Extract a plausible follow-up question from raw text output (non-JSON fallback). */
+        fun extractFollowupFromPlainText(raw: String): String? {
+            val t = raw.trim()
+            if (t.isBlank()) return null
+            if (isEmptyJsonObject(t)) return null
+
+            val unquoted = t.removePrefix("\"").removeSuffix("\"").trim()
+            val lines = unquoted.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+            val qLine = lines.firstOrNull { it.contains("?") }
+            return qLine ?: lines.firstOrNull()
+        }
+
+        /**
+         * Best-effort JSON object slicing from possibly noisy text.
+         *
+         * Strategy:
+         * - Slice from first '{' to last '}'.
+         * - Reject trivial "{}".
+         */
+        fun sliceLikelyJsonObject(text: String): String? {
+            val a = text.indexOf('{')
+            val b = text.lastIndexOf('}')
+            if (a < 0 || b <= a) return null
+            val s = text.substring(a, b + 1)
+            if (isEmptyJsonObject(s)) return null
+            return s
+        }
+
+        /**
+         * Extract follow-up question from JSON using multiple key spellings.
+         */
+        fun extractFollowupFromJsonObject(jsonText: String): String? {
+            return runCatching {
+                val obj = JSONObject(jsonText)
+
+                fun pick(vararg keys: String): String? {
+                    for (k in keys) {
+                        if (!obj.has(k)) continue
+                        val v = obj.optString(k, "").trim()
+                        if (v.isNotBlank()) return v
                     }
-                } else {
-                    // Drop stale stream events aggressively to avoid UI mixing.
-                    eventBuf.setLength(0)
+                    return null
                 }
 
-                lastPublishAt = now
-                lastPublishedLen = len
-            }
+                pick(
+                    "follow_up_question",
+                    "followup_question",
+                    "follow-up question",
+                    "follow-up_question",
+                    "followUpQuestion",
+                    "question",
+                    "followup",
+                    "follow_up",
+                )
+            }.getOrNull()
         }
 
-        if (DEBUG_LOGS) {
-            Log.d(
-                TAG,
-                "run.start: runId=$runId mode=${mode.javaClass.simpleName} prompt.len=${originalPrompt.length} timeoutMs=$timeoutMs"
-            )
-            Log.d(TAG, "run.sha: prompt=${sha256Hex(originalPrompt)}")
+        /**
+         * Build prompt using best-effort compatibility:
+         * - Try repo.buildPrompt(String, PromptPhase) if present.
+         * - Try repo.buildPrompt(String, String) with phase.name if present.
+         * - Fallback to repo.buildPrompt(String).
+         */
+        fun buildPromptCompat(input: String, p: PromptPhase): String {
+            return runCatching {
+                val cls = repo.javaClass
+                val methods = (cls.methods.toList() + cls.declaredMethods.toList())
+                    .filter { it.name == "buildPrompt" }
+                    .distinctBy { m -> "${m.name}/${m.parameterTypes.joinToString(",") { it.name }}" }
+
+                // Prefer 2-arg overload first.
+                val twoArg = methods.filter { it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java }
+                for (m in twoArg) {
+                    try {
+                        m.isAccessible = true
+                        return@runCatching when (m.parameterTypes[1]) {
+                            PromptPhase::class.java -> m.invoke(repo, input, p) as String
+                            String::class.java -> m.invoke(repo, input, p.name) as String
+                            Int::class.javaPrimitiveType,
+                            Integer::class.java -> m.invoke(repo, input, p.ordinal) as String
+                            else -> m.invoke(repo, input, p.name) as String
+                        }
+                    } catch (_: Throwable) {
+                        // Keep trying next overload.
+                    }
+                }
+
+                // Fallback to 1-arg.
+                val oneArg = methods.firstOrNull { it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java }
+                if (oneArg != null) {
+                    oneArg.isAccessible = true
+                    return@runCatching oneArg.invoke(repo, input) as String
+                }
+
+                // Absolute fallback.
+                input
+            }.getOrElse { input }
         }
+
+        var stepError: String? = null
 
         try {
-            awaitCooldownIfNeeded()
-            requireActiveRun()
-
-            runCatching { hooks?.onBeforeAiRun(mode) }
-                .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "hooks.onBeforeAiRun failed (ignored)", t) }
-
-            try {
-                withTimeout(timeoutMs) {
-                    repo.requestWithMode(
-                        userPrompt = originalPrompt,
-                        mode = mode
-                    ).collect { part ->
-                        requireActiveRun()
-                        if (part.isEmpty()) return@collect
-
-                        chunkCount++
-                        buf.append(part)
-                        eventBuf.append(part)
-                        totalChars += part.length
-
-                        flushStreamAndEvents(force = false)
-
-                        if (DEBUG_LOGS && DEBUG_WHITESPACE && chunkCount <= DEBUG_CHUNK_LOG_LIMIT) {
-                            val head = part.take(12)
-                            val tail = part.takeLast(12)
-                            Log.d(
-                                TAG,
-                                "chunk[$chunkCount]: len=${part.length} leadWS=${part.firstOrNull()?.isWhitespace() == true} tailWS=${part.lastOrNull()?.isWhitespace() == true} " +
-                                        "head='${debugVisible(head)}' tail='${debugVisible(tail)}'"
-                            )
-                            Log.d(TAG, "chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
-                        }
-                    }
+            val fullPrompt = runCatching { buildPromptCompat(userPrompt, phase) }
+                .onFailure { t ->
+                    Log.e(TAG, "run[$runId]: buildPromptCompat failed; falling back to userPrompt", t)
                 }
-            } catch (e: TimeoutCancellationException) {
-                // P0 fix: ensure native is asked to stop on timeout.
-                timedOut = true
-                if (DEBUG_LOGS) Log.w(TAG, "evaluate: timeout after ${timeoutMs}ms", e)
-                stopNativeBestEffort("timeout")
-            } catch (e: CancellationException) {
-                // If stale, bail early.
-                if (!isActiveRun()) {
-                    if (DEBUG_LOGS) Log.d(TAG, "run.stale: runId=$runId cancelled/invalidated")
-                    return@launch
-                }
-
-                // Some engines surface timeout-like cancellations via CancellationException.
-                if (looksLikeTimeout(e)) {
-                    timedOut = true
-                    if (DEBUG_LOGS) Log.w(TAG, "evaluate: timeout-like cancellation (${e.javaClass.name})")
-                    stopNativeBestEffort("timeout-like")
-                } else {
-                    // User-driven cancel or upstream cancellation.
-                    stopNativeBestEffort("cancel")
-                    throw e
-                }
-            } finally {
-                runCatching { hooks?.onAfterAiRun(mode) }
-                    .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "hooks.onAfterAiRun failed (ignored)", t) }
-            }
-
-            requireActiveRun()
-
-            flushStreamAndEvents(force = true)
-
-            val rawText = buf.toString()
+                .getOrElse { userPrompt }
 
             if (DEBUG_LOGS) {
                 Log.d(
                     TAG,
-                    "Evaluate[stats]: runId=$runId mode=${mode.javaClass.simpleName} chunks=$chunkCount chars=$totalChars raw.len=${rawText.length}"
+                    "run[$runId]: mode=$mode phase=$phase commit=$commitToPrimaryState " +
+                            "prompt.len=${userPrompt.length}, fullPrompt.len=${fullPrompt.length}, timeoutMs=$timeoutMs"
                 )
-                Log.d(TAG, "Evaluate[sha]: raw=${sha256Hex(rawText)}")
+                Log.d(TAG, "run[$runId]: sha(prompt)=${sha256Hex(userPrompt)} sha(full)=${sha256Hex(fullPrompt)}")
             }
 
+            Log.i(FULL_PROMPT_TAG, "run[$runId]: FullPrompt=\n$fullPrompt")
+
+            try {
+                withTimeout(timeoutMs) {
+                    repo.request(fullPrompt).collect { part ->
+                        if (!isActiveRun()) return@collect
+
+                        if (part.isNotEmpty()) {
+                            chunkCount++
+                            buf.append(part)
+                            totalChars += part.length
+
+                            _stream.update { it + part }
+                            _events.tryEmit(AiEvent.Stream(part))
+
+                            if (DEBUG_LOGS) {
+                                Log.d(TAG, "run[$runId] chunk[$chunkCount].preview='${debugVisible(preview(part))}'")
+                            }
+                        }
+                    }
+                }
+            } catch (e: TimeoutCancellationException) {
+                timedOut = true
+                stepError = "timeout"
+                if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: timeout after ${timeoutMs}ms", e)
+            } catch (e: CancellationException) {
+                if (!isActiveRun()) throw e
+                if (looksLikeTimeout(e)) {
+                    timedOut = true
+                    stepError = "timeout"
+                    if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: timeout-like cancellation (${e.javaClass.name})")
+                } else {
+                    throw e
+                }
+            }
+
+            if (!isActiveRun()) {
+                return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = timedOut)
+            }
+
+            val rawText = buf.toString().ifBlank { _stream.value }
+            val rawTrim = rawText.trim()
+
+            if (DEBUG_LOGS) {
+                Log.d(TAG, "run[$runId] stats: chunks=$chunkCount, chars=$totalChars, raw.len=${rawText.length}")
+                Log.d(TAG, "run[$runId] sha(raw)=${sha256Hex(rawText)}")
+            }
             if (DEBUG_LOGS && DEBUG_WHITESPACE) {
-                Log.d(TAG, "rawVisible='${debugVisible(preview(rawText))}'")
+                Log.d(TAG, "run[$runId] rawVisible='${debugVisible(preview(rawText))}'")
             }
 
-            if (!isActiveRun()) return@launch
+            val parsedScore: Int?
+            val top3: List<String>
+            val q0: String?
 
-            if (rawText.isNotBlank()) {
-                val parsedScore = runCatching { clampScore(FollowupExtractor.extractScore(rawText)) }
-                    .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "extractScore failed (non-fatal)", t) }
-                    .getOrNull()
+            when (mode) {
+                EvalMode.EVAL_JSON -> {
+                    if (rawTrim.isBlank() || isEmptyJsonObject(rawTrim)) {
+                        // Critical guard: empty JSON must never be treated as a follow-up.
+                        parsedScore = null
+                        top3 = emptyList()
+                        q0 = null
+                        if (DEBUG_LOGS) {
+                            Log.w(
+                                TAG,
+                                "run[$runId]: EVAL_JSON output is empty/trivial ('${debugVisible(preview(rawTrim))}') -> score=null, followups=0"
+                            )
+                        }
+                    } else {
+                        val (s, f, first) = runCatching {
+                            val s1 = clampScore(FollowupExtractor.extractScore(rawText))
+                            val f1 = sanitizeFollowups(FollowupExtractor.fromRaw(rawText, max = 3))
+                            Triple(s1, f1, f1.firstOrNull())
+                        }.onFailure { t ->
+                            Log.e(TAG, "run[$runId]: parsing failed (EVAL_JSON)", t)
+                        }.getOrElse {
+                            Triple(null, emptyList(), null)
+                        }
 
-                val top3 = runCatching { FollowupExtractor.fromRaw(rawText, max = 3) }
-                    .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "extractFollowups failed (non-fatal)", t) }
-                    .getOrElse { emptyList() }
+                        parsedScore = s
+                        top3 = f
+                        q0 = first
 
-                val q0 = top3.firstOrNull()
+                        if (DEBUG_LOGS) {
+                            Log.d(
+                                TAG,
+                                "run[$runId]: EVAL_JSON parsed score=$parsedScore followups=${top3.size} fu0='${debugVisible(preview(q0.orEmpty()))}'"
+                            )
+                        }
+                    }
+                }
 
+                EvalMode.FOLLOWUP_JSON_OR_TEXT -> {
+                    val jsonSlice = sliceLikelyJsonObject(rawText)
+                    val jsonQ = jsonSlice?.let { extractFollowupFromJsonObject(it) }
+                    val textQ = extractFollowupFromPlainText(rawText)
+
+                    val best = (jsonQ ?: textQ)
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.takeIf { !isEmptyJsonObject(it) }
+                        ?.takeIf { !isJsonLike(it) }
+
+                    parsedScore = null
+                    top3 = best?.let { listOf(it) } ?: emptyList()
+                    q0 = best
+
+                    if (DEBUG_LOGS) {
+                        Log.d(
+                            TAG,
+                            "run[$runId]: FOLLOWUP parse jsonSlice=${jsonSlice != null} " +
+                                    "jsonQ='${debugVisible(preview(jsonQ.orEmpty()))}' " +
+                                    "textQ='${debugVisible(preview(textQ.orEmpty()))}' " +
+                                    "best='${debugVisible(preview(best.orEmpty()))}'"
+                        )
+                    }
+                }
+            }
+
+            // Reflect step-local error state to the global UI error flow.
+            if (stepError != null) {
+                _error.value = stepError
+            } else if (_error.value != "timeout" && _error.value != "cancelled") {
+                // Keep sticky timeout/cancelled unless overwritten.
+                _error.value = null
+            }
+
+            // Always record history so UI can show both Step1 and Step2.
+            appendStepSnapshot(
+                StepSnapshot(
+                    runId = runId,
+                    phase = phase,
+                    mode = mode,
+                    raw = rawText,
+                    score = parsedScore,
+                    followups = top3,
+                    timedOut = timedOut,
+                    error = stepError
+                )
+            )
+
+            // Commit to primary UI state only when requested (keep Step1 pinned).
+            if (commitToPrimaryState) {
                 _raw.value = rawText
-                _rawRunId.value = runId
-
                 _score.value = parsedScore
                 _followups.value = top3
                 _followupQuestion.value = q0
-
-                _events.tryEmit(AiEvent.Final(runId = runId, raw = rawText, score = parsedScore, followups = top3))
-                finalEmitted = true
-
-                if (DEBUG_LOGS) {
-                    Log.i(TAG, "Final[runId=$runId] score=$parsedScore FU[0]=${q0 ?: "<none>"} FU[1..]=${top3.drop(1)}")
-                }
-            } else {
-                if (DEBUG_LOGS) Log.w(TAG, "evaluate: no output produced (buffer empty)")
-                _raw.value = ""
-                _rawRunId.value = runId
-
-                _score.value = null
-                _followups.value = emptyList()
-                _followupQuestion.value = null
-
-                _events.tryEmit(AiEvent.Final(runId = runId, raw = "", score = null, followups = emptyList()))
-                finalEmitted = true
             }
 
-            if (timedOut && isActiveRun()) {
-                _error.value = "timeout"
-                _events.tryEmit(AiEvent.Timeout(runId = runId))
+            _events.tryEmit(AiEvent.Final(rawText, parsedScore, top3))
+
+            if (timedOut) {
+                _events.tryEmit(AiEvent.Timeout)
             }
+
+            Log.i(
+                TAG,
+                "run[$runId] done: phase=$phase mode=$mode score=$parsedScore FU[0]=${q0 ?: "<none>"} commit=$commitToPrimaryState err=${stepError ?: "<none>"}"
+            )
+            Log.i(FULL_TEXT_OUT_TAG, "run[$runId]: RawTextOut=\n$rawText")
+
+            return EvalResult(runId = runId, raw = rawText, score = parsedScore, followups = top3, timedOut = timedOut)
         } catch (e: CancellationException) {
-            if (!isActiveRun()) {
-                if (DEBUG_LOGS) Log.d(TAG, "run.stale: runId=$runId cancelled in outer catch")
-                return@launch
+            if (isActiveRun() && _error.value == "cancelled") {
+                _events.tryEmit(AiEvent.Cancelled)
             }
-
-            // IMPORTANT:
-            // Do NOT emit AiEvent.Cancelled here to avoid double emission.
-            // User-driven cancel() is the only path that emits Cancelled.
-            flushStreamAndEvents(force = true)
-
-            if (!finalEmitted && isActiveRun()) {
-                _events.tryEmit(
-                    AiEvent.Final(
-                        runId = runId,
-                        raw = _stream.value,
-                        score = _score.value,
-                        followups = _followups.value
-                    )
-                )
-            }
-
-            if (DEBUG_LOGS) Log.w(TAG, "evaluate: cancelled (no Cancelled event emitted here)", e)
+            if (DEBUG_LOGS) Log.w(TAG, "run[$runId]: cancelled", e)
             throw e
         } catch (t: Throwable) {
-            // P0 fix: best-effort stop native on unexpected errors.
-            stopNativeBestEffort("error")
-
             if (!isActiveRun()) {
-                if (DEBUG_LOGS) Log.d(TAG, "run.stale: runId=$runId error after invalidation: ${t.message}")
-                return@launch
+                return EvalResult(runId = runId, raw = "", score = null, followups = emptyList(), timedOut = false)
             }
 
             val msg = t.message ?: "error"
             _error.value = msg
-            _events.tryEmit(AiEvent.Error(runId = runId, message = msg))
-            Log.e(TAG, "evaluate: error", t)
+            _events.tryEmit(AiEvent.Error(msg))
+            Log.e(TAG, "run[$runId]: error", t)
 
-            flushStreamAndEvents(force = true)
-            if (!finalEmitted && isActiveRun()) {
-                _events.tryEmit(
-                    AiEvent.Final(
-                        runId = runId,
-                        raw = _stream.value,
-                        score = _score.value,
-                        followups = _followups.value
-                    )
+            val rawText = _stream.value
+
+            // Still record a snapshot for UI (partial/error).
+            appendStepSnapshot(
+                StepSnapshot(
+                    runId = runId,
+                    phase = phase,
+                    mode = mode,
+                    raw = rawText,
+                    score = null,
+                    followups = emptyList(),
+                    timedOut = false,
+                    error = msg
                 )
-            }
-        } finally {
-            // Always apply cooldown after a run attempt (even if cancelled/errored).
-            nextAllowedAt.set(SystemClock.elapsedRealtime() + cooldownAfterRunMs)
-            endRunIfOwned(runId = runId, job = this.coroutineContext[Job])
+            )
+
+            _events.tryEmit(AiEvent.Final(_stream.value, _score.value, _followups.value))
+
+            return EvalResult(
+                runId = runId,
+                raw = rawText,
+                score = _score.value,
+                followups = _followups.value,
+                timedOut = false
+            )
         }
     }
 
+    // ───────────────────────── UI preparation ─────────────────────────
+
     /**
-     * Cancel helper used by both user-driven cancel and internal resets.
+     * Prepare UI for a brand-new chain/run (clears primary state and optionally clears history).
      *
-     * @param silent When true, do not surface "cancelled" error nor emit Cancelled event.
+     * @param clearHistory True to clear [stepHistory].
      */
-    private fun cancelInternal(silent: Boolean) {
-        val jobToCancel: Job?
-        val hadActive: Boolean
-
-        synchronized(stateLock) {
-            hadActive = running.get()
-            jobToCancel = evalJobRef.getAndSet(null)
-
-            if (DEBUG_LOGS) {
-                Log.i(
-                    TAG,
-                    "cancelInternal: silent=$silent hadActive=$hadActive jobActive=${jobToCancel?.isActive == true} activeRunId=${activeRunId.get()}"
-                )
-            }
-
-            // P0 fix: stop native work BEFORE invalidating state to reduce re-entry races.
-            runCatching { (repo as? RepositoryCancelable)?.cancelInFlight() }
-                .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "repo.cancelInFlight failed (ignored)", t) }
-
-            // Invalidate current run id so late emissions are ignored.
-            activeRunId.set(0L)
-            _activeRunIdFlow.value = 0L
-
-            // Apply cooldown even after cancel/reset to reduce immediate re-entry risk.
-            nextAllowedAt.set(SystemClock.elapsedRealtime() + cooldownAfterRunMs)
-
-            // Make UI reflect cancellation immediately.
-            if (!silent) _error.value = "cancelled"
-            _loading.value = false
-            running.set(false)
-
-            // Clear run correlation to avoid UI mixing.
-            _streamRunId.value = 0L
-        }
-
-        runCatching { jobToCancel?.cancel() }
-            .onFailure { t -> if (DEBUG_LOGS) Log.w(TAG, "cancelInternal: exception during cancel (ignored)", t) }
-
-        // Emit Cancelled exactly once from here for user-driven cancels.
-        if (!silent && hadActive) _events.tryEmit(AiEvent.Cancelled)
-    }
-
-    /**
-     * Prepare all UI-visible states for a new evaluation run.
-     */
-    private fun prepareUiForNewRun(runId: Long) {
+    private fun prepareUiForNewChain(clearHistory: Boolean) {
         _loading.value = true
         _score.value = null
         _stream.value = ""
-        _streamRunId.value = runId
         _raw.value = null
-        _rawRunId.value = 0L
         _followupQuestion.value = null
         _followups.value = emptyList()
-
-        // Clear previous errors at the start of a new run to avoid sticky UI states.
-        _error.value = null
+        if (_error.value != "timeout" && _error.value != "cancelled") {
+            _error.value = null
+        }
+        if (clearHistory) clearStepHistory()
     }
 
     /**
-     * Best-effort end-of-run cleanup.
+     * Prepare UI for the next step in a chain WITHOUT clearing Step1 primary state.
      *
-     * IMPORTANT:
-     * Only clear flags if this run still owns the active slot.
-     * This prevents older runs from clobbering newer run state.
+     * Behavior:
+     * - Keeps _score/_raw/_followups/_followupQuestion intact.
+     * - Resets only streaming buffer and transient non-timeout errors.
      */
-    private fun endRunIfOwned(runId: Long, job: Job?) {
-        synchronized(stateLock) {
-            val stillActive = activeRunId.get() == runId
-            val sameJob = job != null && evalJobRef.get() === job
-
-            if (!stillActive || !sameJob) return
-
-            _loading.value = false
-            running.set(false)
-            evalJobRef.set(null)
-            activeRunId.set(0L)
-            _activeRunIdFlow.value = 0L
+    private fun prepareUiForNextStep() {
+        _loading.value = true
+        _stream.value = ""
+        if (_error.value != "timeout" && _error.value != "cancelled") {
+            _error.value = null
         }
     }
 
-    /* ───────────────────────── helpers ───────────────────────── */
+    /** Finalize flags after an evaluation completes, but only if [runId] is still active. */
+    private fun finalizeRunFlagsIfActive(runId: Long) {
+        if (activeRunId.get() != runId) return
+        _loading.value = false
+        running.set(false)
+        evalJob = null
+        activeRunId.set(0L)
+    }
+
+    /** Finalize flags after a chained sequence completes. */
+    private fun finalizeChainFlags() {
+        _loading.value = false
+        running.set(false)
+        evalJob = null
+        activeRunId.set(0L)
+    }
+
+    /**
+     * Stop current run (if any).
+     *
+     * @param reason For logs and optional error state.
+     * @param emitCancelledEvent Whether to emit [AiEvent.Cancelled].
+     * @param setCancelledError Whether to set error="cancelled".
+     */
+    private fun stopCurrentRunInternal(
+        reason: String,
+        emitCancelledEvent: Boolean,
+        setCancelledError: Boolean
+    ) {
+        val job = evalJob
+        evalJob = null
+
+        if (setCancelledError) _error.value = "cancelled"
+
+        activeRunId.set(-1L)
+
+        if (job != null) {
+            runCatching { job.cancel(CancellationException(reason)) }
+                .onFailure { t -> Log.w(TAG, "stopCurrentRunInternal: exception during cancel (ignored)", t) }
+        }
+
+        _loading.value = false
+        running.set(false)
+
+        if (emitCancelledEvent) {
+            _events.tryEmit(AiEvent.Cancelled)
+        }
+    }
+
+    /**
+     * Cancel an unexpected leftover job reference without touching [running]/[_loading].
+     */
+    private fun cancelDanglingJobIfAny(reason: String) {
+        val job = evalJob ?: return
+        evalJob = null
+        activeRunId.set(-1L)
+
+        runCatching { job.cancel(CancellationException(reason)) }
+            .onFailure { t -> Log.w(TAG, "cancelDanglingJobIfAny: exception during cancel (ignored)", t) }
+    }
+
+    // ───────────────────────── helpers ─────────────────────────
 
     private fun clampScore(s: Int?): Int? = s?.coerceIn(0, 100)
 
@@ -990,27 +1073,15 @@ class AiViewModel(
 
 sealed interface AiEvent {
 
-    data class Stream(
-        val runId: Long,
-        val chunk: String
-    ) : AiEvent
+    data class Stream(val chunk: String) : AiEvent
 
     data class Final(
-        val runId: Long,
         val raw: String,
         val score: Int?,
         val followups: List<String>
     ) : AiEvent
 
-    /** Emitted when an evaluation request is made while another run is active. */
-    data object Busy : AiEvent
-
     data object Cancelled : AiEvent
-
-    data class Timeout(val runId: Long) : AiEvent
-
-    data class Error(
-        val runId: Long,
-        val message: String
-    ) : AiEvent
+    data object Timeout : AiEvent
+    data class Error(val message: String) : AiEvent
 }

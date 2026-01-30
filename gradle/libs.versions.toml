@@ -2,10 +2,10 @@
 agp = "8.13.2"
 
 # Kotlin
-kotlin = "2.1.21"
+kotlin = "2.3.0"
 
 # Compose (BOM controls Compose artifact versions)
-composeBom = "2025.12.00"
+composeBom = "2026.01.00"
 
 # AndroidX core / app compat
 coreKtx = "1.17.0"
@@ -14,7 +14,7 @@ documentfile = "1.1.0"
 
 # Serialization / YAML
 kaml = "0.104.0"
-kotlinxSerializationJson = "1.9.0"
+kotlinxSerializationJson = "1.10.0"
 
 # Coroutines
 kotlinxCoroutinesAndroid = "1.10.2"
@@ -41,7 +41,7 @@ media3Ui = "1.8.0"
 
 # MediaPipe / LiteRT-LM
 mediapipeTasksGenai = "0.10.29"
-litertlm = "0.9.0-alpha01"
+litertlm = "0.9.0-alpha02"
 
 # Networking
 okhttp = "4.12.0"
@@ -67,6 +67,7 @@ material = "1.13.0"
 
 # Security
 securityCrypto = "1.1.0"
+roomKtx = "2.8.4"
 
 [libraries]
 accompanist-navigation-animation = { module = "com.google.accompanist:accompanist-navigation-animation", version.ref = "accompanistNavigationAnimation" }
@@ -149,6 +150,7 @@ material = { group = "com.google.android.material", name = "material", version.r
 
 # Security
 androidx-security-crypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }
+androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "roomKtx" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

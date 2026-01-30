@@ -81,6 +81,7 @@ object GitHubDiagnosticsConfigStore {
     /**
      * Build preferences, preferring encrypted storage.
      */
+    @Suppress("DEPRECATION")
     private fun prefs(context: Context): SharedPreferences {
         return runCatching {
             val masterKey = MasterKey.Builder(context)

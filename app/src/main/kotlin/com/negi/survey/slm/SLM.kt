@@ -10,19 +10,25 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  Concurrency-safe helper for managing MediaPipe LLM inference sessions
- *  on Android.
+ *  Compatibility facade over LiteRtLM (NO MediaPipe).
  *
- *  Responsibilities:
- *    • Initialize and configure LlmInference / LlmInferenceSession.
- *    • Stream responses via generateResponseAsync with partial tokens.
- *    • Provide cancellation and cleanup hooks with session reuse.
- *    • Expose simple busy-state checks for higher-level watchdogs.
+ *  Why:
+ *   - MediaPipe GenAI APIs are removed.
+ *   - Keep existing call sites using SLM.* with minimal code changes.
  *
- *  Stability notes:
- *    • All user callbacks are delivered on Main.
- *    • cleanup hooks are generation-aware (prevents late-done races).
- *    • cleanUp(busy) is deferred but guarded by a watchdog timeout.
+ *  Contract:
+ *   - Delegates to LiteRtLM which already implements:
+ *       • single-active-stream per key
+ *       • runId late-callback suppression
+ *       • logical done vs native termination separation
+ *       • deferred cleanup after native termination
+ *
+ *  Strengthen (2026-01):
+ *   • Avoid compile-time coupling to LiteRtLM method surface (reflection for non-suspend APIs).
+ *   • Best-effort overload matching + argument coercion.
+ *   • Supports signature drift by trying trimmed argument tails.
+ *   • Caches method candidates to reduce reflection overhead.
+ *   • Adds a suspend fallback for generateText via streaming when reflection suspend path fails.
  * =====================================================================
  */
 
@@ -31,17 +37,25 @@
 package com.negi.survey.slm
 
 import android.content.Context
-import android.os.Handler
-import android.os.Looper
-import android.os.SystemClock
+import android.graphics.Bitmap
 import android.util.Log
-import com.google.mediapipe.tasks.genai.llminference.LlmInference
-import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
+import com.google.ai.edge.litertlm.Message
+import com.negi.survey.config.SurveyConfig
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
+import java.lang.reflect.Modifier
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.concurrent.thread
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+
+private const val TAG = "SLM"
+
+/** Toggle facade logs (safe to keep enabled in dev builds). */
+private const val DEBUG_SLM = true
 
 /**
  * Hardware accelerator options for inference (CPU or GPU).
@@ -53,60 +67,64 @@ enum class Accelerator(val label: String) { CPU("CPU"), GPU("GPU") }
  */
 enum class ConfigKey { MAX_TOKENS, TOP_K, TOP_P, TEMPERATURE, ACCELERATOR }
 
-/** Default values for model parameters. */
-private const val DEFAULT_MAX_TOKEN = 4096
-private const val DEFAULT_TOP_K = 40
-private const val DEFAULT_TOP_P = 0.9f
-private const val DEFAULT_TEMPERATURE = 0.7f
-
-/** Absolute safety clamp for engine-level max tokens. */
-private const val ABS_MAX_TOKENS = 4096
-
-private const val TAG = "SLM"
-
-/** Upper bound for error strings rendered in UI/log aggregation. */
-private const val ERROR_MAX_CHARS = 240
-
-/**
- * Deferred hard-close watchdog:
- * If done=true is never observed after cancel, we eventually force-close.
- *
- * WARNING:
- * Force-closing native resources while generation is truly active may be risky.
- * We only do this after a grace timeout and best-effort cancel.
- */
-private const val HARD_CLOSE_TIMEOUT_MS = 15_000L
-private const val HARD_CLOSE_POLL_MS = 750L
-
 /**
  * Callback to deliver partial or final inference results.
  *
- * @param partialResult Current accumulated text or token chunk.
- * @param done True when the inference is complete for this request.
+ * @param partialResult Current partial text (delta chunks).
+ * @param done True when logical completion is reached for this request.
  */
 typealias ResultListener = (partialResult: String, done: Boolean) -> Unit
 
 /**
- * Callback to notify when the model session and engine have reached
- * a cleaned or stable state for this request.
+ * Callback invoked ONLY after native termination (safe point for deferred cleanup).
  */
 typealias CleanUpListener = () -> Unit
 
-/**
- * Execution states of a model instance.
- */
-enum class RunState { IDLE, RUNNING, CANCELLING }
+private const val DEFAULT_MAX_TOKENS = 4096
+private const val DEFAULT_TOP_K = 40
+private const val DEFAULT_TOP_P = 0.9f
+private const val DEFAULT_TEMPERATURE = 0.7f
+
+/** Keep aligned with LiteRtLM absolute bounds. */
+private const val ABS_MAX_TOKENS = 4096
+
+/** Conservative temperature bound to avoid weird sampler behavior. */
+private const val ABS_MAX_TEMPERATURE = 2.0f
+
+/** Defensive TOP_K bound (samplers can behave oddly with absurdly large values). */
+private const val ABS_MAX_TOP_K = 2048
+
+/* ───────────────────────────── Logging helpers ───────────────────────────── */
 
 /**
- * Represents a loaded LLM model configuration and runtime instance.
+ * Debug log with lazy message construction.
+ */
+private inline fun d(msg: () -> String) {
+    if (DEBUG_SLM) Log.d(TAG, msg())
+}
+
+/**
+ * Warning log with lazy message construction.
+ */
+private inline fun w(t: Throwable? = null, msg: () -> String) {
+    if (t != null) Log.w(TAG, msg(), t) else Log.w(TAG, msg())
+}
+
+/* ───────────────────────────── Model config ───────────────────────────── */
+
+/**
+ * Represents a model configuration.
+ *
+ * NOTE:
+ * - LiteRtLM owns the runtime instance lifecycle internally (Engine/Conversation).
+ * - This model class is just config + path holder.
  */
 data class Model(
     val name: String,
     val taskPath: String,
     val config: Map<ConfigKey, Any> = emptyMap(),
-    @Volatile var instance: SlmModelInstance? = null
 ) {
-    /** Returns the raw task path used by MediaPipe Tasks. */
+    /** Returns the raw model path used by LiteRtLM EngineConfig. */
     fun getPath(): String = taskPath
 
     /** Lookup an Int config value with a sane fallback. */
@@ -129,966 +147,752 @@ data class Model(
 }
 
 /**
- * Snapshot of session parameters derived from Model.config.
+ * Parse an accelerator string safely.
  */
-data class SessionParams(
-    val topK: Int = DEFAULT_TOP_K,
-    val topP: Float = DEFAULT_TOP_P,
-    val temperature: Float = DEFAULT_TEMPERATURE
-)
+private fun parseAcceleratorLabel(raw: String?): String {
+    val s = raw?.trim()?.uppercase(Locale.US).orEmpty()
+    return when (s) {
+        Accelerator.CPU.label -> Accelerator.CPU.label
+        Accelerator.GPU.label -> Accelerator.GPU.label
+        "" -> Accelerator.GPU.label
+        else -> {
+            /** Unknown label -> default GPU for compatibility. */
+            Accelerator.GPU.label
+        }
+    }
+}
 
 /**
- * Holds the initialized engine and session for a model.
+ * Normalize config value types so downstream reads are stable:
+ * - MAX_TOKENS/TOP_K: Int
+ * - TOP_P/TEMPERATURE: Float
+ * - ACCELERATOR: String
+ */
+private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
+    m[ConfigKey.MAX_TOKENS] = (m[ConfigKey.MAX_TOKENS] as? Number)?.toInt()
+        ?: (m[ConfigKey.MAX_TOKENS] as? String)?.toIntOrNull()
+                ?: DEFAULT_MAX_TOKENS
+
+    m[ConfigKey.TOP_K] = (m[ConfigKey.TOP_K] as? Number)?.toInt()
+        ?: (m[ConfigKey.TOP_K] as? String)?.toIntOrNull()
+                ?: DEFAULT_TOP_K
+
+    m[ConfigKey.TOP_P] = (m[ConfigKey.TOP_P] as? Number)?.toFloat()
+        ?: (m[ConfigKey.TOP_P] as? String)?.toFloatOrNull()
+                ?: DEFAULT_TOP_P
+
+    m[ConfigKey.TEMPERATURE] = (m[ConfigKey.TEMPERATURE] as? Number)?.toFloat()
+        ?: (m[ConfigKey.TEMPERATURE] as? String)?.toFloatOrNull()
+                ?: DEFAULT_TEMPERATURE
+
+    m[ConfigKey.ACCELERATOR] = parseAcceleratorLabel(m[ConfigKey.ACCELERATOR] as? String)
+}
+
+/**
+ * Clamp config ranges defensively.
+ */
+private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
+    val maxTokens = (m[ConfigKey.MAX_TOKENS] as Number).toInt().coerceIn(1, ABS_MAX_TOKENS)
+    val topK = (m[ConfigKey.TOP_K] as Number).toInt().coerceIn(1, ABS_MAX_TOP_K)
+    val topP = (m[ConfigKey.TOP_P] as Number).toFloat().coerceIn(0f, 1f)
+    val temp = (m[ConfigKey.TEMPERATURE] as Number).toFloat().coerceIn(0f, ABS_MAX_TEMPERATURE)
+
+    m[ConfigKey.MAX_TOKENS] = maxTokens
+    m[ConfigKey.TOP_K] = topK
+    m[ConfigKey.TOP_P] = topP
+    m[ConfigKey.TEMPERATURE] = temp
+}
+
+/**
+ * Build a normalized config map from SurveyConfig.SlmMeta.
+ */
+fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
+    val out: MutableMap<ConfigKey, Any> = mutableMapOf(
+        ConfigKey.ACCELERATOR to parseAcceleratorLabel(slm.accelerator ?: Accelerator.GPU.label),
+        ConfigKey.MAX_TOKENS to (slm.maxTokens ?: DEFAULT_MAX_TOKENS),
+        ConfigKey.TOP_K to (slm.topK ?: DEFAULT_TOP_K),
+        ConfigKey.TOP_P to (slm.topP ?: DEFAULT_TOP_P),
+        ConfigKey.TEMPERATURE to (slm.temperature ?: DEFAULT_TEMPERATURE),
+    )
+
+    normalizeNumberTypes(out)
+    clampRanges(out)
+
+    d {
+        "buildModelConfig: accel=${out[ConfigKey.ACCELERATOR]} " +
+                "maxTokens=${out[ConfigKey.MAX_TOKENS]} topK=${out[ConfigKey.TOP_K]} " +
+                "topP=${out[ConfigKey.TOP_P]} temp=${out[ConfigKey.TEMPERATURE]}"
+    }
+
+    return out
+}
+
+/* ───────────────────────────── Reflection Bridge ───────────────────────────── */
+
+/**
+ * Cache methods by (name/arity) to reduce reflection scan cost.
+ */
+private val methodBucketCache = ConcurrentHashMap<String, List<Method>>()
+
+/**
+ * Build a cache key for method buckets.
+ */
+private fun bucketKey(methodName: String, argc: Int): String = "$methodName/$argc"
+
+/**
+ * Get all methods (public + declared) matching name+arity, cached.
+ */
+private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<Method> {
+    val key = bucketKey(methodName, argc)
+    return methodBucketCache.getOrPut(key) {
+        val all = ArrayList<Method>(64)
+        all.addAll(cls.methods.filter { it.name == methodName && it.parameterTypes.size == argc })
+        all.addAll(cls.declaredMethods.filter { it.name == methodName && it.parameterTypes.size == argc })
+        all.distinctBy { m ->
+            val sb = StringBuilder()
+            sb.append(m.name).append("(")
+            m.parameterTypes.forEachIndexed { i, p ->
+                if (i > 0) sb.append(",")
+                sb.append(p.name)
+            }
+            sb.append(")")
+            sb.toString()
+        }
+    }
+}
+
+/**
+ * Convert primitive parameter class to its boxed counterpart.
+ */
+private fun boxedOfPrimitive(p: Class<*>): Class<*>? {
+    if (!p.isPrimitive) return null
+    return when (p) {
+        java.lang.Boolean.TYPE -> java.lang.Boolean::class.java
+        java.lang.Integer.TYPE -> java.lang.Integer::class.java
+        java.lang.Long.TYPE -> java.lang.Long::class.java
+        java.lang.Float.TYPE -> java.lang.Float::class.java
+        java.lang.Double.TYPE -> java.lang.Double::class.java
+        java.lang.Short.TYPE -> java.lang.Short::class.java
+        java.lang.Byte.TYPE -> java.lang.Byte::class.java
+        java.lang.Character.TYPE -> java.lang.Character::class.java
+        else -> null
+    }
+}
+
+/**
+ * Try to coerce an argument to match the parameter type.
  *
- * Native-generation guards:
- * - generationSeq: monotonic request id for generation-aware cleanup hooks.
- * - activeGenerationId / lastDoneGenerationId: indicates native work in flight.
- * - pendingClose: old session that must be closed only when safe.
+ * Supports:
+ * - Number widening/narrowing to required primitive/boxed types
+ * - Function0 -> Runnable
+ * - Function1 -> java.util.function.Consumer (best-effort)
  */
-data class SlmModelInstance(
-    @Volatile var cacheKey: String = "",
-    @Volatile var backendLabel: String = Accelerator.GPU.label,
-    val engine: LlmInference,
-    @Volatile var session: LlmInferenceSession,
-    val state: AtomicReference<RunState> = AtomicReference(RunState.IDLE),
-    @Volatile var lastParams: SessionParams = SessionParams(),
-    val generationSeq: AtomicLong = AtomicLong(0L),
-    @Volatile var activeGenerationId: Long = 0L,
-    @Volatile var lastDoneGenerationId: Long = 0L,
-    val pendingClose: AtomicReference<LlmInferenceSession?> = AtomicReference(null),
-    @Volatile var lastGenerateStartMs: Long = 0L,
-    @Volatile var lastGenerateDoneMs: Long = 0L
-)
+@Suppress("UNCHECKED_CAST")
+private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
+    if (arg == null) return null
+
+    /** Direct instance match. */
+    if (param.isInstance(arg)) return arg
+
+    /** Primitive params accept boxed instances. */
+    val boxed = boxedOfPrimitive(param)
+    if (boxed != null && boxed.isInstance(arg)) return arg
+
+    /** Numeric coercions. */
+    val wantsInt = (param == java.lang.Integer.TYPE || param == java.lang.Integer::class.java)
+    val wantsLong = (param == java.lang.Long.TYPE || param == java.lang.Long::class.java)
+    val wantsFloat = (param == java.lang.Float.TYPE || param == java.lang.Float::class.java)
+    val wantsDouble = (param == java.lang.Double.TYPE || param == java.lang.Double::class.java)
+    val wantsShort = (param == java.lang.Short.TYPE || param == java.lang.Short::class.java)
+    val wantsByte = (param == java.lang.Byte.TYPE || param == java.lang.Byte::class.java)
+
+    if (arg is Number) {
+        return when {
+            wantsInt -> arg.toInt()
+            wantsLong -> arg.toLong()
+            wantsFloat -> arg.toFloat()
+            wantsDouble -> arg.toDouble()
+            wantsShort -> arg.toShort()
+            wantsByte -> arg.toByte()
+            else -> arg
+        }
+    }
+
+    /** Function0 -> Runnable. */
+    if (param == java.lang.Runnable::class.java && arg is Function0<*>) {
+        return Runnable { arg.invoke() }
+    }
+
+    /** Function1 -> Consumer (best-effort). */
+    if (param.name == "java.util.function.Consumer" && arg is Function1<*, *>) {
+        val f = arg as Function1<Any?, Any?>
+        val consumerCls = Class.forName("java.util.function.Consumer")
+        /** Create a proxy via lambda adaptation (Consumer is SAM). */
+        return java.lang.reflect.Proxy.newProxyInstance(
+            consumerCls.classLoader,
+            arrayOf(consumerCls)
+        ) { _, method, args ->
+            if (method.name == "accept") {
+                f.invoke(args?.getOrNull(0))
+                null
+            } else {
+                null
+            }
+        }
+    }
+
+    return arg
+}
 
 /**
- * Safe Language Model inference helper.
+ * Check if parameter can accept an arg after coercion.
  */
+private fun isParamCompatible(param: Class<*>, arg: Any?): Boolean {
+    if (arg == null) return !param.isPrimitive
+    val coerced = coerceArgForParam(param, arg) ?: return !param.isPrimitive
+
+    if (param.isPrimitive) {
+        val boxed = boxedOfPrimitive(param) ?: return false
+        return boxed.isInstance(coerced)
+    }
+    return param.isAssignableFrom(coerced.javaClass)
+}
+
+/**
+ * Score a (param,arg) match for selecting the "best" overload.
+ */
+private fun scoreParamMatch(param: Class<*>, arg: Any?): Int {
+    if (arg == null) return if (param.isPrimitive) -10_000 else 1
+    val coerced = coerceArgForParam(param, arg) ?: return if (param.isPrimitive) -10_000 else 1
+
+    if (param.isPrimitive) {
+        val boxed = boxedOfPrimitive(param) ?: return -10_000
+        return when {
+            boxed == coerced.javaClass -> 8
+            boxed.isAssignableFrom(coerced.javaClass) -> 6
+            else -> -10_000
+        }
+    }
+
+    return when {
+        param == coerced.javaClass -> 10
+        param.isAssignableFrom(coerced.javaClass) -> 7
+        else -> -10_000
+    }
+}
+
+/**
+ * Find the best matching method by name + arity + parameter compatibility.
+ *
+ * Preference order:
+ * 1) higher match score
+ * 2) instance methods over static (Kotlin object style)
+ */
+private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>): Method? {
+    val bucket = getMethodBucket(cls, methodName, args.size)
+    if (bucket.isEmpty()) return null
+
+    var best: Method? = null
+    var bestScore = Int.MIN_VALUE
+
+    for (m in bucket) {
+        val params = m.parameterTypes
+        var score = 0
+        var ok = true
+        for (i in params.indices) {
+            val s = scoreParamMatch(params[i], args[i])
+            if (s < -1000) {
+                ok = false
+                break
+            }
+            score += s
+        }
+        if (!ok) continue
+
+        /** Prefer instance methods for Kotlin object APIs. */
+        if (!Modifier.isStatic(m.modifiers)) score += 3
+
+        if (score > bestScore) {
+            bestScore = score
+            best = m
+        }
+    }
+
+    return best
+}
+
+/**
+ * Produce argument candidates to survive signature drift by trimming optional tails.
+ *
+ * Strategy:
+ * - Try full args
+ * - If last is emptyList -> drop it
+ * - If last is null -> drop it
+ * - Also try dropping last 1 / last 2 always (best-effort)
+ */
+private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
+    if (args.isEmpty()) return listOf(args)
+
+    val out = ArrayList<Array<Any?>>(6)
+    out.add(args)
+
+    fun dropLast(n: Int) {
+        if (args.size > n) out.add(args.copyOf(args.size - n))
+    }
+
+    val last = args.last()
+    if (last is List<*> && last.isEmpty()) dropLast(1)
+    if (last == null) dropLast(1)
+
+    /** Generic trims (works for optional tails like systemMessage/tools). */
+    dropLast(1)
+    dropLast(2)
+
+    /** De-dupe by arity. */
+    return out.distinctBy { it.size }
+}
+
+/**
+ * Call a LiteRtLM method by name using reflection (non-suspend).
+ *
+ * Returns true if invoked successfully.
+ */
+private fun invokeLiteRtLmBestEffortUnit(
+    methodName: String,
+    args: Array<Any?>,
+    onFailLog: String,
+): Boolean {
+    val cls = LiteRtLM::class.java
+    val candidates = buildArgCandidates(args)
+
+    for (cand in candidates) {
+        try {
+            val m = findBestMethod(cls, methodName, cand)
+            if (m == null) {
+                d { "$onFailLog (method not found): name='$methodName' argc=${cand.size}" }
+                continue
+            }
+
+            m.isAccessible = true
+            val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
+
+            /** Coerce args per param types. */
+            val coercedArgs = Array<Any?>(cand.size) { i ->
+                coerceArgForParam(m.parameterTypes[i], cand[i])
+            }
+
+            m.invoke(receiver, *coercedArgs)
+            return true
+        } catch (ite: InvocationTargetException) {
+            val root = ite.targetException ?: ite
+            w(root) { "$onFailLog (target threw): name='$methodName' err=${root.message}" }
+        } catch (t: Throwable) {
+            w(t) { "$onFailLog (invoke failed): name='$methodName' err=${t.message}" }
+        }
+    }
+
+    return false
+}
+
+/**
+ * Call a LiteRtLM suspend function by name using reflection.
+ *
+ * The Kotlin suspend method is compiled as:
+ *   fun foo(..., continuation: Continuation<T>): Any?
+ *
+ * Returns null if method not found (caller can fallback).
+ */
+private suspend fun invokeLiteRtLmBestEffortSuspend(
+    methodName: String,
+    argsNoCont: Array<Any?>,
+    onFailLog: String,
+): Any? {
+    val cls = LiteRtLM::class.java
+    val candidates = buildArgCandidates(argsNoCont)
+
+    return suspendCancellableCoroutine { outer ->
+        /** Propagate cancellation to LiteRtLM if possible. */
+        outer.invokeOnCancellation {
+            d { "invokeSuspend cancelled: method='$methodName'" }
+        }
+
+        val cont = object : Continuation<Any?> {
+            override val context = outer.context
+            override fun resumeWith(result: Result<Any?>) {
+                if (outer.isCompleted) return
+                outer.resumeWith(result)
+            }
+        }
+
+        for (cand in candidates) {
+            try {
+                val args = arrayOfNulls<Any?>(cand.size + 1)
+                for (i in cand.indices) args[i] = cand[i]
+                args[args.lastIndex] = cont
+
+                val m = findBestMethod(cls, methodName, args)
+                if (m == null) {
+                    d { "$onFailLog (suspend method not found): name='$methodName' argc=${args.size}" }
+                    continue
+                }
+
+                m.isAccessible = true
+                val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
+
+                val coercedArgs = Array<Any?>(args.size) { i ->
+                    coerceArgForParam(m.parameterTypes[i], args[i])
+                }
+
+                val ret = m.invoke(receiver, *coercedArgs)
+
+                if (ret !== COROUTINE_SUSPENDED) {
+                    /** Completed synchronously. */
+                    if (!outer.isCompleted) outer.resume(ret)
+                }
+                return@suspendCancellableCoroutine
+            } catch (ite: InvocationTargetException) {
+                val root = ite.targetException ?: ite
+                w(root) { "$onFailLog (suspend target threw): name='$methodName' err=${root.message}" }
+                if (!outer.isCompleted) outer.resume(null)
+                return@suspendCancellableCoroutine
+            } catch (t: Throwable) {
+                w(t) { "$onFailLog (suspend invoke failed): name='$methodName' err=${t.message}" }
+            }
+        }
+
+        /** Method not found. */
+        if (!outer.isCompleted) outer.resume(null)
+    }
+}
+
+/* ───────────────────────────── Facade API ──────────────────────────────── */
+
 object SLM {
 
-    /** Main thread handler for UI-safe callbacks. */
-    private val mainHandler: Handler = Handler(Looper.getMainLooper())
-
-    /** Global lock for multi-map state transitions. */
-    private val stateLock = Any()
-
-    /**
-     * Generation-aware cleanup hook.
-     *
-     * Using generationId prevents late callbacks from older sessions
-     * from invoking (or removing) the cleanup hook for a newer request.
-     */
-    private data class CleanUpHook(
-        val generationId: Long,
-        val callback: () -> Unit
-    )
-
-    /**
-     * Per-runtime cleanup hooks keyed by stable runtime identity.
-     */
-    private val cleanUpHooks = ConcurrentHashMap<String, CleanUpHook>()
-
-    /**
-     * Process-wide cache to reuse heavy engine/session across UI resets.
-     *
-     * Key = "taskPath|backendLabel|maxTokens"
-     */
-    private val instanceCache = ConcurrentHashMap<String, SlmModelInstance>()
-
-    /**
-     * Alias mapping for requested key -> actual key.
-     */
-    private val cacheAliases = ConcurrentHashMap<String, String>()
-
-    /**
-     * Prevent concurrent init on the same requested key.
-     */
-    private val initInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
-
-    /**
-     * Deferred hard closes keyed by runtime key.
-     */
-    private data class DeferredHardClose(
-        val instance: SlmModelInstance,
-        val callbacks: MutableList<() -> Unit>,
-        val requestedAtMs: Long,
-        val reason: String
-    )
-
-    private val deferredHardCloses = ConcurrentHashMap<String, DeferredHardClose>()
-
-    /**
-     * Returns true when the runtime is not idle for this model.
-     */
-    fun isBusy(model: Model): Boolean {
-        val attached = model.instance
-        if (attached != null) return isInstanceBusy(attached)
-
-        val requestedKey = cacheKeyOf(model)
-        val resolvedKey = resolveCacheKey(requestedKey)
-        val cached = instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-        return cached?.let { isInstanceBusy(it) } ?: false
-    }
-
-    /**
-     * Idempotent initialization entry point.
-     *
-     * Behavior:
-     * - If cached exists, attach it.
-     * - If params differ, rebuild only the session.
-     * - Otherwise, no-op.
-     * - If no cache exists, initialize in background and callback on Main.
-     */
-    fun ensureInitialized(context: Context, model: Model, onDone: (String) -> Unit) {
-        val requestedKey = cacheKeyOf(model)
-        val resolvedKey = resolveCacheKey(requestedKey)
-        val cached = instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-
-        Log.d(
-            TAG,
-            "ensureInitialized: model='${model.name}', requestedKey='$requestedKey', resolvedKey='$resolvedKey', " +
-                    "hasCached=${cached != null}, hasAttached=${model.instance != null}"
+    /** True when a suspend generateText call is currently in progress. */
+    fun isBusy(): Boolean {
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "isBusy",
+            args = emptyArray(),
+            onFailLog = "LiteRtLM.isBusy unavailable",
         )
-
-        if (cached != null) {
-            if (isInstanceBusy(cached)) {
-                postToMain { onDone("Model '${model.name}' is busy. Try again after done=true or call cancel().") }
-                return
-            }
-
-            val desired = paramsFromModel(model)
-            if (cached.lastParams != desired) {
-                val old = cached.session
-                val newSession = runCatching { buildSession(cached.engine, desired) }
-                    .getOrElse {
-                        Log.e(TAG, "ensureInitialized: session rebuild failed: ${it.message}", it)
-                        postToMain { onDone(cleanError(it.message)) }
-                        return
-                    }
-
-                cached.session = newSession
-                cached.lastParams = desired
-                scheduleOrCloseOldSession(cached, old, "ensureInitialized-rebuild")
-                flushDeferredHardCloseIfReady(cached, "ensureInitialized-post-rebuild")
-            }
-
-            model.instance = cached
-
-            // Only clear stale hooks if truly idle (best-effort).
-            if (!isInstanceBusy(cached)) {
-                cleanUpHooks.remove(runtimeKeyOf(model, cached))
-            }
-
-            postToMain { onDone("") }
-            return
-        }
-
-        initialize(context, model, onDone)
-    }
-
-    /**
-     * Initializes an engine + session for model in a background thread.
-     */
-    fun initialize(context: Context, model: Model, onDone: (String) -> Unit) {
-        val requestedKey = cacheKeyOf(model)
-
-        val accepted = initInFlight.add(requestedKey)
-        if (!accepted) {
-            postToMain { onDone("Initialization already in progress for key='$requestedKey'.") }
-            return
-        }
-
-        thread(name = "SLM-init-${model.name}") {
-            try {
-                val resolvedKey = resolveCacheKey(requestedKey)
-
-                Log.d(
-                    TAG,
-                    "initialize: model='${model.name}', requestedKey='$requestedKey', resolvedKey='$resolvedKey', hasAttached=${model.instance != null}"
-                )
-
-                // Hard-evict existing runtime if safe.
-                val existing = synchronized(stateLock) {
-                    model.instance ?: instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-                }
-
-                if (existing != null) {
-                    if (isInstanceBusy(existing)) {
-                        postToMain { onDone("Model '${model.name}' is busy. Try again after done=true or call cancel().") }
-                        return@thread
-                    }
-
-                    val keyInCache = existing.cacheKey.takeIf { it.isNotBlank() }
-                        ?: findCacheKeyForInstance(existing)
-                        ?: resolvedKey
-
-                    Log.d(TAG, "initialize: hard-evict existing runtime key='$keyInCache'")
-
-                    synchronized(stateLock) {
-                        removeAliasesPointingTo(keyInCache)
-                        instanceCache.remove(keyInCache)
-                        if (model.instance === existing) model.instance = null
-                        cleanUpHooks.remove(keyInCache)
-                    }
-
-                    flushPendingClose(existing, "initialize-hard-evict")
-                    tryCloseQuietly(existing.session)
-                    safeClose(existing.engine)
-                }
-
-                val maxTokensRaw = model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN)
-                val maxTokens = maxTokensRaw.coerceIn(1, ABS_MAX_TOKENS)
-                val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOP_K))
-                val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOP_P))
-                val temp = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
-
-                val backendPref = normalizedAccelerator(model)
-                val preferredBackend = when (backendPref) {
-                    Accelerator.CPU.label -> LlmInference.Backend.CPU
-                    else -> LlmInference.Backend.GPU
-                }
-
-                Log.d(
-                    TAG,
-                    "initialize: opts model='${model.name}' path='${model.getPath()}', backendPref='$backendPref', " +
-                            "preferredBackend=$preferredBackend, maxTokens=$maxTokens (raw=$maxTokensRaw), topK=$topK, topP=$topP, temp=$temp"
-                )
-
-                val baseOpts = LlmInference.LlmInferenceOptions.builder()
-                    .setModelPath(model.getPath())
-                    .setMaxTokens(maxTokens)
-
-                var actualBackend = preferredBackend
-                val engine = try {
-                    LlmInference.createFromOptions(
-                        context,
-                        baseOpts.setPreferredBackend(preferredBackend).build()
-                    )
-                } catch (e: Exception) {
-                    if (preferredBackend == LlmInference.Backend.GPU) {
-                        Log.w(TAG, "GPU init failed. Falling back to CPU: ${e.message}")
-                        actualBackend = LlmInference.Backend.CPU
-                        LlmInference.createFromOptions(
-                            context,
-                            baseOpts.setPreferredBackend(LlmInference.Backend.CPU).build()
-                        )
-                    } else {
-                        throw e
-                    }
-                }
-
-                val params = SessionParams(topK = topK, topP = topP, temperature = temp)
-                val session = buildSession(engine, params)
-
-                val actualBackendLabel = if (actualBackend == LlmInference.Backend.CPU) {
-                    Accelerator.CPU.label
-                } else {
-                    Accelerator.GPU.label
-                }
-
-                val actualKey = cacheKeyOf(model.getPath(), actualBackendLabel, maxTokens)
-
-                val inst = SlmModelInstance(
-                    cacheKey = actualKey,
-                    backendLabel = actualBackendLabel,
-                    engine = engine,
-                    session = session,
-                    lastParams = params
-                )
-
-                synchronized(stateLock) {
-                    instanceCache[actualKey] = inst
-                    model.instance = inst
-                    if (requestedKey != actualKey) {
-                        cacheAliases[requestedKey] = actualKey
-                        Log.w(TAG, "initialize: cache alias stored: '$requestedKey' -> '$actualKey'")
-                    }
-                }
-
-                Log.d(TAG, "initialize: success model='${model.name}', requestedKey='$requestedKey', actualKey='$actualKey'")
-                postToMain { onDone("") }
-            } catch (e: Exception) {
-                Log.e(TAG, "initialize failed: ${e.message}", e)
-                postToMain { onDone(cleanError(e.message)) }
-            } finally {
-                initInFlight.remove(requestedKey)
-            }
-        }
-    }
-
-    /**
-     * Rebuilds the LlmInferenceSession for model while keeping the engine.
-     */
-    fun resetSession(model: Model): Boolean {
-        val inst = synchronized(stateLock) {
-            model.instance ?: run {
-                val requestedKey = cacheKeyOf(model)
-                val resolvedKey = resolveCacheKey(requestedKey)
-                instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-            }
-        } ?: return false
-
-        if (isInstanceBusy(inst)) return false
-
-        val desired = paramsFromModel(model)
-        Log.d(TAG, "resetSession: model='${model.name}', key='${runtimeKeyOf(model, inst)}', desired=$desired, last=${inst.lastParams}")
-
-        val newSession = runCatching { buildSession(inst.engine, desired) }
-            .getOrElse {
-                Log.e(TAG, "resetSession: new session build failed: ${it.message}", it)
-                return false
-            }
-
-        val oldSession: LlmInferenceSession = synchronized(stateLock) {
-            val current = model.instance ?: instanceCache[inst.cacheKey] ?: run {
-                tryCloseQuietly(newSession)
-                return false
-            }
-
-            if (current !== inst || isInstanceBusy(current)) {
-                tryCloseQuietly(newSession)
-                return false
-            }
-
-            val old = current.session
-            current.session = newSession
-            current.lastParams = desired
-            model.instance = current
-            old
-        }
-
-        scheduleOrCloseOldSession(inst, oldSession, "resetSession-swap")
-
-        synchronized(stateLock) {
-            val current = model.instance ?: instanceCache[inst.cacheKey] ?: return false
-            if (current !== inst) return false
-
-            current.generationSeq.set(0L)
-            current.activeGenerationId = 0L
-            current.lastDoneGenerationId = 0L
-            current.lastGenerateStartMs = 0L
-            current.lastGenerateDoneMs = 0L
-            current.state.set(RunState.IDLE)
-        }
-
-        flushPendingClose(inst, "resetSession-post")
-        flushDeferredHardCloseIfReady(inst, "resetSession-post")
-        return true
-    }
-
-    /**
-     * Detach this model from runtime without closing engine/session.
-     */
-    fun release(model: Model) {
-        val inst = model.instance
-        model.instance = null
-
-        if (inst != null && !isInstanceBusy(inst)) {
-            cleanUpHooks.remove(runtimeKeyOf(model, inst))
-        } else {
-            Log.d(TAG, "release: detached only (busy or null instance).")
-        }
-    }
-
-    /**
-     * Completely cleans up the model's engine and session.
-     *
-     * Busy behavior:
-     * - If busy, cleanup is deferred until safe, and guarded by a watchdog timeout.
-     * - The instance is evicted from cache immediately to prevent new requests.
-     */
-    fun cleanUp(model: Model, onDone: () -> Unit) {
-        val inst = synchronized(stateLock) {
-            model.instance ?: run {
-                val requestedKey = cacheKeyOf(model)
-                val resolvedKey = resolveCacheKey(requestedKey)
-                instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-            }
-        } ?: run {
-            postToMain { onDone() }
-            return
-        }
-
-        val runtimeKey = runtimeKeyOf(model, inst)
-
-        Log.d(
-            TAG,
-            "cleanUp: model='${model.name}', runtimeKey='$runtimeKey', state=${inst.state.get()}, " +
-                    "active=${inst.activeGenerationId}, done=${inst.lastDoneGenerationId}"
-        )
-
-        synchronized(stateLock) {
-            instanceCache.remove(runtimeKey)
-            removeAliasesPointingTo(runtimeKey)
-            model.instance = null
-
-            if (!isInstanceBusy(inst)) {
-                cleanUpHooks.remove(runtimeKey)
-            }
-        }
-
-        if (isInstanceBusy(inst)) {
-            deferHardClose(runtimeKey, inst, reason = "cleanUp-busy") {
-                postToMain { onDone() }
-            }
-            runCatching { inst.session.cancelGenerateResponseAsync() }
-                .onFailure { Log.w(TAG, "cleanUp: cancelGenerateResponseAsync failed: ${it.message}") }
-
-            scheduleDeferredHardCloseWatchdog(runtimeKey)
-            return
-        }
-
-        flushPendingClose(inst, "cleanUp-idle")
-        tryCloseQuietly(inst.session)
-        safeClose(inst.engine)
-
-        postToMain { onDone() }
-    }
-
-    /**
-     * Attempts to cancel the current generation for model.
-     */
-    fun cancel(model: Model) {
-        val inst = synchronized(stateLock) {
-            model.instance ?: run {
-                val requestedKey = cacheKeyOf(model)
-                val resolvedKey = resolveCacheKey(requestedKey)
-                instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-            }
-        } ?: return
-
-        model.instance = inst
-
-        val runtimeKey = runtimeKeyOf(model, inst)
-        val stateBefore = inst.state.get()
-        val active = inst.activeGenerationId
-        val done = inst.lastDoneGenerationId
-        val genBusy = active > done
-
-        Log.d(
-            TAG,
-            "cancel: model='${model.name}', runtimeKey='$runtimeKey', stateBefore=$stateBefore, active=$active, done=$done, genBusy=$genBusy"
-        )
-
-        if (stateBefore == RunState.IDLE && !genBusy) {
-            flushPendingClose(inst, "cancel-idle")
-            flushDeferredHardCloseIfReady(inst, "cancel-idle")
-            return
-        }
-
-        inst.state.set(RunState.CANCELLING)
-
-        runCatching { inst.session.cancelGenerateResponseAsync() }
-            .onFailure { Log.w(TAG, "cancelGenerateResponseAsync failed: ${it.message}") }
-
-        if (!genBusy) {
-            Log.d(TAG, "cancel: no active generation -> immediate session rebuild + IDLE")
-            val old = inst.session
-            val params = inst.lastParams
-            val newSession = runCatching { buildSession(inst.engine, params) }.getOrNull()
-
-            if (newSession != null) {
-                inst.session = newSession
-                scheduleOrCloseOldSession(inst, old, "cancel-no-active-rebuild")
-            }
-
-            inst.state.set(RunState.IDLE)
-            flushPendingClose(inst, "cancel-no-active-flush")
-            flushDeferredHardCloseIfReady(inst, "cancel-no-active-flush")
-            return
-        }
-
-        flushPendingClose(inst, "cancel-post")
-    }
-
-    /**
-     * Launches an asynchronous inference for model with input.
-     */
-    fun runInference(
-        model: Model,
-        input: String,
-        listener: ResultListener,
-        onClean: CleanUpListener
-    ) {
-        val inst = synchronized(stateLock) {
-            model.instance ?: run {
-                val requestedKey = cacheKeyOf(model)
-                val resolvedKey = resolveCacheKey(requestedKey)
-                instanceCache[resolvedKey] ?: instanceCache[requestedKey]
-            }
-        } ?: run {
-            safeCallResult(listener, "Model not initialized.", true)
-            safeCallClean(onClean)
-            return
-        }
-
-        model.instance = inst
-
-        val runtimeKey = runtimeKeyOf(model, inst)
-
-        if (inst.activeGenerationId > inst.lastDoneGenerationId) {
-            Log.w(
-                TAG,
-                "runInference: refused due to native gen busy model='${model.name}', key='$runtimeKey', " +
-                        "active=${inst.activeGenerationId}, done=${inst.lastDoneGenerationId}"
-            )
-            safeCallResult(listener, "Model '${model.name}' is still processing a previous request.", true)
-            safeCallClean(onClean)
-            return
-        }
-
-        val once = AtomicBoolean(false)
-
-        fun fireClean(tag: String) {
-            if (!once.compareAndSet(false, true)) return
-
-            Log.d(
-                TAG,
-                "runInference: onClean fired tag='$tag' model='${model.name}', key='$runtimeKey', stateBefore=${inst.state.get()}"
-            )
-
-            inst.state.set(RunState.IDLE)
-
-            flushPendingClose(inst, "fireClean-$tag")
-            flushDeferredHardCloseIfReady(inst, "fireClean-$tag")
-
-            safeCallClean(onClean)
-        }
-
-        val desired = paramsFromModel(model)
-        if (!ensureSessionParams(inst, desired)) {
-            safeCallResult(listener, "Session rebuild failed.", true)
-            fireClean("session-rebuild-failed")
-            return
-        }
-
-        val acquired = inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)
-        if (!acquired) {
-            cancel(model)
-            if (!inst.state.compareAndSet(RunState.IDLE, RunState.RUNNING)) {
-                safeCallResult(listener, "Model '${model.name}' is busy.", true)
-                fireClean("busy-refused")
-                return
-            }
-        }
-
-        Log.d(
-            TAG,
-            "runInference: start model='${model.name}', key='$runtimeKey', backend='${inst.backendLabel}', " +
-                    "state=${inst.state.get()}, lastParams=${inst.lastParams}, input.len=${input.length}"
-        )
-
-        val text = input.trim()
-        if (text.isNotEmpty()) {
-            val ok = addQueryChunkWithOneRetry(model, inst, desired, text)
-            if (!ok) {
-                safeCallResult(listener, "Failed to add query chunk.", true)
-                postToMain { fireClean("addQueryChunk-failed") }
-                return
-            }
-        }
-
-        val genId = markGenerationStart(inst)
-
-        // Install generation-aware cleanup hook.
-        cleanUpHooks[runtimeKey] = CleanUpHook(genId) { fireClean("cleanup-hook") }
-
-        try {
-            inst.session.generateResponseAsync { partial, done ->
-                if (!done) {
-                    safeCallResult(listener, partial, false)
-                    return@generateResponseAsync
-                }
-
-                markGenerationDone(inst, genId)
-                flushPendingClose(inst, "done-callback")
-
-                postToMain {
-                    safeCallResult(listener, partial, true)
-
-                    // Only remove+invoke if generation matches (prevents late-done races).
-                    val hook = cleanUpHooks[runtimeKey]
-                    if (hook != null && hook.generationId == genId) {
-                        val removed = cleanUpHooks.remove(runtimeKey, hook)
-                        if (removed) {
-                            runCatching { hook.callback.invoke() }
-                                .onFailure { t -> Log.w(TAG, "Cleanup hook threw: ${t.message}", t) }
-                        }
-                    } else {
-                        Log.w(TAG, "Ignoring cleanup hook mismatch: key='$runtimeKey' gen=$genId hookGen=${hook?.generationId}")
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "generateResponseAsync failed: ${e.message}", e)
-            markGenerationDone(inst, genId)
-            flushPendingClose(inst, "exception-generateResponseAsync")
-
-            postToMain {
-                safeCallResult(listener, cleanError(e.message), true)
-
-                val hook = cleanUpHooks[runtimeKey]
-                if (hook != null && hook.generationId == genId) {
-                    val removed = cleanUpHooks.remove(runtimeKey, hook)
-                    if (removed) {
-                        runCatching { hook.callback.invoke() }
-                            .onFailure { t -> Log.w(TAG, "Cleanup hook threw: ${t.message}", t) }
-                    }
-                } else {
-                    fireClean("exception-fallback")
-                }
-            }
-        }
-    }
-
-    /* --------------------------------------------------------------------- */
-    /* Internal helpers                                                      */
-    /* --------------------------------------------------------------------- */
-
-    /** Dispatch work on the main thread. */
-    private fun postToMain(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
-    }
-
-    /** Returns true if the instance is busy (state or native generation). */
-    private fun isInstanceBusy(inst: SlmModelInstance): Boolean {
-        val stateBusy = inst.state.get() != RunState.IDLE
-        val genBusy = inst.activeGenerationId > inst.lastDoneGenerationId
-        return stateBusy || genBusy
-    }
-
-    /** Derive session parameters from Model.config with sanitization. */
-    private fun paramsFromModel(model: Model): SessionParams {
-        val topK = sanitizeTopK(model.getIntConfigValue(ConfigKey.TOP_K, DEFAULT_TOP_K))
-        val topP = sanitizeTopP(model.getFloatConfigValue(ConfigKey.TOP_P, DEFAULT_TOP_P))
-        val temp = sanitizeTemperature(model.getFloatConfigValue(ConfigKey.TEMPERATURE, DEFAULT_TEMPERATURE))
-        return SessionParams(topK = topK, topP = topP, temperature = temp)
-    }
-
-    /** Ensure the current session matches desired params. */
-    private fun ensureSessionParams(inst: SlmModelInstance, desired: SessionParams): Boolean {
-        if (inst.lastParams == desired) return true
-
-        val old = inst.session
-        val newSession = runCatching { buildSession(inst.engine, desired) }
-            .getOrElse {
-                Log.e(TAG, "ensureSessionParams: rebuild failed: ${it.message}", it)
-                return false
-            }
-
-        inst.session = newSession
-        inst.lastParams = desired
-        scheduleOrCloseOldSession(inst, old, "ensureSessionParams-rebuild")
-        return true
-    }
-
-    /** Build a new session from engine and params. */
-    private fun buildSession(engine: LlmInference, params: SessionParams): LlmInferenceSession =
-        LlmInferenceSession.createFromOptions(
-            engine,
-            LlmInferenceSession.LlmInferenceSessionOptions.builder()
-                .setTopK(params.topK)
-                .setTopP(params.topP)
-                .setTemperature(params.temperature)
-                .build()
-        )
-
-    /** Try addQueryChunk; if it fails, rebuild the session once and retry. */
-    private fun addQueryChunkWithOneRetry(
-        model: Model,
-        inst: SlmModelInstance,
-        desired: SessionParams,
-        text: String
-    ): Boolean {
-        fun tryAdd(): Boolean =
-            runCatching {
-                inst.session.addQueryChunk(text)
-                true
-            }.getOrElse { e ->
-                Log.w(TAG, "addQueryChunk failed: ${e.message}")
-                false
-            }
-
-        if (tryAdd()) return true
-
-        val rebuilt = synchronized(stateLock) {
-            val current = model.instance ?: instanceCache[inst.cacheKey] ?: return@synchronized false
-            if (current.engine != inst.engine) return@synchronized false
-
-            val old = current.session
-            val newSession = runCatching { buildSession(current.engine, desired) }
-                .getOrElse {
-                    Log.e(TAG, "addQueryChunk: session rebuild failed: ${it.message}", it)
-                    return@synchronized false
-                }
-
-            current.session = newSession
-            current.lastParams = desired
-            model.instance = current
-
-            scheduleOrCloseOldSession(current, old, "addQueryChunk-rebuild")
-            true
-        }
-
-        if (!rebuilt) return false
-
-        return runCatching {
-            inst.session.addQueryChunk(text)
-            true
-        }.getOrElse { e ->
-            Log.e(TAG, "addQueryChunk retry failed: ${e.message}", e)
+        if (!ok) return false
+
+        /** If invoked, prefer reading via reflection return is hard; fallback to safe default. */
+        return try {
+            /** Try direct reflection-return path (secondary). */
+            val cls = LiteRtLM::class.java
+            val m = findBestMethod(cls, "isBusy", emptyArray()) ?: return false
+            val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
+            val ret = m.invoke(receiver)
+            ret as? Boolean ?: false
+        } catch (t: Throwable) {
             false
         }
     }
 
-    /** Mark the start of a new generation and return its id. */
-    private fun markGenerationStart(inst: SlmModelInstance): Long {
-        val id = inst.generationSeq.incrementAndGet()
-        inst.activeGenerationId = id
-        inst.lastGenerateStartMs = SystemClock.elapsedRealtime()
-        return id
-    }
-
-    /** Mark the completion of a generation. */
-    private fun markGenerationDone(inst: SlmModelInstance, id: Long) {
-        if (id >= inst.lastDoneGenerationId) {
-            inst.lastDoneGenerationId = id
-            inst.lastGenerateDoneMs = SystemClock.elapsedRealtime()
+    /** Allow host app to set context early (recommended). */
+    fun setApplicationContext(context: Context) {
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "setApplicationContext",
+            args = arrayOf(context),
+            onFailLog = "LiteRtLM.setApplicationContext unavailable",
+        )
+        if (!ok) {
+            w { "setApplicationContext: skipped (LiteRtLM API not present)." }
         }
     }
 
     /**
-     * Close old session immediately if native is idle; otherwise defer until done.
+     * Initialize LiteRtLM Engine + Conversation (async).
+     *
+     * NOTE:
+     * - supportImage/supportAudio must match your actual requests later.
      */
-    private fun scheduleOrCloseOldSession(inst: SlmModelInstance, old: LlmInferenceSession?, reason: String) {
-        if (old == null) return
+    fun initialize(
+        context: Context,
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        onDone: (String) -> Unit,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+    ) {
+        d {
+            "initialize: model='${model.name}' path='${model.taskPath}' image=$supportImage audio=$supportAudio"
+        }
 
-        val genBusy = inst.activeGenerationId > inst.lastDoneGenerationId
-        if (genBusy) {
-            val prev = inst.pendingClose.getAndSet(old)
-            Log.d(
-                TAG,
-                "deferClose: reason=$reason active=${inst.activeGenerationId} done=${inst.lastDoneGenerationId} " +
-                        "state=${inst.state.get()} prevPending=${prev != null}"
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "initialize",
+            args = arrayOf(context, model, supportImage, supportAudio, onDone, systemMessage, tools),
+            onFailLog = "LiteRtLM.initialize unavailable",
+        )
+
+        if (!ok) {
+            w { "initialize: failed (LiteRtLM API not present / signature mismatch)." }
+            onDone("error: initialize unavailable")
+        }
+    }
+
+    /**
+     * Suspend-style initializer.
+     *
+     * Best-effort reflection call. If unavailable, falls back to initialize() and returns.
+     */
+    suspend fun initializeIfNeeded(
+        context: Context,
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+    ) {
+        d {
+            "initializeIfNeeded: model='${model.name}' image=$supportImage audio=$supportAudio"
+        }
+
+        try {
+            val ret = invokeLiteRtLmBestEffortSuspend(
+                methodName = "initializeIfNeeded",
+                argsNoCont = arrayOf(context, model, supportImage, supportAudio, systemMessage, tools),
+                onFailLog = "LiteRtLM.initializeIfNeeded unavailable",
             )
+            if (ret != null) return
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            w(t) { "initializeIfNeeded: reflection failed err=${t.message}" }
+        }
 
-            if (prev != null && prev !== old) {
-                runCatching { prev.close() }
-                    .onFailure { Log.d(TAG, "deferClose: previous pending close failed: ${it.message}") }
+        /** Fallback: call async initialize and return once onDone fires. */
+        suspendCancellableCoroutine<Unit> { cont ->
+            initialize(
+                context = context,
+                model = model,
+                supportImage = supportImage,
+                supportAudio = supportAudio,
+                onDone = { _ ->
+                    if (!cont.isCompleted) cont.resume(Unit)
+                },
+                systemMessage = systemMessage,
+                tools = tools
+            )
+            cont.invokeOnCancellation {
+                d { "initializeIfNeeded fallback cancelled: model='${model.name}'" }
+                cancel(model)
             }
-            return
         }
-
-        tryCloseQuietly(old)
-    }
-
-    /** Flush a deferred close if it is safe to do so. */
-    private fun flushPendingClose(inst: SlmModelInstance, reason: String) {
-        val genBusy = inst.activeGenerationId > inst.lastDoneGenerationId
-        if (genBusy) {
-            Log.d(TAG, "flushPendingClose: skipped reason=$reason active=${inst.activeGenerationId} done=${inst.lastDoneGenerationId}")
-            return
-        }
-
-        val pending = inst.pendingClose.getAndSet(null)
-        if (pending != null) {
-            Log.d(TAG, "flushPendingClose: closing deferred session reason=$reason")
-            tryCloseQuietly(pending)
-        }
-    }
-
-    /** Defer a hard close for a busy instance until it becomes safe. */
-    private fun deferHardClose(key: String, inst: SlmModelInstance, reason: String, onDone: () -> Unit) {
-        val now = SystemClock.elapsedRealtime()
-        deferredHardCloses.compute(key) { _, prev ->
-            val callbacks = prev?.callbacks ?: mutableListOf()
-            callbacks.add(onDone)
-            DeferredHardClose(
-                instance = inst,
-                callbacks = callbacks,
-                requestedAtMs = prev?.requestedAtMs ?: now,
-                reason = prev?.reason ?: reason
-            )
-        }
-        Log.w(TAG, "deferHardClose: key='$key' reason='$reason' (busy)")
     }
 
     /**
-     * Watchdog: if deferred hard-close sits too long, force-close.
+     * Reset conversation (reuse engine) safely.
+     *
+     * If LiteRtLM.resetConversation does not exist in the current build,
+     * we fall back to a no-op and log a warning (avoids build/runtime crash).
      */
-    private fun scheduleDeferredHardCloseWatchdog(key: String) {
-        thread(name = "SLM-hardclose-watchdog-$key") {
-            while (true) {
-                val entry = deferredHardCloses[key] ?: return@thread
+    fun resetConversation(
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+    ) {
+        d { "resetConversation: model='${model.name}' image=$supportImage audio=$supportAudio" }
 
-                val now = SystemClock.elapsedRealtime()
-                val age = now - entry.requestedAtMs
-                val inst = entry.instance
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "resetConversation",
+            args = arrayOf(model, supportImage, supportAudio, systemMessage, tools),
+            onFailLog = "LiteRtLM.resetConversation unavailable",
+        )
 
-                // If already safe, let normal flush handle it.
-                if (!isInstanceBusy(inst)) {
-                    flushDeferredHardCloseIfReady(inst, "watchdog-safe")
-                    return@thread
-                }
+        if (!ok) {
+            w { "resetConversation: skipped (LiteRtLM API not present)." }
+        }
+    }
 
-                if (age >= HARD_CLOSE_TIMEOUT_MS) {
-                    Log.e(TAG, "WATCHDOG: forcing hard close key='$key' ageMs=$age reason='${entry.reason}'")
+    /**
+     * Request a deferred idle cleanup.
+     */
+    fun cleanUp(model: Model, onDone: () -> Unit) {
+        d { "cleanUp: model='${model.name}'" }
 
-                    // Best-effort cancel before forced close.
-                    runCatching { inst.session.cancelGenerateResponseAsync() }
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "cleanUp",
+            args = arrayOf(model, onDone),
+            onFailLog = "LiteRtLM.cleanUp unavailable",
+        )
 
-                    // One last short grace.
-                    Thread.sleep(250)
+        if (!ok) {
+            w { "cleanUp: skipped (LiteRtLM API not present)." }
+            onDone()
+        }
+    }
 
-                    // Force close.
-                    runCatching { inst.session.close() }
-                        .onFailure { Log.w(TAG, "WATCHDOG: session close failed: ${it.message}") }
-                    runCatching { inst.engine.close() }
-                        .onFailure { Log.w(TAG, "WATCHDOG: engine close failed: ${it.message}") }
+    /**
+     * Force immediate teardown (use sparingly).
+     *
+     * If LiteRtLM.forceCleanUp does not exist, falls back to cleanUp().
+     */
+    fun forceCleanUp(model: Model, onDone: () -> Unit) {
+        d { "forceCleanUp: model='${model.name}'" }
 
-                    deferredHardCloses.remove(key)
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "forceCleanUp",
+            args = arrayOf(model, onDone),
+            onFailLog = "LiteRtLM.forceCleanUp unavailable",
+        )
 
-                    postToMain {
-                        entry.callbacks.forEach { cb ->
-                            runCatching { cb.invoke() }
-                                .onFailure { t -> Log.w(TAG, "WATCHDOG callback failed: ${t.message}", t) }
-                        }
+        if (!ok) {
+            w { "forceCleanUp: falling back to cleanUp() (deferred)." }
+            cleanUp(model = model, onDone = onDone)
+        }
+    }
+
+    /**
+     * Low-level callback-based streaming API.
+     *
+     * Contract (aligned with LiteRtLM):
+     * - resultListener(done=true) is logical completion for UI.
+     * - cleanUpListener() is invoked ONLY after native termination.
+     */
+    fun runInference(
+        model: Model,
+        input: String,
+        resultListener: ResultListener,
+        cleanUpListener: CleanUpListener,
+        onError: (message: String) -> Unit = {},
+        images: List<Bitmap> = emptyList(),
+        audioClips: List<ByteArray> = emptyList(),
+    ) {
+        d {
+            "runInference: model='${model.name}' textLen=${input.length} images=${images.size} audio=${audioClips.size}"
+        }
+
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "runInference",
+            args = arrayOf(model, input, resultListener, cleanUpListener, onError, images, audioClips, false),
+            onFailLog = "LiteRtLM.runInference unavailable",
+        )
+
+        if (!ok) {
+            w { "runInference: failed (LiteRtLM API not present / signature mismatch)." }
+            onError("runInference unavailable")
+            cleanUpListener()
+        }
+    }
+
+    /**
+     * High-level suspend API:
+     * - Returns full aggregated text.
+     *
+     * Strategy:
+     * 1) Try reflection suspend call to LiteRtLM.generateText.
+     * 2) If unavailable, fallback to streaming runInference() aggregation.
+     */
+    suspend fun generateText(
+        model: Model,
+        input: String,
+        images: List<Bitmap> = emptyList(),
+        audioClips: List<ByteArray> = emptyList(),
+        onPartial: (String) -> Unit = {},
+    ): String {
+        d {
+            "generateText: model='${model.name}' textLen=${input.length} images=${images.size} audio=${audioClips.size}"
+        }
+
+        /** Try reflection suspend call first. */
+        try {
+            val ret = invokeLiteRtLmBestEffortSuspend(
+                methodName = "generateText",
+                argsNoCont = arrayOf(model, input, images, audioClips, onPartial),
+                onFailLog = "LiteRtLM.generateText unavailable",
+            )
+            val s = ret as? String
+            if (s != null) return s
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            w(t) { "generateText: reflection failed err=${t.message}" }
+        }
+
+        /** Fallback: aggregate via streaming. */
+        return suspendCancellableCoroutine { cont ->
+            var lastText = ""
+            var doneOnce = false
+
+            runInference(
+                model = model,
+                input = input,
+                images = images,
+                audioClips = audioClips,
+                resultListener = { partial, done ->
+                    lastText = partial
+                    onPartial(partial)
+                    if (done && !doneOnce) {
+                        doneOnce = true
+                        if (!cont.isCompleted) cont.resume(partial)
                     }
-                    return@thread
+                },
+                cleanUpListener = {
+                    /** No-op; LiteRtLM owns native termination. */
+                },
+                onError = { msg ->
+                    if (!cont.isCompleted) cont.resume("error: $msg")
                 }
+            )
 
-                Thread.sleep(HARD_CLOSE_POLL_MS)
+            cont.invokeOnCancellation {
+                d { "generateText fallback cancelled: model='${model.name}'" }
+                cancel(model)
             }
         }
     }
 
-    /** Flush deferred hard close if the instance is now safe to close. */
-    private fun flushDeferredHardCloseIfReady(inst: SlmModelInstance, reason: String) {
-        val key = inst.cacheKey.takeIf { it.isNotBlank() } ?: return
-        val entry = deferredHardCloses[key] ?: return
+    /**
+     * Best-effort logical cancellation.
+     */
+    fun cancel(model: Model) {
+        d { "cancel: model='${model.name}'" }
 
-        if (entry.instance !== inst) return
+        val ok = invokeLiteRtLmBestEffortUnit(
+            methodName = "cancel",
+            args = arrayOf(model),
+            onFailLog = "LiteRtLM.cancel unavailable",
+        )
 
-        if (isInstanceBusy(entry.instance)) {
-            Log.d(TAG, "flushDeferredHardCloseIfReady: still busy key='$key' reason='$reason'")
-            return
-        }
-
-        deferredHardCloses.remove(key)
-
-        Log.w(TAG, "flushDeferredHardCloseIfReady: closing deferred engine/session key='$key' reason='$reason'")
-        flushPendingClose(entry.instance, "deferred-hard-close")
-        tryCloseQuietly(entry.instance.session)
-        safeClose(entry.instance.engine)
-
-        postToMain {
-            entry.callbacks.forEach { cb ->
-                runCatching { cb.invoke() }
-                    .onFailure { t -> Log.w(TAG, "Deferred cleanup callback failed: ${t.message}", t) }
-            }
+        if (!ok) {
+            w { "cancel: skipped (LiteRtLM API not present)." }
         }
     }
+}
 
-    /** Sanitize TopK - must be >= 1. */
-    private fun sanitizeTopK(k: Int): Int = k.coerceAtLeast(1)
+/* ───────────────────────────── R8 / Proguard NOTE ─────────────────────────────
+ *
+ * If you enable minify/obfuscation, reflection may fail to find methods.
+ * Add keep rules for LiteRtLM methods that SLM uses, e.g.:
+ *
+ * -keep class com.negi.survey.slm.LiteRtLM { *; }
+ *
+ * Or annotate LiteRtLM with @Keep.
+ *
+ * ───────────────────────────────────────────────────────────────────────────── */
 
-    /** Sanitize TopP - must be in [0, 1]. */
-    private fun sanitizeTopP(p: Float): Float = p.takeIf { it in 0f..1f } ?: DEFAULT_TOP_P
+/* ────────────────────────── TestTag Sanitizer (unchanged) ────────────────────────── */
 
-    /** Sanitize Temperature - typical safe band [0, 2]. */
-    private fun sanitizeTemperature(t: Float): Float = t.takeIf { it in 0f..2f } ?: DEFAULT_TEMPERATURE
-
-    /** Normalize accelerator preference string for stable cache keys. */
-    private fun normalizedAccelerator(model: Model): String =
-        model.getStringConfigValue(ConfigKey.ACCELERATOR, Accelerator.GPU.label)
-            .trim()
-            .uppercase()
-            .ifBlank { Accelerator.GPU.label }
-
-    /** Build a stable runtime key. */
-    private fun cacheKeyOf(path: String, backendLabel: String, maxTokens: Int): String {
-        val p = path.trim()
-        val b = backendLabel.trim().uppercase().ifBlank { Accelerator.GPU.label }
-        return "$p|$b|$maxTokens"
-    }
-
-    /** Build a process-wide requested cache key. */
-    private fun cacheKeyOf(model: Model): String {
-        val maxTokens = model.getIntConfigValue(ConfigKey.MAX_TOKENS, DEFAULT_MAX_TOKEN).coerceIn(1, ABS_MAX_TOKENS)
-        val backendPref = normalizedAccelerator(model)
-        return cacheKeyOf(model.getPath(), backendPref, maxTokens)
-    }
-
-    /** Resolve requested cache key through alias mapping. */
-    private fun resolveCacheKey(requestedKey: String): String {
-        var key = requestedKey
-        repeat(4) {
-            val next = cacheAliases[key] ?: return key
-            if (next == key) return key
-            key = next
-        }
-        return key
-    }
-
-    /** Remove aliases that point to targetKey. */
-    private fun removeAliasesPointingTo(targetKey: String) {
-        val toRemove = cacheAliases.entries
-            .filter { it.value == targetKey || it.key == targetKey }
-            .map { it.key }
-
-        for (k in toRemove) cacheAliases.remove(k)
-    }
-
-    /** Stable runtime key for cleanup/listener routing. */
-    private fun runtimeKeyOf(model: Model, inst: SlmModelInstance?): String {
-        val k = inst?.cacheKey?.takeIf { it.isNotBlank() }
-        if (k != null) return k
-        val requested = cacheKeyOf(model)
-        return resolveCacheKey(requested)
-    }
-
-    /** Find the cache key that maps to the given instance by identity. */
-    private fun findCacheKeyForInstance(inst: SlmModelInstance): String? =
-        instanceCache.entries.firstOrNull { it.value === inst }?.key
-
-    /** Clean and compress error messages for UI. */
-    private fun cleanError(msg: String?): String =
-        msg
-            ?.replace("INTERNAL:", "", ignoreCase = true)
-            ?.replace("\\s+".toRegex(), " ")
-            ?.trim()
-            ?.take(ERROR_MAX_CHARS)
-            ?.takeIf { it.isNotEmpty() }
-            ?: "Unknown error"
-
-    /** Try to cancel and close a session quietly. */
-    private fun tryCloseQuietly(session: LlmInferenceSession?) {
-        runCatching {
-            session?.cancelGenerateResponseAsync()
-            session?.close()
-        }.onFailure {
-            Log.w(TAG, "Session close failed: ${it.message}")
+/**
+ * Sanitize strings for use in test tags.
+ *
+ * Notes:
+ * - Allow only [A-Za-z0-9_.-]
+ * - Replace other characters with underscore.
+ * - Truncate to [maxLen].
+ */
+private fun String.safeTestTagToken(maxLen: Int): String {
+    val cleaned = buildString(length) {
+        for (ch in this@safeTestTagToken) {
+            val ok = ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == '.'
+            append(if (ok) ch else '_')
         }
     }
-
-    /** Close an engine quietly. */
-    private fun safeClose(engine: LlmInference?) {
-        runCatching { engine?.close() }
-            .onFailure { Log.w(TAG, "Engine close failed: ${it.message}") }
-    }
-
-    /** Invoke listener safely on Main without crashing the calling thread. */
-    private fun safeCallResult(listener: ResultListener, text: String, done: Boolean) {
-        postToMain {
-            runCatching { listener(text, done) }
-                .onFailure { Log.w(TAG, "ResultListener threw: ${it.message}", it) }
-        }
-    }
-
-    /** Invoke onClean safely on Main without crashing the calling thread. */
-    private fun safeCallClean(onClean: CleanUpListener) {
-        postToMain {
-            runCatching { onClean() }
-                .onFailure { Log.w(TAG, "CleanUpListener threw: ${it.message}", it) }
-        }
-    }
+    return if (cleaned.length <= maxLen) cleaned else cleaned.take(maxLen)
 }

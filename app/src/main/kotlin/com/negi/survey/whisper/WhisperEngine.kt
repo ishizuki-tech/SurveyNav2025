@@ -20,6 +20,7 @@ import android.util.Log
 import com.negi.whispers.media.decodeWaveFile
 import com.whispercpp.whisper.WhisperContext
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
@@ -213,7 +214,8 @@ object WhisperEngine {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.d(
                 LOG_TAG,
-                "[$requestId][init:file] Fast path (already initialized). totalMs=$totalMs key=$key bytes=${formatBytes(bytes)} lastMod=$lastMod thread=${Thread.currentThread().name}"
+                "[$requestId][init:file] Fast path (already initialized). " +
+                        "totalMs=$totalMs key=$key bytes=${formatBytes(bytes)} lastMod=$lastMod thread=${Thread.currentThread().name}"
             )
             safeEmitInitTiming(
                 onTiming = onTiming,
@@ -251,7 +253,8 @@ object WhisperEngine {
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                 Log.d(
                     LOG_TAG,
-                    "[$requestId][init:file] Already initialized (locked). totalMs=$totalMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs key=$key thread=${Thread.currentThread().name}"
+                    "[$requestId][init:file] Already initialized (locked). " +
+                            "totalMs=$totalMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs key=$key thread=${Thread.currentThread().name}"
                 )
                 safeEmitInitTiming(
                     onTiming = onTiming,
@@ -274,7 +277,8 @@ object WhisperEngine {
 
             Log.i(
                 LOG_TAG,
-                "[$requestId][init:file] Init start. lockWaitMs=$lockWaitMs prevKey=$previousKey newKey=$key bytes=${formatBytes(bytes)} lastMod=$lastMod thread=${Thread.currentThread().name}"
+                "[$requestId][init:file] Init start. lockWaitMs=$lockWaitMs prevKey=$previousKey newKey=$key " +
+                        "bytes=${formatBytes(bytes)} lastMod=$lastMod thread=${Thread.currentThread().name}"
             )
             logMemory("[$requestId][init:file]")
 
@@ -300,7 +304,6 @@ object WhisperEngine {
             /**
              * Create new context.
              */
-            var created: WhisperContext? = null
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
                 Log.i(LOG_TAG, "[$requestId][init:file] Creating WhisperContext from file=$key")
@@ -315,7 +318,8 @@ object WhisperEngine {
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                 Log.e(
                     LOG_TAG,
-                    "[$requestId][init:file] Init FAILED. totalMs=$totalMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
+                    "[$requestId][init:file] Init FAILED. totalMs=$totalMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs " +
+                            "releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
                 )
                 safeEmitInitTiming(
                     onTiming = onTiming,
@@ -336,8 +340,7 @@ object WhisperEngine {
                 return@withLock Result.failure(createdResult.exceptionOrNull()!!)
             }
 
-            created = createdResult.getOrThrow()
-            whisperContext = created
+            whisperContext = createdResult.getOrThrow()
             modelKey = key
 
             val totalMs = SystemClock.elapsedRealtime() - totalStart
@@ -345,7 +348,8 @@ object WhisperEngine {
 
             Log.i(
                 LOG_TAG,
-                "[$requestId][init:file] Init OK. totalMs=$totalMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
+                "[$requestId][init:file] Init OK. totalMs=$totalMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs " +
+                        "releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
             )
             logMemory("[$requestId][init:file]")
 
@@ -409,7 +413,8 @@ object WhisperEngine {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.e(
                 LOG_TAG,
-                "[$requestId][init:asset] Asset missing. totalMs=$totalMs assetCheckMs=$assetCheckMs path=assets/$assetPath thread=${Thread.currentThread().name}"
+                "[$requestId][init:asset] Asset missing. totalMs=$totalMs assetCheckMs=$assetCheckMs " +
+                        "path=assets/$assetPath thread=${Thread.currentThread().name}"
             )
             safeEmitInitTiming(
                 onTiming = onTiming,
@@ -441,7 +446,8 @@ object WhisperEngine {
             val totalMs = SystemClock.elapsedRealtime() - totalStart
             Log.d(
                 LOG_TAG,
-                "[$requestId][init:asset] Fast path (already initialized). totalMs=$totalMs assetCheckMs=$assetCheckMs key=$key thread=${Thread.currentThread().name}"
+                "[$requestId][init:asset] Fast path (already initialized). totalMs=$totalMs assetCheckMs=$assetCheckMs " +
+                        "key=$key thread=${Thread.currentThread().name}"
             )
             safeEmitInitTiming(
                 onTiming = onTiming,
@@ -479,7 +485,8 @@ object WhisperEngine {
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                 Log.d(
                     LOG_TAG,
-                    "[$requestId][init:asset] Already initialized (locked). totalMs=$totalMs assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs key=$key"
+                    "[$requestId][init:asset] Already initialized (locked). totalMs=$totalMs assetCheckMs=$assetCheckMs " +
+                            "lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs key=$key"
                 )
                 safeEmitInitTiming(
                     onTiming = onTiming,
@@ -502,7 +509,8 @@ object WhisperEngine {
 
             Log.i(
                 LOG_TAG,
-                "[$requestId][init:asset] Init start. assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs prevKey=$previousKey newKey=$key thread=${Thread.currentThread().name}"
+                "[$requestId][init:asset] Init start. assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs prevKey=$previousKey newKey=$key " +
+                        "thread=${Thread.currentThread().name}"
             )
             logMemory("[$requestId][init:asset]")
 
@@ -528,7 +536,6 @@ object WhisperEngine {
             /**
              * Create new context.
              */
-            var created: WhisperContext? = null
             val c0 = SystemClock.elapsedRealtime()
             val createdResult = runCatching {
                 Log.i(LOG_TAG, "[$requestId][init:asset] Creating WhisperContext from assets/$assetPath")
@@ -543,7 +550,8 @@ object WhisperEngine {
                 val lockHoldMs = SystemClock.elapsedRealtime() - lockAcquiredAt
                 Log.e(
                     LOG_TAG,
-                    "[$requestId][init:asset] Init FAILED. totalMs=$totalMs assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
+                    "[$requestId][init:asset] Init FAILED. totalMs=$totalMs assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs " +
+                            "releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
                 )
                 safeEmitInitTiming(
                     onTiming = onTiming,
@@ -564,8 +572,7 @@ object WhisperEngine {
                 return@withLock Result.failure(createdResult.exceptionOrNull()!!)
             }
 
-            created = createdResult.getOrThrow()
-            whisperContext = created
+            whisperContext = createdResult.getOrThrow()
             modelKey = key
 
             val totalMs = SystemClock.elapsedRealtime() - totalStart
@@ -573,7 +580,8 @@ object WhisperEngine {
 
             Log.i(
                 LOG_TAG,
-                "[$requestId][init:asset] Init OK. totalMs=$totalMs assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
+                "[$requestId][init:asset] Init OK. totalMs=$totalMs assetCheckMs=$assetCheckMs lockWaitMs=$lockWaitMs lockHoldMs=$lockHoldMs " +
+                        "releasePrevMs=$releasePrevMs createMs=$createMs key=$key"
             )
             logMemory("[$requestId][init:asset]")
 
@@ -619,6 +627,11 @@ object WhisperEngine {
      *
      * Thread-safety:
      * - The Whisper JNI call is protected by [engineMutex].
+     *
+     * IMPORTANT (format safety):
+     * - Do NOT call String.format / "…".format() on strings that already include
+     *   dynamic text (e.g., transcript previews). '%' inside the transcript can
+     *   crash Formatter with UnknownFormatConversionException.
      *
      * @param file Input WAV file (PCM16 or Float32). Must exist.
      * @param lang Language code ("en", "ja", "sw", or "auto").
@@ -680,12 +693,13 @@ object WhisperEngine {
         }
 
         val audioSeconds = pcm.size.toDouble() / targetSampleRate.toDouble()
+        val audioSecondsStr = formatFixed2(audioSeconds)
 
         val stats = computePcmStats(pcm)
         Log.d(
             LOG_TAG,
-            "[$requestId][asr] PCM stats: samples=${pcm.size} seconds=%.2f min=${stats.min} max=${stats.max} rms=${stats.rms} decodeMs=$decodeMs"
-                .format(audioSeconds)
+            "[$requestId][asr] PCM stats: samples=${pcm.size} seconds=${audioSecondsStr} " +
+                    "min=${stats.min} max=${stats.max} rms=${stats.rms} decodeMs=$decodeMs"
         )
 
         val languageAttempts: List<String> =
@@ -738,8 +752,8 @@ object WhisperEngine {
 
             Log.i(
                 LOG_TAG,
-                "[$requestId][asr] Mutex acquired. lockWaitMs=$lockWaitMs attempts=${languageAttempts.joinToString(",")} audio=%.2fs modelKey=$modelKey"
-                    .format(audioSeconds)
+                "[$requestId][asr] Mutex acquired. lockWaitMs=$lockWaitMs attempts=${languageAttempts.joinToString(",")} " +
+                        "audio=${audioSecondsStr}s modelKey=$modelKey"
             )
 
             for (code in languageAttempts) {
@@ -749,8 +763,7 @@ object WhisperEngine {
                 val result = runCatching {
                     Log.i(
                         LOG_TAG,
-                        "[$requestId][asr] Transcribing: lang=$code translate=$translate ts=$printTimestamp samples=${pcm.size} audio=%.2fs"
-                            .format(audioSeconds)
+                        "[$requestId][asr] Transcribing: lang=$code translate=$translate ts=$printTimestamp samples=${pcm.size} audio=${audioSecondsStr}s"
                     )
                     ctx.transcribeData(
                         data = pcm,
@@ -781,6 +794,7 @@ object WhisperEngine {
 
                 val trimmed = result.getOrThrow().trim()
                 val rtf = if (audioSeconds > 0.0) (transcribeMs / 1000.0) / audioSeconds else 0.0
+                val rtfStr = formatFixed2(rtf)
 
                 attemptTimings += TranscribeTiming.AttemptTiming(
                     lang = code,
@@ -794,10 +808,11 @@ object WhisperEngine {
                     if (trimmed.length > 160) trimmed.take(110) + " … " + trimmed.takeLast(25)
                     else trimmed
 
+                // IMPORTANT: preview may contain '%' (e.g., "10%"). Never feed it into Formatter.
                 Log.d(
                     LOG_TAG,
-                    "[$requestId][asr] Attempt done: lang=$code transcribeMs=$transcribeMs rtf=%.2f textLen=${trimmed.length} preview=\"$preview\""
-                        .format(rtf)
+                    "[$requestId][asr] Attempt done: lang=$code transcribeMs=$transcribeMs rtf=$rtfStr " +
+                            "textLen=${trimmed.length} preview=\"${escapeForLog(preview)}\""
                 )
 
                 if (trimmed.isNotEmpty()) {
@@ -969,10 +984,36 @@ object WhisperEngine {
         val gb = mb * 1024.0
         val b = bytes.toDouble()
         return when {
-            b >= gb -> "%.2fGB".format(b / gb)
-            b >= mb -> "%.2fMB".format(b / mb)
-            b >= kb -> "%.2fKB".format(b / kb)
+            b >= gb -> String.format(Locale.US, "%.2fGB", b / gb)
+            b >= mb -> String.format(Locale.US, "%.2fMB", b / mb)
+            b >= kb -> String.format(Locale.US, "%.2fKB", b / kb)
             else -> "${bytes}B"
+        }
+    }
+
+    /**
+     * Format a double with 2 decimal places using a fixed locale.
+     *
+     * IMPORTANT: Only use this for numeric formatting; do not mix dynamic text into Formatter.
+     */
+    private fun formatFixed2(value: Double): String {
+        return String.format(Locale.US, "%.2f", value)
+    }
+
+    /**
+     * Escape control chars to keep logs single-line and readable.
+     */
+    private fun escapeForLog(text: String): String {
+        if (text.isEmpty()) return text
+        return buildString(text.length) {
+            for (ch in text) {
+                when (ch) {
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    else -> append(ch)
+                }
+            }
         }
     }
 }

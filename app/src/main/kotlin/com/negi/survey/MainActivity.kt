@@ -1,15 +1,15 @@
 /*
  * =====================================================================
- *  IshizukiTech LLC — SLM Integration Framework
+ *  IshizukiTech LLC — Android App Shell
  *  ---------------------------------------------------------------------
  *  File: MainActivity.kt
- *  Author: Shu Ishizuki (石附 支)
+ *  Author: Shu Ishizuki
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  */
 
-@file:Suppress("UnusedParameter", "UnusedImport")
+@file:Suppress("unused")
 
 package com.negi.survey
 
@@ -21,11 +21,8 @@ import android.content.res.AssetManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Process
-import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
-import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -33,7 +30,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.RequiresApi
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -48,6 +44,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -76,6 +73,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -107,7 +105,6 @@ import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import com.negi.survey.config.SurveyConfig
 import com.negi.survey.config.SurveyConfigLoader
-import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.screens.AiScreen
 import com.negi.survey.screens.ConfigOptionUi
@@ -115,12 +112,12 @@ import com.negi.survey.screens.DoneScreen
 import com.negi.survey.screens.IntroScreen
 import com.negi.survey.screens.ReviewScreen
 import com.negi.survey.screens.SpeechController
-import com.negi.survey.screens.UploadProgressOverlay
-import com.negi.survey.slm.ConfigKey
 import com.negi.survey.slm.LiteRtLM
 import com.negi.survey.slm.LiteRtRepository
 import com.negi.survey.slm.Model
 import com.negi.survey.slm.Repository
+import com.negi.survey.slm.buildModelConfig
+import com.negi.survey.ui.theme.SurveyNavTheme
 import com.negi.survey.vm.AiViewModel
 import com.negi.survey.vm.AppViewModel
 import com.negi.survey.vm.DlState
@@ -129,19 +126,9 @@ import com.negi.survey.vm.FlowAI
 import com.negi.survey.vm.FlowDone
 import com.negi.survey.vm.FlowHome
 import com.negi.survey.vm.FlowReview
-import com.negi.survey.vm.FlowText
 import com.negi.survey.vm.SurveyViewModel
 import com.negi.survey.vm.WhisperSpeechController
-import java.io.BufferedReader
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileOutputStream
-import java.io.InputStreamReader
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -149,94 +136,101 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.system.exitProcess
 
-// IMPORTANT:
-// We alias ConfigDetails to avoid any accidental name collision with local types.
+/** IMPORTANT: Alias to avoid accidental collision with local types. */
 import com.negi.survey.screens.ConfigDetails as ScreenConfigDetails
 
-/**
- * Root activity of the SurveyNav app.
- *
- * This activity is intentionally thin:
- * - Applies edge-to-edge system bar styling.
- * - Installs a crash capture handler (logcat snapshot + exception).
- * - On next startup, schedules pending crash reports for upload via WorkManager.
- * - Delegates all runtime state and UI composition to [AppNav].
- */
+// -----------------------------------------------------------------------------
+// Defaults
+// -----------------------------------------------------------------------------
+
+/** Default Whisper model path in assets when config omits it. */
+private const val DEFAULT_WHISPER_ASSET_MODEL: String = "models/ggml-small-q5_1.bin"
+
+/** Default Whisper language when config omits it. */
+private const val DEFAULT_WHISPER_LANGUAGE: String = "en"
+
 class MainActivity : ComponentActivity() {
 
-    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 0) IME hardening: ensure Compose receives IME insets reliably.
-        //    Some devices + edge-to-edge combos won't report WindowInsets.ime unless we resize.
-        applyImeResizeHardening()
+        LiteRtLM.setApplicationContext(this)
 
-        // 1) Install crash capture as early as possible.
-        runCatching { CrashCapture.install(applicationContext) }
-            .onFailure { Log.w("CrashCapture", "install failed: ${it.message}", it) }
-
-        // 2) On startup, enqueue any pending crash files for upload (if GH config is present).
-        runCatching { CrashCapture.enqueuePendingCrashUploadsIfPossible(applicationContext) }
-            .onFailure { Log.w("CrashCapture", "enqueuePendingCrashUploads failed: ${it.message}", it) }
-
-        /**
-         * Prefer the modern edge-to-edge API.
-         * Fall back to legacy insets handling on older or vendor-modified devices.
-         */
-        try {
-            enableEdgeToEdge(
-                statusBarStyle = SystemBarStyle.dark("#000000".toColorInt()),
-                navigationBarStyle = SystemBarStyle.dark("#000000".toColorInt())
-            )
-        } catch (_: Throwable) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-            val controller = WindowInsetsControllerCompat(window, window.decorView)
-            controller.isAppearanceLightStatusBars = false
-            controller.isAppearanceLightNavigationBars = false
-            window.statusBarColor = 0xFF000000.toInt()
-            window.navigationBarColor = 0xFF000000.toInt()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                runCatching { window.isNavigationBarContrastEnforced = false }
-            }
-        } finally {
-            // IME + edge-to-edge: enforce decorFitsSystemWindows=false even when enableEdgeToEdge succeeds.
-            // This avoids vendor-specific cases where insets are not dispatched consistently.
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-        }
+        installCrashCapture()
+        enqueuePendingCrashUploads()
+        configureEdgeToEdge()
 
         setContent {
-            MaterialTheme {
-                AppNav()
+            SurveyNavTheme {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        // Keep the whole app above the IME when it shows.
+                        .imePadding(),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
+                    AppRoot()
+                }
             }
         }
     }
 
+    /** Install crash capture as early as possible. */
+    private fun installCrashCapture() {
+        runCatching { CrashCapture.install(applicationContext) }
+            .onFailure { Log.w(TAG, "CrashCapture.install failed: ${it.message}", it) }
+    }
+
+    /** Enqueue pending crash files for upload if configuration exists. */
+    private fun enqueuePendingCrashUploads() {
+        runCatching { CrashCapture.enqueuePendingCrashUploadsIfPossible(applicationContext) }
+            .onFailure { Log.w(TAG, "CrashCapture.enqueuePendingCrashUploads failed: ${it.message}", it) }
+    }
+
     /**
-     * Force resize behavior so WindowInsets.ime is non-zero and imePadding() can work.
+     * Configure edge-to-edge system bars.
      *
-     * Notes:
-     * - Prefer Manifest android:windowSoftInputMode="adjustResize" as the primary switch.
-     * - This is an additional runtime safety net for devices/ROMs that ignore the manifest.
+     * Preferred path:
+     *  - enableEdgeToEdge() with explicit dark styles on a black background.
+     *
+     * Fallback path:
+     *  - Use decorFitsSystemWindows(false) + icon appearance controls.
      */
-    private fun applyImeResizeHardening() {
+    private fun configureEdgeToEdge() {
+        val black = "#000000".toColorInt()
+
+        // Force edge-to-edge in both paths for consistency.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         runCatching {
-            window.setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
-                        WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.dark(black),
+                navigationBarStyle = SystemBarStyle.dark(black),
             )
-        }.onFailure {
-            Log.w("MainActivity", "applyImeResizeHardening failed: ${it.message}", it)
+        }.onFailure { t ->
+            Log.w(TAG, "enableEdgeToEdge failed; using legacy insets path: ${t.message}", t)
+
+            WindowInsetsControllerCompat(window, window.decorView).apply {
+                isAppearanceLightStatusBars = false
+                isAppearanceLightNavigationBars = false
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching { window.isNavigationBarContrastEnforced = false }
+            }
         }
+    }
+
+    companion object {
+        const val TAG = "MainActivity"
     }
 }
 
 /* ───────────────────────────── Visual Utilities ───────────────────────────── */
 
 @Composable
-private fun animatedBackplate(): Brush =
+private fun appBackplate(): Brush =
     Brush.verticalGradient(
         0f to Color(0xFF202020),
         1f to Color(0xFF040404)
@@ -264,6 +258,12 @@ private fun Modifier.neonEdgeThin(
 
 /* ───────────────────────────── Init Gate ───────────────────────────── */
 
+/**
+ * A simple init gate composable that runs a suspend init and shows:
+ * - Loading UI while running
+ * - Error UI with retry on failure
+ * - Content UI when init succeeds
+ */
 @Composable
 fun InitGate(
     modifier: Modifier = Modifier,
@@ -288,7 +288,9 @@ fun InitGate(
                 init()
                 isLoading = false
             } catch (ce: CancellationException) {
-                throw ce
+                // Cancellation is expected during recomposition/dispose; do not treat as error.
+                // Avoid rethrow to prevent cascading cancellation in parent scopes.
+                return@launch
             } catch (t: Throwable) {
                 error = t
                 isLoading = false
@@ -304,13 +306,14 @@ fun InitGate(
         kick()
     }
 
-    val backplate = animatedBackplate()
+    val backplate = appBackplate()
 
     when {
         isLoading -> {
             Box(
                 modifier
                     .fillMaxSize()
+                    .imePadding()
                     .background(backplate)
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
@@ -325,7 +328,7 @@ fun InitGate(
                         .neonEdgeThin()
                 ) {
                     Column(
-                        Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(
@@ -346,13 +349,13 @@ fun InitGate(
                         )
 
                         Text(
-                            progressText,
+                            text = progressText,
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.primary.copy(alpha = alpha)
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            subText,
+                            text = subText,
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -365,6 +368,7 @@ fun InitGate(
             Box(
                 modifier
                     .fillMaxSize()
+                    .imePadding()
                     .background(backplate)
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
@@ -382,11 +386,11 @@ fun InitGate(
                         )
                 ) {
                     Column(
-                        Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            onErrorMessage(error!!),
+                            text = onErrorMessage(error!!),
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.error
                         )
@@ -399,9 +403,7 @@ fun InitGate(
             }
         }
 
-        else -> {
-            content()
-        }
+        else -> content()
     }
 }
 
@@ -421,8 +423,7 @@ fun AudioPermissionGate(
 
     var hasPermission by remember {
         mutableStateOf(
-            ContextCompat.checkSelfPermission(context, permission) ==
-                    PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
         )
     }
 
@@ -430,8 +431,7 @@ fun AudioPermissionGate(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasPermission =
-                    ContextCompat.checkSelfPermission(context, permission) ==
-                            PackageManager.PERMISSION_GRANTED
+                    ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -463,113 +463,104 @@ fun AudioPermissionGate(
 
     if (hasPermission) {
         content()
-    } else {
-        val backplate = animatedBackplate()
+        return
+    }
 
-        Box(
-            modifier = modifier
-                .fillMaxSize()
-                .background(backplate)
-                .padding(24.dp),
-            contentAlignment = Alignment.Center
+    val backplate = appBackplate()
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 360.dp)
+                .wrapContentWidth()
+                .neonEdgeThin()
         ) {
-            Surface(
-                tonalElevation = 6.dp,
-                shadowElevation = 8.dp,
-                shape = MaterialTheme.shapes.large,
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .widthIn(max = 360.dp)
-                    .wrapContentWidth()
-                    .neonEdgeThin()
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                Icon(
+                    imageVector = Icons.Filled.Mic,
+                    contentDescription = "Microphone",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(32.dp)
+                )
+                Text(
+                    text = "Microphone permission needed",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(
+                    text = "To use voice input for survey answers, allow microphone access.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Button(
+                    onClick = { launcher.launch(permission) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary
+                    )
+                ) {
+                    Text("Allow microphone")
+                }
+                IconButton(
+                    onClick = {
+                        val intent = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", context.packageName, null)
+                        ).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    }
                 ) {
                     Icon(
-                        imageVector = Icons.Filled.Mic,
-                        contentDescription = "Microphone",
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(32.dp)
+                        imageVector = Icons.Filled.Settings,
+                        contentDescription = "Open app settings"
                     )
-                    Text(
-                        text = "Microphone permission needed",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Text(
-                        text = "To use voice input for survey answers, allow microphone access.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Button(
-                        onClick = { launcher.launch(permission) },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary
-                        )
-                    ) {
-                        Text("Allow microphone")
-                    }
-                    IconButton(
-                        onClick = {
-                            val intent = Intent(
-                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                Uri.fromParts("package", context.packageName, null)
-                            ).apply {
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            context.startActivity(intent)
-                        }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Settings,
-                            contentDescription = "Open app settings"
-                        )
-                    }
                 }
             }
-
-            SnackbarHost(
-                hostState = snackbarHostState,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(16.dp)
-            )
         }
+
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(16.dp)
+        )
     }
+}
+
+/* ───────────────────────────── App Root ───────────────────────────── */
+
+@Composable
+private fun AppRoot() {
+    AppNav()
 }
 
 /* ───────────────────────────── App Nav Root ───────────────────────────── */
 
-private const val DEFAULT_WHISPER_ASSET_MODEL = "models/ggml-small-q5_1.bin"
-private const val DEFAULT_WHISPER_LANGUAGE = "auto"
-
-private data class RuntimeHardeningOptions(
-    val reinitLiteRtOnResume: Boolean = true,
-    val showManualReinitButtonInDebug: Boolean = true
-)
-
-@RequiresApi(Build.VERSION_CODES.TIRAMISU)
 @Composable
 fun AppNav() {
     val appContext = LocalContext.current.applicationContext
-    val lifecycleOwner = LocalLifecycleOwner.current
-
-    val hardening = remember {
-        RuntimeHardeningOptions(
-            reinitLiteRtOnResume = true,
-            showManualReinitButtonInDebug = true
-        )
-    }
 
     val options = remember(appContext) {
         val assetManager = appContext.assets
-
         val yamlFiles = listAssetYamlConfigs(assetManager)
             .filter { path ->
-                val name = path.substringAfterLast('/')
+                val name = path.substringAfterLast('/').lowercase(Locale.US)
                 (name.endsWith(".yaml") || name.endsWith(".yml")) &&
                         (name.startsWith("survey_") || name.startsWith("survey_config"))
             }
@@ -583,7 +574,7 @@ fun AppNav() {
         mapped.ifEmpty {
             listOf(
                 ConfigOptionUi(
-                    id = "survey_config20.yaml",
+                    id = "configs/survey_config1.yaml",
                     label = "Default config",
                     description = "Fallback survey configuration loaded from survey_config1.yaml."
                 )
@@ -597,15 +588,6 @@ fun AppNav() {
     var configError by remember { mutableStateOf<String?>(null) }
     var selectionEpoch by remember { mutableIntStateOf(0) }
 
-    // NEW: Re-init epoch for LiteRT runtime recovery (watchdog cleanup, debug reset, etc.)
-    var liteRtReinitEpoch by remember { mutableIntStateOf(0) }
-
-    fun requestLiteRtReinit(reason: String) {
-        liteRtReinitEpoch += 1
-        Log.w("MainActivity", "LiteRT re-init requested. epoch=$liteRtReinitEpoch reason=$reason")
-    }
-
-    // Intro: add onResolveConfigDetails (required by IntroScreen signature)
     if (chosen == null) {
         IntroScreen(
             options = options,
@@ -616,11 +598,7 @@ fun AppNav() {
                 configError = null
                 configLoading = false
                 chosen = option
-
-                Log.d(
-                    "MainActivity",
-                    "Intro -> Start session. epoch=$selectionEpoch, file=${option.id}"
-                )
+                Log.d(MainActivity.TAG, "Intro -> Start session. epoch=$selectionEpoch, file=${option.id}")
             },
             onResolveConfigDetails = { configId ->
                 resolveConfigDetailsFromAssets(
@@ -640,27 +618,34 @@ fun AppNav() {
         configLoading = true
         configError = null
         try {
+            SurveyConfigLoader.setDebug(
+                format = true,
+                validate = true,
+                prompts = true,
+                dumpSystemPrompts = true
+            )
             val loaded = withContext(Dispatchers.IO) {
                 SurveyConfigLoader.fromAssetsValidated(appContext, chosen!!.id)
             }
             config = loaded
-            Log.d("MainActivity", "Config loaded. session=$sessionKey")
+            Log.d(MainActivity.TAG, "Config loaded. session=$sessionKey")
         } catch (t: Throwable) {
             config = null
             configError = t.message ?: "Failed to load survey configuration."
-            Log.e("MainActivity", "Config load failed. session=$sessionKey", t)
+            Log.e(MainActivity.TAG, "Config load failed. session=$sessionKey", t)
         } finally {
             configLoading = false
         }
     }
 
-    val backplate = animatedBackplate()
+    val backplate = appBackplate()
 
     when {
         configLoading || (config == null && configError == null) -> {
             Box(
-                Modifier
+                modifier = Modifier
                     .fillMaxSize()
+                    .imePadding()
                     .background(backplate)
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
@@ -675,7 +660,7 @@ fun AppNav() {
                         .neonEdgeThin()
                 ) {
                     Column(
-                        Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(
@@ -701,8 +686,9 @@ fun AppNav() {
 
         configError != null -> {
             Box(
-                Modifier
+                modifier = Modifier
                     .fillMaxSize()
+                    .imePadding()
                     .background(backplate)
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
@@ -720,7 +706,7 @@ fun AppNav() {
                         )
                 ) {
                     Column(
-                        Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
@@ -731,7 +717,7 @@ fun AppNav() {
                         Spacer(Modifier.height(12.dp))
                         OutlinedButton(
                             onClick = {
-                                Log.d("MainActivity", "Error -> Back to selector. session=$sessionKey")
+                                Log.d(MainActivity.TAG, "Error -> Back to selector. session=$sessionKey")
                                 chosen = null
                                 config = null
                                 configError = null
@@ -758,7 +744,7 @@ fun AppNav() {
 
     DisposableEffect(sessionKey) {
         onDispose {
-            Log.d("MainActivity", "Session dispose -> clearing ViewModelStore. session=$sessionKey")
+            Log.d(MainActivity.TAG, "Session dispose -> clearing ViewModelStore. session=$sessionKey")
             sessionVmStore.clear()
         }
     }
@@ -779,7 +765,7 @@ fun AppNav() {
 
     LaunchedEffect(state) {
         if (state is DlState.Idle) {
-            Log.d("MainActivity", "DownloadGate idle -> start download. session=$sessionKey")
+            Log.d(MainActivity.TAG, "DownloadGate idle -> start download. session=$sessionKey")
             appVm.ensureModelDownloaded(appContext)
         }
     }
@@ -787,18 +773,13 @@ fun AppNav() {
     DownloadGate(
         state = state,
         onRetry = {
-            Log.d("MainActivity", "DownloadGate retry. session=$sessionKey")
+            Log.d(MainActivity.TAG, "DownloadGate retry. session=$sessionKey")
             appVm.ensureModelDownloaded(appContext)
         }
     ) { modelFile ->
 
         val modelConfig = remember(cfg) { buildModelConfig(cfg.slm) }
-
-        val slmModel = remember(
-            modelFile.absolutePath,
-            modelConfig,
-            cfg.modelDefaults.defaultFileName
-        ) {
+        val slmModel = remember(modelFile.absolutePath, modelConfig, cfg.modelDefaults.defaultFileName) {
             val modelName = cfg.modelDefaults.defaultFileName
                 ?.substringBeforeLast('.')
                 ?.ifBlank { null }
@@ -811,33 +792,8 @@ fun AppNav() {
             )
         }
 
-        // NEW: On resume, try to ensure LiteRT is ready (best-effort).
-        DisposableEffect(lifecycleOwner, slmModel, liteRtReinitEpoch) {
-            if (!hardening.reinitLiteRtOnResume) {
-                onDispose { }
-                return@DisposableEffect onDispose { }
-            }
-
-            val observer = LifecycleEventObserver { _, event ->
-                if (event == Lifecycle.Event.ON_RESUME) {
-                    Log.d("MainActivity", "ON_RESUME -> best-effort LiteRT initializeIfNeeded()")
-                    runCatching {
-                        // Note: This is safe because initializeIfNeeded is idempotent.
-                        // We intentionally do not block the UI thread.
-                    }
-                }
-            }
-
-            lifecycleOwner.lifecycle.addObserver(observer)
-            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-        }
-
-        val initKey = remember(slmModel, liteRtReinitEpoch) {
-            "${slmModel.name}@${slmModel.taskPath}@epoch=$liteRtReinitEpoch"
-        }
-
         InitGate(
-            key = initKey,
+            key = "slm_init@$sessionKey@${modelFile.absolutePath}",
             progressText = "Initializing Small Language Model…",
             subText = "Setting up accelerated runtime and buffers",
             onErrorMessage = { "Failed to initialize model: ${it.message}" },
@@ -854,7 +810,7 @@ fun AppNav() {
         ) {
             val backStack = rememberNavBackStack(FlowHome)
 
-            val repo: Repository = remember(appContext, slmModel, cfg) {
+            val repo: Repository = remember(slmModel, cfg) {
                 LiteRtRepository(slmModel, cfg)
             }
 
@@ -881,7 +837,7 @@ fun AppNav() {
             )
 
             val resetToSelector: () -> Unit = {
-                Log.d("MainActivity", "resetToSelector invoked. session=$sessionKey")
+                Log.d(MainActivity.TAG, "resetToSelector invoked. session=$sessionKey")
                 chosen = null
                 config = null
                 configError = null
@@ -889,8 +845,19 @@ fun AppNav() {
             }
 
             val voiceEnabled = remember(cfg) { cfg.whisper.enabled ?: true }
-
-            val body: @Composable () -> Unit = {
+            if (voiceEnabled) {
+                AudioPermissionGate {
+                    SurveyNavHost(
+                        vmSurvey = vmSurvey,
+                        vmAI = vmAI,
+                        backStack = backStack,
+                        onResetToSelector = resetToSelector,
+                        whisperMeta = cfg.whisper,
+                        sessionId = sessionKey,
+                        sessionVmOwner = sessionVmOwner
+                    )
+                }
+            } else {
                 SurveyNavHost(
                     vmSurvey = vmSurvey,
                     vmAI = vmAI,
@@ -898,20 +865,43 @@ fun AppNav() {
                     onResetToSelector = resetToSelector,
                     whisperMeta = cfg.whisper,
                     sessionId = sessionKey,
-                    sessionVmOwner = sessionVmOwner,
-                    onRequestLiteRtReinit = { reason ->
-                        requestLiteRtReinit(reason)
-                    },
-                    showDebugReinitButton = BuildConfig.DEBUG && hardening.showManualReinitButtonInDebug
+                    sessionVmOwner = sessionVmOwner
                 )
             }
-
-            if (voiceEnabled) {
-                AudioPermissionGate { body() }
-            } else {
-                body()
-            }
         }
+    }
+}
+
+/* ───────────────────────────── No-op Speech ───────────────────────────── */
+
+private class NoOpSpeechController(
+    private val disabledReason: String = "Voice input is disabled."
+) : SpeechController {
+
+    private val _isRecording = MutableStateFlow(false)
+    private val _isTranscribing = MutableStateFlow(false)
+    private val _partialText = MutableStateFlow("")
+    private val _error = MutableStateFlow<String?>(null)
+
+    override val isRecording: StateFlow<Boolean> = _isRecording
+    override val isTranscribing: StateFlow<Boolean> = _isTranscribing
+    override val partialText: StateFlow<String> = _partialText
+    override val errorMessage: StateFlow<String?> = _error
+
+    override fun updateContext(surveyId: String?, questionId: String?) {
+        // No-op
+    }
+
+    override fun startRecording() {
+        _error.value = disabledReason
+    }
+
+    override fun stopRecording() {
+        // No-op
+    }
+
+    override fun toggleRecording() {
+        startRecording()
     }
 }
 
@@ -925,48 +915,57 @@ fun SurveyNavHost(
     onResetToSelector: () -> Unit = {},
     whisperMeta: SurveyConfig.WhisperMeta = SurveyConfig.WhisperMeta(),
     sessionId: String = "session",
-    sessionVmOwner: ViewModelStoreOwner? = null,
-    onRequestLiteRtReinit: (String) -> Unit = {},
-    showDebugReinitButton: Boolean = false
+    sessionVmOwner: ViewModelStoreOwner? = null
 ) {
     val appContext = LocalContext.current.applicationContext
     val owner = sessionVmOwner ?: LocalViewModelStoreOwner.current
     ?: error("Missing ViewModelStoreOwner")
 
+    val canGoBack by vmSurvey.canGoBack.collectAsState()
+    val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
     val latestNode by vmSurvey.currentNode.collectAsState()
     val latestNodeId = latestNode.id
 
-    val voiceEnabled = remember(whisperMeta.enabled) { whisperMeta.enabled ?: true }
+    // IMPORTANT:
+    // - IME causes recompositions and size changes.
+    // - imePadding() here prevents the whole nav content from being covered by the keyboard.
+    val rootModifier = Modifier.fillMaxSize().imePadding()
+
+    val assetPath = remember(whisperMeta.assetModelPath) {
+        whisperMeta.assetModelPath?.ifBlank { null } ?: DEFAULT_WHISPER_ASSET_MODEL
+    }
+
+    val lang = remember(whisperMeta.language) {
+        whisperMeta.language
+            ?.trim()
+            ?.lowercase(Locale.US)
+            ?.ifBlank { null }
+            ?: DEFAULT_WHISPER_LANGUAGE
+    }
+
+    /** Keep the latest node id without forcing ViewModel recreation. */
+    val latestNodeIdState = rememberUpdatedState(latestNodeId)
 
     val speechController: SpeechController = if (voiceEnabled) {
-        val assetPath = remember(whisperMeta.assetModelPath) {
-            whisperMeta.assetModelPath?.ifBlank { null } ?: DEFAULT_WHISPER_ASSET_MODEL
-        }
-        val lang = remember(whisperMeta.language) {
-            whisperMeta.language?.trim()?.lowercase(Locale.US)?.ifBlank { null } ?: DEFAULT_WHISPER_LANGUAGE
-        }
-
-        viewModel(
-            viewModelStoreOwner = owner,
-            key = "WhisperSpeechController_${vmSurvey.hashCode()}_${assetPath}_$lang",
-            factory = WhisperSpeechController.provideFactory(
+        val factory = remember(appContext, assetPath, lang, vmSurvey) {
+            WhisperSpeechController.provideFactory(
                 appContext = appContext,
                 assetModelPath = assetPath,
                 languageCode = lang,
                 onVoiceExported = onVoiceExported@{ voice ->
                     val resolvedQid =
-                        voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeId
+                        voice.questionId?.takeIf { it.isNotBlank() } ?: latestNodeIdState.value
 
                     if (resolvedQid.isBlank()) {
                         Log.w(
-                            "MainActivity",
+                            MainActivity.TAG,
                             "onVoiceExported: missing questionId and fallback failed. file=${voice.fileName}"
                         )
                         return@onVoiceExported
                     }
 
                     Log.d(
-                        "MainActivity",
+                        MainActivity.TAG,
                         "onVoiceExported: q=$resolvedQid, file=${voice.fileName}, bytes=${voice.byteSize}, checksum=${voice.checksum}"
                     )
 
@@ -979,49 +978,48 @@ fun SurveyNavHost(
                     )
                 }
             )
+        }
+
+        // IMPORTANT:
+        // viewModel<T>() must be parameterized with a ViewModel type.
+        val whisperVm: WhisperSpeechController = viewModel(
+            viewModelStoreOwner = owner,
+            key = "WhisperSpeechController_${sessionId}_${assetPath}_$lang",
+            factory = factory
         )
+
+        whisperVm
     } else {
-        remember { NoOpSpeechController() }
+        remember {
+            NoOpSpeechController("Voice input is disabled by configuration.")
+        }
     }
 
-    LaunchedEffect(sessionId, latestNodeId) {
-        speechController.updateContext(
-            surveyId = sessionId,
-            questionId = latestNodeId
-        )
+    LaunchedEffect(sessionId, latestNode.id) {
+        // Keep SpeechController in sync with the current question/node.
+        runCatching { speechController.updateContext(sessionId, latestNode.id) }
     }
 
-    val canGoBack by vmSurvey.canGoBack.collectAsState()
+    DisposableEffect(speechController) {
+        onDispose {
+            // Best-effort: stop recording when leaving the host.
+            runCatching { speechController.stopRecording() }
+        }
+    }
 
-    Box(Modifier.fillMaxSize()) {
-        UploadProgressOverlay()
-
+    Box(modifier = rootModifier) {
         NavDisplay(
             backStack = backStack,
-            entryDecorators = listOf(
-                rememberSaveableStateHolderNavEntryDecorator()
-            ),
+            entryDecorators = listOf(rememberSaveableStateHolderNavEntryDecorator()),
             entryProvider = entryProvider {
                 entry<FlowHome> {
                     HomeScreen(
                         onStart = {
-                            Log.d("MainActivity", "Home -> Start survey")
+                            Log.d(MainActivity.TAG, "Home -> Start survey. session=$sessionId")
                             vmSurvey.resetToStart()
                             vmAI.resetAll(keepError = false)
                             vmSurvey.advanceToNext()
                         }
-                    )
-                }
-
-                entry<FlowText> {
-                    val node by vmSurvey.currentNode.collectAsState()
-                    AiScreen(
-                        nodeId = node.id,
-                        vmSurvey = vmSurvey,
-                        vmAI = vmAI,
-                        onNext = { vmSurvey.advanceToNext() },
-                        onBack = { vmSurvey.backToPrevious() },
-                        speechController = speechController
                     )
                 }
 
@@ -1061,7 +1059,7 @@ fun SurveyNavHost(
                     DoneScreen(
                         vm = vmSurvey,
                         onRestart = {
-                            Log.d("MainActivity", "Done -> Restart requested (return to selector)")
+                            Log.d(MainActivity.TAG, "Done -> Restart requested (return to selector)")
                             vmAI.resetStates()
                             vmSurvey.resetToStart()
                             onResetToSelector()
@@ -1071,25 +1069,11 @@ fun SurveyNavHost(
                 }
             }
         )
-
-        if (showDebugReinitButton) {
-            IconButton(
-                onClick = { onRequestLiteRtReinit("debug-button") },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(10.dp)
-                    .neonEdgeThin(intensity = 0.03f, corner = 14.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Settings,
-                    contentDescription = "Reinitialize LiteRT runtime"
-                )
-            }
-        }
     }
 
     BackHandler(enabled = canGoBack) {
-        Log.d("MainActivity", "BackHandler -> backToPrevious")
+        Log.d(MainActivity.TAG, "BackHandler -> backToPrevious. session=$sessionId voice=$voiceEnabled")
+        runCatching { speechController.stopRecording() }
         vmAI.resetStates()
         vmSurvey.backToPrevious()
     }
@@ -1101,11 +1085,12 @@ fun SurveyNavHost(
 private fun HomeScreen(
     onStart: () -> Unit
 ) {
-    val backplate = animatedBackplate()
+    val backplate = appBackplate()
 
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .imePadding()
             .background(backplate)
             .padding(24.dp),
         contentAlignment = Alignment.Center
@@ -1139,72 +1124,6 @@ private fun HomeScreen(
                 }
             }
         }
-    }
-}
-
-/* ───────────────────────────── SLM Config Helpers ────────────────────────── */
-
-private fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
-    val out: MutableMap<ConfigKey, Any> = mutableMapOf(
-        ConfigKey.ACCELERATOR to ((slm.accelerator ?: "GPU").uppercase(Locale.US)),
-        ConfigKey.MAX_TOKENS to ((slm.maxTokens ?: 512).toInt()),
-        ConfigKey.TOP_K to ((slm.topK ?: 1).toInt()),
-        ConfigKey.TOP_P to ((slm.topP ?: 0.0).toDouble()),
-        ConfigKey.TEMPERATURE to ((slm.temperature ?: 0.0).toDouble())
-    )
-
-    normalizeNumberTypes(out)
-    clampRanges(out)
-    return out
-}
-
-private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
-    m[ConfigKey.MAX_TOKENS] = (m[ConfigKey.MAX_TOKENS] as? Number)?.toInt() ?: 512
-    m[ConfigKey.TOP_K] = (m[ConfigKey.TOP_K] as? Number)?.toInt() ?: 1
-    m[ConfigKey.TOP_P] = (m[ConfigKey.TOP_P] as? Number)?.toDouble() ?: 0.0
-    m[ConfigKey.TEMPERATURE] = (m[ConfigKey.TEMPERATURE] as? Number)?.toDouble() ?: 0.0
-}
-
-private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
-    val maxTokens = (m[ConfigKey.MAX_TOKENS] as Number).toInt().coerceAtLeast(1)
-    val topK = (m[ConfigKey.TOP_K] as Number).toInt().coerceAtLeast(1)
-    val topP = (m[ConfigKey.TOP_P] as Number).toDouble().coerceIn(0.0, 1.0)
-    val temp = (m[ConfigKey.TEMPERATURE] as Number).toDouble().coerceAtLeast(0.0)
-
-    m[ConfigKey.MAX_TOKENS] = maxTokens
-    m[ConfigKey.TOP_K] = topK
-    m[ConfigKey.TOP_P] = topP
-    m[ConfigKey.TEMPERATURE] = temp
-}
-
-/* ───────────────────────────── No-op Speech ───────────────────────────── */
-
-private class NoOpSpeechController : SpeechController {
-
-    private val _isRecording = MutableStateFlow(false)
-    private val _isTranscribing = MutableStateFlow(false)
-    private val _partialText = MutableStateFlow("")
-    private val _error = MutableStateFlow<String?>(null)
-
-    override val isRecording: StateFlow<Boolean> = _isRecording
-    override val isTranscribing: StateFlow<Boolean> = _isTranscribing
-    override val partialText: StateFlow<String> = _partialText
-    override val errorMessage: StateFlow<String?> = _error
-
-    override fun updateContext(surveyId: String?, questionId: String?) {
-        // No-op
-    }
-
-    override fun startRecording() {
-        _error.value = "Voice input is disabled by configuration."
-    }
-
-    override fun stopRecording() {
-        // No-op
-    }
-
-    override fun toggleRecording() {
-        startRecording()
     }
 }
 
@@ -1291,6 +1210,7 @@ private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
                 continue
             }
 
+            // AssetManager.list() does not clearly distinguish files vs dirs; attempt to descend.
             walk(path, depth + 1)
         }
     }
@@ -1302,26 +1222,48 @@ private fun listAssetYamlConfigs(assetManager: AssetManager): List<String> {
 
 /* ───────────────────────────── Config Details Resolver ───────────────────────────── */
 
+/**
+ * Load config YAML text from assets and extract helpful meta (slm: section).
+ *
+ * Notes:
+ * - No YAML library needed.
+ * - Best-effort: meta parsing can fail safely; longText still shows the real YAML.
+ */
 private suspend fun resolveConfigDetailsFromAssets(
     context: Context,
     configId: String
 ): ScreenConfigDetails = withContext(Dispatchers.IO) {
+    val base = configId.trim().trimStart('/')
+
+    val hasExt =
+        base.endsWith(".yaml", ignoreCase = true) || base.endsWith(".yml", ignoreCase = true)
+
     val candidates = buildList {
-        add(configId)
-        if (!configId.endsWith(".yaml", ignoreCase = true) && !configId.endsWith(".yml", ignoreCase = true)) {
-            add("$configId.yaml")
-            add("$configId.yml")
+        add(base)
+
+        if (!hasExt) {
+            add("$base.yaml")
+            add("$base.yml")
         }
-        add("configs/$configId")
-        add("configs/$configId.yaml")
-        add("configs/$configId.yml")
-        add("surveys/$configId")
-        add("surveys/$configId.yaml")
-        add("surveys/$configId.yml")
+
+        if (!base.startsWith("configs/")) {
+            add("configs/$base")
+            if (!hasExt) {
+                add("configs/$base.yaml")
+                add("configs/$base.yml")
+            }
+        }
+
+        if (!base.startsWith("surveys/")) {
+            add("surveys/$base")
+            if (!hasExt) {
+                add("surveys/$base.yaml")
+                add("surveys/$base.yml")
+            }
+        }
     }.distinct()
 
     val (assetName, yamlText) = readFirstAssetText(context.assets, candidates)
-
     val meta = extractSlmMeta(yamlText)
 
     val summary = buildString {
@@ -1358,10 +1300,8 @@ private fun readFirstAssetText(
     var lastErr: Throwable? = null
     for (name in candidates) {
         try {
-            assets.open(name).use { input ->
-                val br = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
-                return name to br.readText()
-            }
+            val text = assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
+            return name to text
         } catch (t: Throwable) {
             lastErr = t
         }
@@ -1372,6 +1312,13 @@ private fun readFirstAssetText(
     )
 }
 
+/**
+ * Heuristically extract key/value pairs under the "slm:" section.
+ *
+ * This is intentionally lightweight:
+ * - Not a full YAML parser.
+ * - Handles common "key: value" lines in a nested block.
+ */
 private fun extractSlmMeta(yamlText: String): Map<String, String> {
     val lines = yamlText.lines()
 
@@ -1379,14 +1326,14 @@ private fun extractSlmMeta(yamlText: String): Map<String, String> {
     var slmIndent: Int? = null
     val meta = linkedMapOf<String, String>()
 
-    fun leadingSpaces(s: String): Int =
-        s.indexOfFirst { it != ' ' }.let { if (it < 0) s.length else it }
+    fun leadingSpacesOrTabs(s: String): Int =
+        s.indexOfFirst { it != ' ' && it != '\t' }.let { if (it < 0) s.length else it }
 
     for (raw in lines) {
         val lineNoComment = raw.substringBefore("#")
         if (lineNoComment.isBlank()) continue
 
-        val indent = leadingSpaces(lineNoComment)
+        val indent = leadingSpacesOrTabs(lineNoComment)
         val trimmed = lineNoComment.trim()
 
         if (trimmed.endsWith(":") && !trimmed.contains(" ")) {
@@ -1395,7 +1342,7 @@ private fun extractSlmMeta(yamlText: String): Map<String, String> {
                 inSlm = true
                 slmIndent = indent
             } else {
-                if (inSlm && slmIndent != null && indent <= slmIndent!!) {
+                if (inSlm && slmIndent != null && indent <= slmIndent) {
                     inSlm = false
                     slmIndent = null
                 }
@@ -1404,7 +1351,7 @@ private fun extractSlmMeta(yamlText: String): Map<String, String> {
         }
 
         if (!inSlm || slmIndent == null) continue
-        if (indent <= slmIndent!!) {
+        if (indent <= slmIndent) {
             inSlm = false
             slmIndent = null
             continue
@@ -1413,7 +1360,7 @@ private fun extractSlmMeta(yamlText: String): Map<String, String> {
         val idx = trimmed.indexOf(":")
         if (idx <= 0) continue
 
-        val k = trimmed.substring(0, idx).trim()
+        val k = trimmed.take(idx).trim()
         val vRaw = trimmed.substring(idx + 1).trim()
         if (k.isBlank() || vRaw.isBlank()) continue
 
@@ -1428,234 +1375,44 @@ private fun extractSlmMeta(yamlText: String): Map<String, String> {
     return meta
 }
 
-/* ───────────────────────────── Crash Capture + Startup Upload ───────────────────────────── */
+/* ───────────────────────────── Placeholder Screen ───────────────────────────── */
 
-private object CrashCapture {
+@Composable
+private fun PlaceholderScreen(
+    title: String,
+    subtitle: String
+) {
+    val backplate = appBackplate()
 
-    private const val TAG = "CrashCapture"
-    private const val CRASH_DIR_REL = "diagnostics/crash"
-
-    private const val MAX_LOGCAT_BYTES = 850_000
-    private const val LOGCAT_MAX_MS = 700L
-
-    private const val LOGCAT_TAIL_LINES_PID = "2000"
-    private const val LOGCAT_TAIL_LINES_FALLBACK = "3000"
-
-    private const val MAX_FILES_TO_KEEP = 80
-    private const val MAX_FILES_TO_ENQUEUE = 20
-
-    private val installed = AtomicBoolean(false)
-    private val capturing = AtomicBoolean(false)
-
-    fun install(context: Context) {
-        if (!installed.compareAndSet(false, true)) return
-
-        val appContext = context.applicationContext
-        val prior = Thread.getDefaultUncaughtExceptionHandler()
-
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            if (!capturing.compareAndSet(false, true)) {
-                try {
-                    prior?.uncaughtException(thread, throwable)
-                } catch (_: Throwable) {
-                    hardKill()
-                }
-                return@setDefaultUncaughtExceptionHandler
-            }
-
-            try {
-                val file = runCatching { captureCrashToFile(appContext, thread, throwable) }
-                    .onFailure { e -> Log.e(TAG, "Crash capture failed: ${e.message}", e) }
-                    .getOrNull()
-
-                if (file != null) {
-                    Log.e(TAG, "Crash captured: ${file.absolutePath}")
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "Crash capture unexpected failure: ${t.message}", t)
-            } finally {
-                try {
-                    if (prior != null) {
-                        prior.uncaughtException(thread, throwable)
-                    } else {
-                        hardKill()
-                    }
-                } catch (_: Throwable) {
-                    hardKill()
-                }
-            }
-        }
-
-        Log.d(TAG, "Installed default uncaught exception handler.")
-    }
-
-    fun enqueuePendingCrashUploadsIfPossible(context: Context) {
-        val cfg = buildCrashGitHubConfigOrNull() ?: run {
-            Log.d(TAG, "GitHub config missing; crash uploads will remain local.")
-            return
-        }
-
-        val dir = crashDir(context).apply { mkdirs() }
-        purgeOldCrashFiles(dir)
-
-        val files = dir.listFiles { f ->
-            f.isFile && f.length() > 0L && !f.name.startsWith(".")
-        }?.toList().orEmpty()
-
-        if (files.isEmpty()) return
-
-        Log.d(TAG, "Found ${files.size} pending crash file(s). Enqueuing uploads…")
-
-        files
-            .sortedByDescending { it.lastModified() }
-            .take(MAX_FILES_TO_ENQUEUE)
-            .forEach { file ->
-                GitHubUploadWorker.enqueueExistingPayload(
-                    context = context.applicationContext,
-                    cfg = cfg,
-                    file = file
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .background(backplate)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+            modifier = Modifier
+                .wrapContentWidth()
+                .neonEdgeThin()
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(text = title, style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-    }
-
-    private fun captureCrashToFile(
-        context: Context,
-        thread: Thread,
-        throwable: Throwable
-    ): File {
-        val dir = crashDir(context).apply { mkdirs() }
-        purgeOldCrashFiles(dir)
-
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val pid = Process.myPid()
-        val name = "crash_${stamp}_pid${pid}.log.gz"
-        val outFile = File(dir, name)
-
-        FileOutputStream(outFile).use { fos ->
-            GZIPOutputStream(fos).use { gz ->
-                val header = buildString {
-                    appendLine("=== Crash Report ===")
-                    appendLine("time_local=$stamp")
-                    appendLine("pid=$pid")
-                    appendLine("thread=${thread.name}")
-                    appendLine("sdk=${Build.VERSION.SDK_INT}")
-                    appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
-                    appendLine("appId=${BuildConfig.APPLICATION_ID}")
-                    appendLine("versionName=${BuildConfig.VERSION_NAME}")
-                    appendLine("versionCode=${BuildConfig.VERSION_CODE}")
-                    appendLine()
-                    appendLine("=== Exception ===")
-                    appendLine(Log.getStackTraceString(throwable))
-                    appendLine()
-                    appendLine("=== Logcat (best-effort) ===")
-                }.toByteArray(Charsets.UTF_8)
-
-                gz.write(header)
-
-                val logBytes = collectLogcatBytes(
-                    pid = pid,
-                    maxBytes = MAX_LOGCAT_BYTES,
-                    maxMs = LOGCAT_MAX_MS
-                )
-
-                gz.write(logBytes)
-                gz.flush()
-            }
         }
-
-        return outFile
-    }
-
-    private fun crashDir(context: Context): File =
-        File(context.filesDir, CRASH_DIR_REL)
-
-    private fun purgeOldCrashFiles(dir: File) {
-        val all = dir.listFiles { f -> f.isFile && f.length() > 0L }?.toList().orEmpty()
-        if (all.size <= MAX_FILES_TO_KEEP) return
-
-        val sorted = all.sortedBy { it.lastModified() }
-        val toDelete = sorted.take(all.size - MAX_FILES_TO_KEEP)
-        toDelete.forEach { f -> runCatching { f.delete() } }
-    }
-
-    private fun collectLogcatBytes(pid: Int, maxBytes: Int, maxMs: Long): ByteArray {
-        val primary = listOf(
-            "logcat",
-            "-d",
-            "-v", "threadtime",
-            "-b", "main",
-            "-b", "system",
-            "-b", "crash",
-            "--pid=$pid",
-            "-t", LOGCAT_TAIL_LINES_PID
-        )
-
-        val fallback = listOf(
-            "logcat",
-            "-d",
-            "-v", "threadtime",
-            "-b", "main",
-            "-b", "system",
-            "-b", "crash",
-            "-t", LOGCAT_TAIL_LINES_FALLBACK
-        )
-
-        return runCatching { execAndReadCapped(primary, maxBytes, maxMs) }
-            .recoverCatching { execAndReadCapped(fallback, maxBytes, maxMs) }
-            .getOrElse { e ->
-                ("(logcat capture failed: ${e.message})\n").toByteArray(Charsets.UTF_8)
-            }
-    }
-
-    private fun execAndReadCapped(cmd: List<String>, maxBytes: Int, maxMs: Long): ByteArray {
-        val start = SystemClock.elapsedRealtime()
-
-        val pb = ProcessBuilder(cmd)
-            .redirectErrorStream(true)
-
-        val proc = pb.start()
-
-        return try {
-            proc.inputStream.use { input ->
-                val out = ByteArrayOutputStream(minOf(maxBytes, 128 * 1024))
-                val buf = ByteArray(16 * 1024)
-
-                while (out.size() < maxBytes) {
-                    if (SystemClock.elapsedRealtime() - start > maxMs) break
-
-                    val remaining = maxBytes - out.size()
-                    val n = input.read(buf, 0, minOf(buf.size, remaining))
-                    if (n <= 0) break
-                    out.write(buf, 0, n)
-                }
-
-                out.toByteArray()
-            }
-        } finally {
-            runCatching { proc.destroy() }
-        }
-    }
-
-    private fun buildCrashGitHubConfigOrNull(): GitHubUploader.GitHubConfig? {
-        if (BuildConfig.GH_TOKEN.isBlank()) return null
-        if (BuildConfig.GH_OWNER.isBlank() || BuildConfig.GH_REPO.isBlank()) return null
-
-        val basePrefix = BuildConfig.GH_PATH_PREFIX.trim('/')
-        val crashPrefix = listOf(basePrefix, "diagnostics/crash")
-            .filter { it.isNotBlank() }
-            .joinToString("/")
-
-        return GitHubUploader.GitHubConfig(
-            owner = BuildConfig.GH_OWNER,
-            repo = BuildConfig.GH_REPO,
-            branch = BuildConfig.GH_BRANCH.ifBlank { "main" },
-            pathPrefix = crashPrefix,
-            token = BuildConfig.GH_TOKEN
-        )
-    }
-
-    private fun hardKill() {
-        Process.killProcess(Process.myPid())
-        exitProcess(10)
     }
 }
