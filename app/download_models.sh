@@ -25,8 +25,8 @@ MODEL_URL="${MODEL_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/mai
 MODEL_NAMES="${MODEL_NAMES:-ggml-tiny-q5_1.bin ggml-base-q5_1.bin ggml-small-q5_1.bin ggml-model-q4_0.bin ggml-model-q5_0.bin}"
 
 # model-specific URL overrides
-NDIZI_GGML_Q4_URL="${NDIZI_GGML_Q4_URL:-https://huggingface.co/smutuvi/ndizi-whisper-small-GGUF/resolve/main/ggml-model-q4_0.bin}"
-NDIZI_GGML_Q5_URL="${NDIZI_GGML_Q5_URL:-https://huggingface.co/smutuvi/ndizi-whisper-small-GGUF/resolve/main/ggml-model-q5_0.bin}"
+NDIZI_GGML_Q4_URL="${NDIZI_GGML_Q4_URL:-https://huggingface.co/smutuvi/ndizi-whisper-large-turbo-v3-GGUF/resolve/main/ggml-model-q4_0.bin}"
+NDIZI_GGML_Q5_URL="${NDIZI_GGML_Q5_URL:-https://huggingface.co/smutuvi/ndizi-whisper-large-turbo-v3-GGUF/resolve/main/ggml-model-q5_0.bin}"
 
 DEBUG="${DEBUG:-0}"
 
