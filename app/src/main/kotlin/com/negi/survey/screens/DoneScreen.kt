@@ -10,20 +10,19 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  Crash-resistant final screen:
- *    - Builds a stable JSON export from ViewModel audio manifest.
- *    - Shows summary of answers + follow-ups + audio refs.
- *    - Supports:
- *        • Auto-save JSON to device storage (optional)
- *        • Upload now (best-effort, partial success allowed)
- *        • Upload later (WorkManager, per-file upload jobs)
- *        • Log-only upload now / later
+ *  Final survey screen that summarizes answers and follow-up questions,
+ *  renders them in a simple vertical layout, and exposes export actions:
  *
- *  Hardening goals:
- *    - Never OOM on large WAV files (no naive readBytes()).
- *    - Never hang on logcat collection (best-effort, capped).
- *    - Never fail the whole action because one file failed.
- *    - UI remains responsive; errors are surfaced via snackbar.
+ *   • Local JSON export (auto-save to device storage).
+ *   • Immediate GitHub upload (online now, JSON + voice WAV + logcat snapshot).
+ *   • Deferred GitHub upload via WorkManager (runs when online).
+ *   • Deferred upload of recorded voice WAV files via WorkManager.
+ *   • Optional log-only upload now / later for offline-friendly diagnostics.
+ *
+ *  Key design rule:
+ *   • JSON must be built from SurveyViewModel.recordedAudioRefs (logical manifest),
+ *     not from file system scans, so repeated JSON exports remain stable even if
+ *     WAV files were already uploaded and deleted.
  * =====================================================================
  */
 
@@ -88,42 +87,31 @@ import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.Node
 import com.negi.survey.vm.SurveyViewModel
 import java.io.BufferedInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+
+private const val REMOTE_VOICE_DIR = "voice"
+
+/** Remote directory for session log snapshots (gzip). */
+private const val REMOTE_LOG_DIR = "diagnostics/logcat"
+
+/** Cap logcat bytes to keep GitHub contents uploads safe-ish. */
+private const val MAX_LOGCAT_BYTES = 850_000
 
 private const val LOG_TAG = "DoneScreen"
 
-private const val REMOTE_VOICE_DIR = "voice"
-private const val REMOTE_LOG_DIR = "diagnostics/logcat"
-
-/** Cap logcat bytes to keep contents uploads stable. */
-private const val MAX_LOGCAT_BYTES = 850_000
-
 /**
- * Hard cap for in-memory file reads to avoid OOM.
- * If a file exceeds this, we refuse to read it and continue safely.
+ * Limit logcat to a small set of app tags to reduce noise.
+ * Note: This is best-effort; fallbacks may capture broader output depending on device support.
  */
-private const val MAX_IN_MEMORY_READ_BYTES = 24 * 1024 * 1024 // 24MB
-
-/**
- * Conservative “safe” payload size for APIs that behave best under ~1MB.
- * If your GitHubUploader uses the Contents API, keep small files here to reduce failures.
- * (We do not crash if exceeded; we just skip + notify.)
- */
-private const val MAX_GITHUB_SAFE_BYTES = 950_000 // ~0.95MB
-
 private val LOGCAT_TAG_FILTERS = arrayOf(
     "WhisperEngine",
     "MainActivity",
@@ -134,6 +122,22 @@ private val LOGCAT_TAG_FILTERS = arrayOf(
     "LiteRtRepository"
 )
 
+/**
+ * Final survey screen that summarizes all collected answers and follow-ups.
+ *
+ * Responsibilities:
+ * - Read the current questions, answers, follow-ups, and audio refs from [SurveyViewModel].
+ * - Render a human-readable summary of the interview session.
+ * - Build a JSON export payload covering answers + follow-ups + audio references.
+ * - Provide optional GitHub upload and deferred upload via WorkManager.
+ * - Optionally auto-save the JSON to device storage on first composition.
+ * - Upload WAV files that physically exist under exports/voice for this run.
+ * - Capture and upload a logcat snapshot (gzip) for diagnostics (now / later).
+ *
+ * The key design rule:
+ * - JSON must be built from the logical audio manifest in the ViewModel,
+ *   not from file system scans.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DoneScreen(
@@ -142,70 +146,113 @@ fun DoneScreen(
     gitHubConfig: GitHubUploader.GitHubConfig? = null,
     autoSaveToDevice: Boolean = false
 ) {
-    val questions by vm.questions.collectAsState()
-    val answers by vm.answers.collectAsState()
-    val followups by vm.followups.collectAsState()
-    val recordedAudioRefs by vm.recordedAudioRefs.collectAsState()
+    val questions by vm.questions.collectAsState(initial = emptyMap())
+    val answers by vm.answers.collectAsState(initial = emptyMap())
+    val followups by vm.followups.collectAsState(initial = emptyMap())
+
+    /**
+     * Keep collecting this StateFlow so recomposition is triggered when
+     * logical audio refs change.
+     */
+    val recordedAudioRefs by vm.recordedAudioRefs.collectAsState(initial = emptyMap())
+
+    /** Stable UUID for the active survey run (single source of truth). */
     val surveyUuid by vm.surveyUuid.collectAsState()
 
-    val context = LocalContext.current
-    val snackbar = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
-    val workManager = remember(context) { WorkManager.getInstance(context) }
-
-    /** Prevent multi-click re-entrancy even under recomposition races. */
-    val actionGate = remember { AtomicBoolean(false) }
-    var busy by remember { mutableStateOf(false) }
-
+    /**
+     * Stable export timestamp for this DoneScreen session.
+     *
+     * This prevents accidental "new file name per click" within the same
+     * completion screen.
+     */
     val exportedAtStamp = remember(surveyUuid) {
-        SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+        val fmt = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
+        fmt.format(Date())
     }
 
-    /** Logical audio refs for this run (source of truth). */
-    val audioRefsForRun: Map<String, List<SurveyViewModel.AudioRef>> =
-        remember(recordedAudioRefs, surveyUuid) {
-            vm.getAudioRefsForRun(surveyUuid)
-        }
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    var uploading by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
-    val flatAudioRefsForRun: List<SurveyViewModel.AudioRef> =
-        remember(recordedAudioRefs, surveyUuid) {
-            vm.getAudioRefsForRunFlat(surveyUuid)
-        }
+    /**
+     * Audio refs that belong to the active survey run.
+     *
+     * The ViewModel is the logical source of truth for audio references.
+     */
+    val audioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
+        vm.getAudioRefsForRun(surveyUuid)
+    }
 
-    val expectedVoiceFileNames: Set<String> =
-        remember(flatAudioRefsForRun) {
-            flatAudioRefsForRun
-                .asSequence()
-                .map { it.fileName.trim() }
-                .filter { it.isNotBlank() }
-                .toSet()
-        }
+    /**
+     * Flattened audio refs for the active run.
+     *
+     * Keep the ordering stable and semantically meaningful.
+     * The ViewModel already sorts by createdAt; we preserve that ordering.
+     */
+    val flatAudioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
+        vm.getAudioRefsForRunFlat(surveyUuid)
+    }
 
-    /** Physical WAV files currently present for this run (best-effort). */
-    val voiceFilesState = remember(surveyUuid) { mutableStateOf<List<File>>(emptyList()) }
+    /**
+     * File name set that should be present for this run.
+     *
+     * This is used to select physical WAV files for upload.
+     */
+    val expectedVoiceFileNames = remember(flatAudioRefsForRun) {
+        flatAudioRefsForRun.map { it.fileName }.toSet()
+    }
+
+    /**
+     * Physical WAV files currently present on the device for this run.
+     *
+     * We only include files that are referenced by the ViewModel manifest.
+     */
+    val voiceFilesState = remember(surveyUuid) {
+        mutableStateOf<List<File>>(emptyList())
+    }
+
     LaunchedEffect(expectedVoiceFileNames, surveyUuid) {
         val files = withContext(Dispatchers.IO) {
-            runCatching { scanVoiceFilesByNames(context, expectedVoiceFileNames) }.getOrElse { emptyList() }
+            scanVoiceFilesByNames(context, expectedVoiceFileNames)
         }
         voiceFilesState.value = files
     }
+
     val voiceFilesForRun = voiceFilesState.value
 
-    /** Snapshot nodes for question fallback. */
+    /**
+     * A lightweight snapshot of the runtime node map.
+     *
+     * This allows us to fall back to config-defined question texts
+     * when the questions StateFlow hasn't stored them.
+     */
     val nodesSnapshot: Map<String, Node> = remember(vm) { vm.nodes }
 
-    /** Union keys to avoid dropping audio-only nodes. */
-    val answerOwnerIds: List<String> = remember(questions, answers, audioRefsForRun, followups) {
+    /**
+     * Build the union of keys to avoid dropping answers/audio-only nodes.
+     */
+    val answerOwnerIds = remember(questions, answers, audioRefsForRun) {
         val ids = linkedSetOf<String>()
         ids.addAll(questions.keys)
         ids.addAll(answers.keys)
         ids.addAll(audioRefsForRun.keys)
-        ids.addAll(followups.keys)
         ids.toList().sorted()
     }
 
-    /** Build JSON (manual, stable ordering). */
-    val jsonText: String = remember(
+    /**
+     * Build a compact JSON export representing:
+     *  - "survey_id": UUID for the current run.
+     *  - "exported_at": timestamp for this export.
+     *  - "answers": per-node question/answer pairs (+ optional "audio" array).
+     *  - "followups": per-node arrays of follow-up question/answer pairs.
+     *  - "voice_files": a flat array for ingestion pipelines.
+     *
+     * IMPORTANT:
+     *  - The audio lists are derived from ViewModel audio refs,
+     *    NOT from the file system.
+     */
+    val jsonText = remember(
         questions,
         answers,
         followups,
@@ -215,28 +262,50 @@ fun DoneScreen(
         exportedAtStamp,
         answerOwnerIds
     ) {
-        val sortedFollowups: Map<String, List<SurveyViewModel.FollowupEntry>> = followups.toSortedMap()
+        val sortedFollowups = followups.toSortedMap()
 
         buildString {
             append("{\n")
-            append("  \"survey_id\": \"").append(escapeJson(surveyUuid)).append("\",\n")
-            append("  \"exported_at\": \"").append(escapeJson(exportedAtStamp)).append("\",\n")
 
+            // survey_id + exported_at
+            append("  \"survey_id\": \"")
+                .append(escapeJson(surveyUuid))
+                .append("\",\n")
+            append("  \"exported_at\": \"")
+                .append(escapeJson(exportedAtStamp))
+                .append("\",\n")
+
+            // answers with optional audio array
             append("  \"answers\": {\n")
-            answerOwnerIds.forEachIndexed { idx: Int, id: String ->
-                val q = questions[id] ?: nodesSnapshot[id]?.question ?: ""
+            answerOwnerIds.forEachIndexed { idx, id ->
+                val q = questions[id]
+                    ?: nodesSnapshot[id]?.question
+                    ?: ""
                 val a = answers[id].orEmpty()
-                val audioList: List<SurveyViewModel.AudioRef> = audioRefsForRun[id].orEmpty()
 
-                append("    \"").append(escapeJson(id)).append("\": {\n")
-                append("      \"question\": \"").append(escapeJson(q)).append("\",\n")
-                append("      \"answer\": \"").append(escapeJson(a)).append("\"")
+                /**
+                 * Preserve ViewModel-provided ordering.
+                 * Do not re-sort locally to avoid contradicting VM intent.
+                 */
+                val audioList = audioRefsForRun[id].orEmpty()
+
+                append("    \"")
+                    .append(escapeJson(id))
+                    .append("\": {\n")
+                append("      \"question\": \"")
+                    .append(escapeJson(q))
+                    .append("\",\n")
+                append("      \"answer\": \"")
+                    .append(escapeJson(a))
+                    .append("\"")
 
                 if (audioList.isNotEmpty()) {
                     append(",\n")
                     append("      \"audio\": [\n")
-                    audioList.forEachIndexed { j: Int, ref: SurveyViewModel.AudioRef ->
-                        append("        { \"file\": \"").append(escapeJson(ref.fileName)).append("\" }")
+                    audioList.forEachIndexed { j, ref ->
+                        append("        { \"file\": \"")
+                            .append(escapeJson(ref.fileName))
+                            .append("\" }")
                         if (j != audioList.lastIndex) append(",")
                         append("\n")
                     }
@@ -251,13 +320,12 @@ fun DoneScreen(
             }
             append("  },\n")
 
+            // followups
             append("  \"followups\": {\n")
             val fEntries = sortedFollowups.entries.toList()
-            fEntries.forEachIndexed { i: Int, e: Map.Entry<String, List<SurveyViewModel.FollowupEntry>> ->
-                val ownerId = e.key
-                val list = e.value
+            fEntries.forEachIndexed { i, (ownerId, list) ->
                 append("    \"").append(escapeJson(ownerId)).append("\": [\n")
-                list.forEachIndexed { j: Int, fu: SurveyViewModel.FollowupEntry ->
+                list.forEachIndexed { j, fu ->
                     val fq = fu.question
                     val fa = fu.answer.orEmpty()
                     append("      { ")
@@ -273,39 +341,60 @@ fun DoneScreen(
             }
             append("  },\n")
 
+            // voice_files flat list view for ingestion pipelines
             append("  \"voice_files\": [\n")
-            flatAudioRefsForRun.forEachIndexed { idx: Int, ref: SurveyViewModel.AudioRef ->
+            flatAudioRefsForRun.forEachIndexed { idx, ref ->
                 val qId = ref.questionId
-                val questionText = questions[qId] ?: nodesSnapshot[qId]?.question ?: ""
+                val questionText = questions[qId]
+                    ?: nodesSnapshot[qId]?.question
+                    ?: ""
                 val answerText = answers[qId].orEmpty()
 
                 append("    {\n")
-                append("      \"file\": \"").append(escapeJson(ref.fileName)).append("\",\n")
-                append("      \"survey_id\": \"").append(escapeJson(surveyUuid)).append("\",\n")
-                append("      \"question_id\": \"").append(escapeJson(qId)).append("\",\n")
-                append("      \"question\": \"").append(escapeJson(questionText)).append("\",\n")
-                append("      \"answer\": \"").append(escapeJson(answerText)).append("\"\n")
+                append("      \"file\": \"")
+                    .append(escapeJson(ref.fileName))
+                    .append("\",\n")
+                append("      \"survey_id\": \"")
+                    .append(escapeJson(surveyUuid))
+                    .append("\",\n")
+                append("      \"question_id\": \"")
+                    .append(escapeJson(qId))
+                    .append("\",\n")
+                append("      \"question\": \"")
+                    .append(escapeJson(questionText))
+                    .append("\",\n")
+                append("      \"answer\": \"")
+                    .append(escapeJson(answerText))
+                    .append("\"\n")
                 append("    }")
                 if (idx != flatAudioRefsForRun.lastIndex) append(",")
                 append("\n")
             }
             append("  ]\n")
+
             append("}\n")
         }
     }
 
-    /** Auto-save once per survey UUID. */
+    /**
+     * Auto-save JSON once per survey UUID if requested.
+     */
     val autoSavedOnce = remember(surveyUuid) { mutableStateOf(false) }
+
     LaunchedEffect(autoSaveToDevice, jsonText, surveyUuid) {
         if (autoSaveToDevice && !autoSavedOnce.value) {
+            val fileName = buildSurveyFileName(
+                surveyId = surveyUuid,
+                prefix = "survey",
+                stamp = exportedAtStamp
+            )
             runCatching {
-                val fileName = buildSurveyFileName(
-                    surveyId = surveyUuid,
-                    prefix = "survey",
-                    stamp = exportedAtStamp
-                )
                 val result = withContext(Dispatchers.IO) {
-                    saveJsonAutomatically(context, fileName, jsonText)
+                    saveJsonAutomatically(
+                        context = context,
+                        fileName = fileName,
+                        content = jsonText
+                    )
                 }
                 autoSavedOnce.value = true
                 snackbar.showOnce("Saved to device: ${result.location}")
@@ -327,20 +416,29 @@ fun DoneScreen(
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
         ) {
-            Text("Thanks! Here is your response summary.", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = "Thanks! Here is your response summary.",
+                style = MaterialTheme.typography.bodyLarge
+            )
             Spacer(Modifier.height(8.dp))
-            Text("Survey ID: $surveyUuid", style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = "Survey ID: $surveyUuid",
+                style = MaterialTheme.typography.labelLarge
+            )
 
             Spacer(Modifier.height(16.dp))
 
+            // Answers section.
             Text("■ Answers", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
 
             if (answerOwnerIds.isEmpty()) {
                 Text("No answers yet.", style = MaterialTheme.typography.bodyMedium)
             } else {
-                answerOwnerIds.forEach { id: String ->
-                    val q = questions[id] ?: nodesSnapshot[id]?.question ?: "(unknown question)"
+                answerOwnerIds.forEach { id ->
+                    val q = questions[id]
+                        ?: nodesSnapshot[id]?.question
+                        ?: "(unknown question)"
                     val a = answers[id].orEmpty()
                     val audioCount = audioRefsForRun[id].orEmpty().size
 
@@ -357,7 +455,10 @@ fun DoneScreen(
                         )
                         if (audioCount > 0) {
                             Spacer(Modifier.height(2.dp))
-                            Text("Audio: $audioCount file(s)", style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                text = "Audio: $audioCount file(s)",
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         }
                     }
                     HorizontalDivider()
@@ -366,26 +467,36 @@ fun DoneScreen(
 
             Spacer(Modifier.height(20.dp))
 
+            // Follow-ups section.
             Text("■ Follow-ups", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
 
             if (followups.isEmpty()) {
                 Text("No follow-ups.", style = MaterialTheme.typography.bodyMedium)
             } else {
-                followups.toSortedMap().forEach { (ownerId: String, list: List<SurveyViewModel.FollowupEntry>) ->
+                followups.toSortedMap().forEach { (ownerId, list) ->
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 8.dp)
                     ) {
-                        Text("Owner node: $ownerId", style = MaterialTheme.typography.labelLarge)
+                        Text(
+                            text = "Owner node: $ownerId",
+                            style = MaterialTheme.typography.labelLarge
+                        )
                         Spacer(Modifier.height(6.dp))
-                        list.forEachIndexed { idx: Int, fu: SurveyViewModel.FollowupEntry ->
-                            Text("${idx + 1}. ${fu.question}", style = MaterialTheme.typography.bodyMedium)
+                        list.forEachIndexed { idx, fu ->
+                            Text(
+                                text = "${idx + 1}. ${fu.question}",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
                             val ans = fu.answer
                             if (!ans.isNullOrBlank()) {
                                 Spacer(Modifier.height(2.dp))
-                                Text("   ↳ $ans", style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    text = "   ↳ $ans",
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
                             }
                             Spacer(Modifier.height(6.dp))
                         }
@@ -396,22 +507,32 @@ fun DoneScreen(
 
             Spacer(Modifier.height(20.dp))
 
+            // Recorded voice section (logical + physical).
             Text("■ Recorded voice files", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
 
             if (flatAudioRefsForRun.isEmpty()) {
                 Text(
-                    "No voice recordings registered for this survey run.",
+                    text = "No voice recordings registered for this survey run.",
                     style = MaterialTheme.typography.bodyMedium
                 )
             } else {
-                Text("Manifest: ${flatAudioRefsForRun.size} reference(s).", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    text = "Manifest: ${flatAudioRefsForRun.size} reference(s).",
+                    style = MaterialTheme.typography.bodyMedium
+                )
                 Spacer(Modifier.height(2.dp))
-                Text("On device now: ${voiceFilesForRun.size} file(s).", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    text = "On device now: ${voiceFilesForRun.size} file(s).",
+                    style = MaterialTheme.typography.bodySmall
+                )
 
                 Spacer(Modifier.height(6.dp))
-                flatAudioRefsForRun.take(8).forEach { ref: SurveyViewModel.AudioRef ->
-                    Text("• ${ref.fileName}  (q=${ref.questionId})", style = MaterialTheme.typography.bodySmall)
+                flatAudioRefsForRun.take(8).forEach { ref ->
+                    Text(
+                        text = "• ${ref.fileName}  (q=${ref.questionId})",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                 }
                 if (flatAudioRefsForRun.size > 8) {
                     Spacer(Modifier.height(2.dp))
@@ -421,146 +542,195 @@ fun DoneScreen(
 
             Spacer(Modifier.height(24.dp))
 
+            // Export / upload actions (JSON + voice + logs).
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                // Immediate GitHub upload (JSON + voice WAV + logcat snapshot).
                 if (gitHubConfig != null) {
                     Button(
-                        enabled = !busy,
                         onClick = {
-                            if (!actionGate.compareAndSet(false, true)) return@Button
+                            if (uploading) return@Button
                             scope.launch {
-                                busy = true
+                                uploading = true
                                 try {
-                                    prunePendingUploadsDirBestEffort(context)
                                     val cfg = gitHubConfig
+                                    val resultLabel: String
+                                    val voiceCount: Int
+                                    val logUploaded: Boolean
 
-                                    val jsonRemoteName = buildSurveyFileName(
+                                    val fileName = buildSurveyFileName(
                                         surveyId = surveyUuid,
                                         prefix = "survey",
                                         stamp = exportedAtStamp
                                     )
 
-                                    // Stage JSON + logs to pending dir for consistent behavior.
-                                    val stagedJson = withContext(Dispatchers.IO) {
-                                        writePendingTextFile(context, jsonRemoteName, jsonText)
-                                    }
-                                    val stagedLog = withContext(Dispatchers.IO) {
-                                        captureSessionLogcatToPendingFile(
-                                            context = context,
-                                            surveyUuid = surveyUuid,
-                                            exportedAtStamp = exportedAtStamp,
-                                            maxBytes = MAX_LOGCAT_BYTES
-                                        )
-                                    }
+                                    val (jsonRes, voicesUploaded, didUploadLog) =
+                                        withContext(Dispatchers.IO) {
+                                            // 1) Upload JSON summary.
+                                            val jsonResult = GitHubUploader.uploadJson(
+                                                cfg = cfg,
+                                                relativePath = fileName,
+                                                content = jsonText,
+                                                message = "Upload $fileName"
+                                            )
 
-                                    // Refresh voice list right before upload (best-effort).
-                                    val currentVoiceFiles = withContext(Dispatchers.IO) {
-                                        runCatching { scanVoiceFilesByNames(context, expectedVoiceFileNames) }
-                                            .getOrElse { emptyList() }
-                                    }
+                                            // 2) Upload WAV files referenced by manifest AND present on device.
+                                            val currentVoiceFiles =
+                                                scanVoiceFilesByNames(context, expectedVoiceFileNames)
 
-                                    val result = withContext(Dispatchers.IO) {
-                                        uploadNowBestEffort(
-                                            cfg = cfg,
-                                            jsonFile = stagedJson,
-                                            jsonRemotePath = jsonRemoteName,
-                                            voiceFiles = currentVoiceFiles,
-                                            logFile = stagedLog,
-                                            logRemotePath = "$REMOTE_LOG_DIR/${stagedLog.name}"
-                                        )
-                                    }
+                                            var uploadedVoices = 0
+                                            currentVoiceFiles.forEach { file ->
+                                                val bytes = file.readBytes()
+                                                GitHubUploader.uploadFile(
+                                                    cfg = cfg,
+                                                    relativePath = "$REMOTE_VOICE_DIR/${file.name}",
+                                                    bytes = bytes,
+                                                    message = "Upload ${file.name}"
+                                                )
+                                                runCatching { deleteVoiceSidecars(file) }
+                                                runCatching { file.delete() }
+                                                uploadedVoices++
+                                            }
 
-                                    snackbar.showOnce(result.userMessage)
+                                            // 3) Upload session log snapshot (gzip).
+                                            val logFile = captureSessionLogcatToPendingFile(
+                                                context = context,
+                                                surveyUuid = surveyUuid,
+                                                exportedAtStamp = exportedAtStamp,
+                                                maxBytes = MAX_LOGCAT_BYTES
+                                            )
+
+                                            val didUpload = runCatching {
+                                                GitHubUploader.uploadFile(
+                                                    cfg = cfg,
+                                                    relativePath = "$REMOTE_LOG_DIR/${logFile.name}",
+                                                    bytes = logFile.readBytes(),
+                                                    message = "Upload ${logFile.name}"
+                                                )
+                                            }.isSuccess
+
+                                            if (didUpload) {
+                                                runCatching { logFile.delete() }
+                                            }
+
+                                            Triple(jsonResult, uploadedVoices, didUpload)
+                                        }
+
+                                    resultLabel = jsonRes.fileUrl ?: jsonRes.commitSha ?: "(no URL)"
+                                    voiceCount = voicesUploaded
+                                    logUploaded = didUploadLog
+
+                                    val logMsg = if (logUploaded) " + logs" else ""
+                                    if (voiceCount > 0) {
+                                        snackbar.showOnce("Uploaded JSON + $voiceCount voice file(s)$logMsg: $resultLabel")
+                                    } else {
+                                        snackbar.showOnce("Uploaded JSON$logMsg: $resultLabel")
+                                    }
 
                                     // Refresh physical list after deletion.
                                     val remaining = withContext(Dispatchers.IO) {
-                                        runCatching { scanVoiceFilesByNames(context, expectedVoiceFileNames) }
-                                            .getOrElse { emptyList() }
+                                        scanVoiceFilesByNames(context, expectedVoiceFileNames)
                                     }
                                     voiceFilesState.value = remaining
-                                } catch (t: Throwable) {
-                                    snackbar.showOnce("Upload failed: ${t.message}")
+                                } catch (e: Exception) {
+                                    snackbar.showOnce("Upload failed: ${e.message}")
                                 } finally {
-                                    busy = false
-                                    actionGate.set(false)
+                                    uploading = false
                                 }
                             }
-                        }
+                        },
+                        enabled = !uploading
                     ) {
-                        Text(if (busy) "Uploading..." else "Upload now")
+                        Text(if (uploading) "Uploading..." else "Upload now")
                     }
+                }
 
+                // Deferred GitHub upload for JSON + voice + logs via WorkManager.
+                if (gitHubConfig != null) {
                     Button(
-                        enabled = !busy,
                         onClick = {
-                            if (!actionGate.compareAndSet(false, true)) return@Button
-                            scope.launch {
-                                busy = true
-                                try {
-                                    prunePendingUploadsDirBestEffort(context)
-                                    val cfg = gitHubConfig
+                            val cfg = gitHubConfig
 
-                                    val jsonRemoteName = buildSurveyFileName(
-                                        surveyId = surveyUuid,
-                                        prefix = "survey",
-                                        stamp = exportedAtStamp
-                                    )
+                            // 1) Schedule JSON by writing a pending file.
+                            val jsonRemoteName = buildSurveyFileName(
+                                surveyId = surveyUuid,
+                                prefix = "survey",
+                                stamp = exportedAtStamp
+                            )
 
-                                    // 1) Stage JSON and schedule.
-                                    val pendingJson = withContext(Dispatchers.IO) {
-                                        writePendingTextFile(context, jsonRemoteName, jsonText)
-                                    }
-                                    enqueueWorkerFileUpload(
-                                        workManager = workManager,
-                                        context = context,
-                                        cfg = cfg,
-                                        localFile = pendingJson,
-                                        remoteRelativePath = jsonRemoteName
-                                    )
+                            runCatching {
+                                val pendingJson = writePendingTextFile(
+                                    context = context,
+                                    fileName = jsonRemoteName,
+                                    content = jsonText
+                                )
+                                enqueueWorkerFileUpload(
+                                    context = context,
+                                    cfg = cfg,
+                                    localFile = pendingJson,
+                                    remoteRelativePath = jsonRemoteName
+                                )
+                                scope.launch {
+                                    snackbar.showOnce("Upload scheduled (JSON, will run when online).")
+                                }
+                            }.onFailure { e ->
+                                scope.launch {
+                                    snackbar.showOnce("Failed to schedule JSON upload: ${e.message}")
+                                }
+                            }
 
-                                    // 2) Schedule WAV uploads that physically exist and are referenced by manifest.
-                                    val wavsToSchedule: List<File> = voiceFilesForRun
-                                    wavsToSchedule.forEach { file: File ->
-                                        val remote = "$REMOTE_VOICE_DIR/${file.name}"
+                            // 2) Schedule WAV uploads that physically exist and are referenced by manifest.
+                            val wavsToSchedule = voiceFilesForRun
+                            if (wavsToSchedule.isEmpty()) {
+                                scope.launch {
+                                    snackbar.showOnce("No voice recordings on device to upload.")
+                                }
+                            } else {
+                                wavsToSchedule.forEach { file ->
+                                    val remote = "$REMOTE_VOICE_DIR/${file.name}"
+                                    runCatching {
                                         enqueueWorkerFileUpload(
-                                            workManager = workManager,
                                             context = context,
                                             cfg = cfg,
                                             localFile = file,
                                             remoteRelativePath = remote
                                         )
                                     }
-
-                                    // 3) Stage logcat snapshot and schedule.
-                                    val pendingLog = withContext(Dispatchers.IO) {
-                                        captureSessionLogcatToPendingFile(
-                                            context = context,
-                                            surveyUuid = surveyUuid,
-                                            exportedAtStamp = exportedAtStamp,
-                                            maxBytes = MAX_LOGCAT_BYTES
-                                        )
-                                    }
-                                    enqueueWorkerFileUpload(
-                                        workManager = workManager,
-                                        context = context,
-                                        cfg = cfg,
-                                        localFile = pendingLog,
-                                        remoteRelativePath = "$REMOTE_LOG_DIR/${pendingLog.name}"
-                                    )
-
-                                    val voiceMsg = if (wavsToSchedule.isEmpty()) "" else " + ${wavsToSchedule.size} voice file(s)"
-                                    snackbar.showOnce("Upload scheduled (JSON$voiceMsg + logs).")
-                                } catch (t: Throwable) {
-                                    snackbar.showOnce("Upload scheduling failed: ${t.message}")
-                                } finally {
-                                    busy = false
-                                    actionGate.set(false)
+                                }
+                                scope.launch {
+                                    snackbar.showOnce("Upload scheduled (${wavsToSchedule.size} voice file(s)).")
                                 }
                             }
-                        }
-                    ) { Text("Upload later") }
+
+                            // 3) Schedule logcat snapshot upload (gzip).
+                            runCatching {
+                                val pendingLog = captureSessionLogcatToPendingFile(
+                                    context = context,
+                                    surveyUuid = surveyUuid,
+                                    exportedAtStamp = exportedAtStamp,
+                                    maxBytes = MAX_LOGCAT_BYTES
+                                )
+                                enqueueWorkerFileUpload(
+                                    context = context,
+                                    cfg = cfg,
+                                    localFile = pendingLog,
+                                    remoteRelativePath = "$REMOTE_LOG_DIR/${pendingLog.name}"
+                                )
+                                scope.launch {
+                                    snackbar.showOnce("Upload scheduled (logs, will run when online).")
+                                }
+                            }.onFailure { e ->
+                                scope.launch {
+                                    snackbar.showOnce("Failed to schedule logs: ${e.message}")
+                                }
+                            }
+                        },
+                        enabled = !uploading
+                    ) {
+                        Text("Upload later")
+                    }
                 }
 
                 Spacer(Modifier.weight(1f))
@@ -568,88 +738,79 @@ fun DoneScreen(
 
             Spacer(Modifier.height(12.dp))
 
+            // Optional: log-only actions.
             if (gitHubConfig != null) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Button(
-                        enabled = !busy,
                         onClick = {
-                            if (!actionGate.compareAndSet(false, true)) return@Button
+                            if (uploading) return@Button
                             scope.launch {
-                                busy = true
+                                uploading = true
                                 try {
-                                    prunePendingUploadsDirBestEffort(context)
                                     val cfg = gitHubConfig
-
-                                    val stagedLog = withContext(Dispatchers.IO) {
-                                        captureSessionLogcatToPendingFile(
+                                    val ok = withContext(Dispatchers.IO) {
+                                        val logFile = captureSessionLogcatToPendingFile(
                                             context = context,
                                             surveyUuid = surveyUuid,
                                             exportedAtStamp = exportedAtStamp,
                                             maxBytes = MAX_LOGCAT_BYTES
                                         )
+                                        val didUpload = runCatching {
+                                            GitHubUploader.uploadFile(
+                                                cfg = cfg,
+                                                relativePath = "$REMOTE_LOG_DIR/${logFile.name}",
+                                                bytes = logFile.readBytes(),
+                                                message = "Upload ${logFile.name}"
+                                            )
+                                        }.isSuccess
+                                        if (didUpload) runCatching { logFile.delete() }
+                                        didUpload
                                     }
-
-                                    val ok = withContext(Dispatchers.IO) {
-                                        uploadSingleFileBestEffort(
-                                            cfg = cfg,
-                                            localFile = stagedLog,
-                                            remotePath = "$REMOTE_LOG_DIR/${stagedLog.name}",
-                                            allowOver1Mb = true,
-                                            deleteOnSuccess = true
-                                        )
-                                    }
-
-                                    snackbar.showOnce(if (ok) "Uploaded logs." else "Log upload failed (but app is OK).")
-                                } catch (t: Throwable) {
-                                    snackbar.showOnce("Log upload failed: ${t.message}")
+                                    snackbar.showOnce(if (ok) "Uploaded logs." else "Log upload failed.")
+                                } catch (e: Exception) {
+                                    snackbar.showOnce("Log upload failed: ${e.message}")
                                 } finally {
-                                    busy = false
-                                    actionGate.set(false)
+                                    uploading = false
                                 }
                             }
-                        }
-                    ) { Text(if (busy) "Working..." else "Upload logs") }
+                        },
+                        enabled = !uploading
+                    ) {
+                        Text("Upload logs")
+                    }
 
                     Button(
-                        enabled = !busy,
                         onClick = {
-                            if (!actionGate.compareAndSet(false, true)) return@Button
-                            scope.launch {
-                                busy = true
-                                try {
-                                    prunePendingUploadsDirBestEffort(context)
-                                    val cfg = gitHubConfig
-
-                                    val pendingLog = withContext(Dispatchers.IO) {
-                                        captureSessionLogcatToPendingFile(
-                                            context = context,
-                                            surveyUuid = surveyUuid,
-                                            exportedAtStamp = exportedAtStamp,
-                                            maxBytes = MAX_LOGCAT_BYTES
-                                        )
-                                    }
-
-                                    enqueueWorkerFileUpload(
-                                        workManager = workManager,
-                                        context = context,
-                                        cfg = cfg,
-                                        localFile = pendingLog,
-                                        remoteRelativePath = "$REMOTE_LOG_DIR/${pendingLog.name}"
-                                    )
-
+                            val cfg = gitHubConfig
+                            runCatching {
+                                val pendingLog = captureSessionLogcatToPendingFile(
+                                    context = context,
+                                    surveyUuid = surveyUuid,
+                                    exportedAtStamp = exportedAtStamp,
+                                    maxBytes = MAX_LOGCAT_BYTES
+                                )
+                                enqueueWorkerFileUpload(
+                                    context = context,
+                                    cfg = cfg,
+                                    localFile = pendingLog,
+                                    remoteRelativePath = "$REMOTE_LOG_DIR/${pendingLog.name}"
+                                )
+                                scope.launch {
                                     snackbar.showOnce("Logs scheduled (will run when online).")
-                                } catch (t: Throwable) {
-                                    snackbar.showOnce("Failed to schedule logs: ${t.message}")
-                                } finally {
-                                    busy = false
-                                    actionGate.set(false)
+                                }
+                            }.onFailure { e ->
+                                scope.launch {
+                                    snackbar.showOnce("Failed to schedule logs: ${e.message}")
                                 }
                             }
-                        }
-                    ) { Text("Upload logs later") }
+                        },
+                        enabled = !uploading
+                    ) {
+                        Text("Upload logs later")
+                    }
 
                     Spacer(Modifier.weight(1f))
                 }
@@ -661,185 +822,33 @@ fun DoneScreen(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Button(onClick = onRestart, enabled = !busy) { Text("Restart") }
+                Button(onClick = onRestart, enabled = !uploading) {
+                    Text("Restart")
+                }
             }
         }
     }
 
+    /**
+     * Friendly completion snackbar for this run.
+     */
     LaunchedEffect(surveyUuid) {
         snackbar.showOnce("Thank you for your responses")
     }
 }
 
 /* ============================================================
- * SurveyViewModel compatibility helpers
- * ============================================================ */
-
-/**
- * Returns audio refs for a specific run (surveyUuid), grouped by questionId.
- * This is implemented as an extension to avoid changing SurveyViewModel public API.
- */
-private fun SurveyViewModel.getAudioRefsForRun(surveyUuid: String): Map<String, List<SurveyViewModel.AudioRef>> {
-    val snap: Map<String, List<SurveyViewModel.AudioRef>> = recordedAudioRefs.value
-    if (snap.isEmpty()) return emptyMap()
-
-    val out = LinkedHashMap<String, List<SurveyViewModel.AudioRef>>()
-    for ((qid, list) in snap) {
-        val filtered = list.filter { it.surveyId == surveyUuid }
-        if (filtered.isNotEmpty()) out[qid] = filtered
-    }
-    return out
-}
-
-/**
- * Returns audio refs for a specific run (surveyUuid), flattened.
- */
-private fun SurveyViewModel.getAudioRefsForRunFlat(surveyUuid: String): List<SurveyViewModel.AudioRef> {
-    val snap: Map<String, List<SurveyViewModel.AudioRef>> = recordedAudioRefs.value
-    if (snap.isEmpty()) return emptyList()
-
-    return snap.values
-        .asSequence()
-        .flatten()
-        .filter { it.surveyId == surveyUuid }
-        .toList()
-}
-
-/* ============================================================
- * Upload now (best-effort, partial success OK)
- * ============================================================ */
-
-private data class UploadNowResult(
-    val userMessage: String
-)
-
-private suspend fun uploadNowBestEffort(
-    cfg: GitHubUploader.GitHubConfig,
-    jsonFile: File,
-    jsonRemotePath: String,
-    voiceFiles: List<File>,
-    logFile: File,
-    logRemotePath: String
-): UploadNowResult {
-    var jsonOk = false
-    var voicesOk = 0
-    var voicesSkippedLarge = 0
-    var voicesFailed = 0
-    var logOk = false
-
-    // 1) JSON
-    jsonOk = uploadSingleFileBestEffort(
-        cfg = cfg,
-        localFile = jsonFile,
-        remotePath = jsonRemotePath,
-        allowOver1Mb = true,
-        deleteOnSuccess = false // keep the staged JSON for safety; caller can prune later
-    )
-
-    // 2) Voice files (each isolated)
-    for (file in voiceFiles) {
-        val tooLargeForSafe = file.length() > MAX_IN_MEMORY_READ_BYTES
-        if (tooLargeForSafe) {
-            voicesSkippedLarge++
-            continue
-        }
-
-        val ok = uploadSingleFileBestEffort(
-            cfg = cfg,
-            localFile = file,
-            remotePath = "$REMOTE_VOICE_DIR/${file.name}",
-            allowOver1Mb = false, // conservative; avoid hard failures on Contents-like APIs
-            deleteOnSuccess = true
-        )
-
-        if (ok) {
-            // Delete sidecars only after successful upload.
-            runCatching { deleteVoiceSidecars(file) }
-            voicesOk++
-        } else {
-            // Keep file so it can be retried later.
-            voicesFailed++
-        }
-    }
-
-    // 3) Logs
-    logOk = uploadSingleFileBestEffort(
-        cfg = cfg,
-        localFile = logFile,
-        remotePath = logRemotePath,
-        allowOver1Mb = true,
-        deleteOnSuccess = true
-    )
-
-    val parts = ArrayList<String>()
-    parts += if (jsonOk) "JSON:OK" else "JSON:FAIL"
-    parts += "VOICE:OK=$voicesOk"
-    if (voicesFailed > 0) parts += "FAIL=$voicesFailed"
-    if (voicesSkippedLarge > 0) parts += "SKIP_LARGE=$voicesSkippedLarge"
-    parts += if (logOk) "LOG:OK" else "LOG:FAIL"
-
-    val msg = "Upload done (best-effort): " + parts.joinToString("  ")
-    return UploadNowResult(userMessage = msg)
-}
-
-private suspend fun uploadSingleFileBestEffort(
-    cfg: GitHubUploader.GitHubConfig,
-    localFile: File,
-    remotePath: String,
-    allowOver1Mb: Boolean,
-    deleteOnSuccess: Boolean
-): Boolean {
-    if (!localFile.exists() || !localFile.isFile) return false
-
-    val size = localFile.length()
-    if (size <= 0L) return false
-
-    // Avoid OOM no matter what.
-    if (size > MAX_IN_MEMORY_READ_BYTES) {
-        Log.w(LOG_TAG, "Skip upload (too large to read safely): ${localFile.name} size=$size")
-        return false
-    }
-
-    // Conservative guard for APIs that behave best under ~1MB.
-    if (!allowOver1Mb && size > MAX_GITHUB_SAFE_BYTES) {
-        Log.w(LOG_TAG, "Skip upload (over conservative safe size): ${localFile.name} size=$size")
-        return false
-    }
-
-    val bytes = runCatching {
-        readFileBytesCapped(localFile, MAX_IN_MEMORY_READ_BYTES)
-    }.getOrElse {
-        Log.e(LOG_TAG, "Read failed: ${localFile.name}", it)
-        return false
-    }
-
-    val ok = runCatching {
-        withTimeout(90_000L) {
-            GitHubUploader.uploadFile(
-                cfg = cfg,
-                relativePath = remotePath,
-                bytes = bytes,
-                message = "Upload ${localFile.name}"
-            )
-        }
-        true
-    }.getOrElse { e ->
-        Log.e(LOG_TAG, "Upload failed: remote=$remotePath local=${localFile.name}", e)
-        false
-    }
-
-    if (ok && deleteOnSuccess) {
-        runCatching { localFile.delete() }
-    }
-    return ok
-}
-
-/* ============================================================
  * WorkManager enqueue helpers
  * ============================================================ */
 
+/**
+ * Enqueue GitHubUploadWorker in "file" mode with a custom remote relative path.
+ *
+ * Important:
+ * - GitHubUploadWorker uses KEY_FILE_NAME as the *remote relative path*.
+ * - Passing "voice/<name>.wav" keeps remote structure aligned with immediate upload.
+ */
 private fun enqueueWorkerFileUpload(
-    workManager: WorkManager,
     context: Context,
     cfg: GitHubUploader.GitHubConfig,
     localFile: File,
@@ -858,6 +867,7 @@ private fun enqueueWorkerFileUpload(
                     GitHubUploadWorker.KEY_TOKEN to cfg.token,
                     GitHubUploadWorker.KEY_BRANCH to cfg.branch,
                     GitHubUploadWorker.KEY_PATH_PREFIX to cfg.pathPrefix,
+
                     GitHubUploadWorker.KEY_FILE_PATH to localFile.absolutePath,
                     GitHubUploadWorker.KEY_FILE_NAME to remoteRelativePath
                 )
@@ -877,9 +887,13 @@ private fun enqueueWorkerFileUpload(
             .addTag("${GitHubUploadWorker.TAG}:file:$safeUnique")
             .build()
 
-    workManager.enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
+    WorkManager.getInstance(context)
+        .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
 }
 
+/**
+ * Sanitize a unique work name so WorkManager never sees illegal characters.
+ */
 private fun sanitizeWorkName(value: String): String {
     return value
         .trim()
@@ -887,10 +901,12 @@ private fun sanitizeWorkName(value: String): String {
         .take(120)
 }
 
-/* ============================================================
- * Pending file helpers
- * ============================================================ */
-
+/**
+ * Write a pending UTF-8 text payload to app-private storage so WorkManager can upload it later.
+ *
+ * Location:
+ *  - /files/pending_uploads/<fileName or unique>
+ */
 private fun writePendingTextFile(
     context: Context,
     fileName: String,
@@ -901,20 +917,32 @@ private fun writePendingTextFile(
     val safeName = sanitizeFileName(fileName)
     val dir = File(context.filesDir, "pending_uploads").apply { mkdirs() }
     val target = uniqueIfExists(File(dir, safeName))
+
     target.writeText(content, Charsets.UTF_8)
     return target
 }
 
+/**
+ * Replace all non `[A-Za-z0-9_.-/]` characters with underscores.
+ *
+ * Note:
+ * - We allow '/' because remoteRelativePath may include subdirs like "voice/<name>.wav".
+ * - For local pending files, slashes are converted to underscores to keep a flat directory.
+ */
 private fun sanitizeFileName(name: String): String {
     val flattened = name.replace("/", "_")
     return flattened.replace(Regex("""[^\w\-.]"""), "_")
 }
 
+/**
+ * Append a numeric suffix until a non-existing file name is found.
+ */
 private fun uniqueIfExists(file: File): File {
     if (!file.exists()) return file
 
     val base = file.nameWithoutExtension
     val ext = file.extension.takeIf { it.isNotEmpty() }?.let { ".$it" } ?: ""
+
     var idx = 1
     while (true) {
         val candidate = File(file.parentFile, "${base}_$idx$ext")
@@ -923,37 +951,17 @@ private fun uniqueIfExists(file: File): File {
     }
 }
 
-/**
- * Best-effort pruning to prevent pending_uploads from growing forever.
- * This should NEVER throw.
- */
-private fun prunePendingUploadsDirBestEffort(context: Context) {
-    runCatching {
-        val dir = File(context.filesDir, "pending_uploads")
-        if (!dir.exists() || !dir.isDirectory) return
-
-        val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
-        val maxFiles = 250
-        val maxBytes = 200L * 1024L * 1024L // 200MB
-
-        var total = 0L
-        files.forEachIndexed { idx, f ->
-            total += f.length().coerceAtLeast(0L)
-            val overCount = idx >= maxFiles
-            val overBytes = total > maxBytes
-            if (overCount || overBytes) {
-                runCatching { f.delete() }
-            }
-        }
-    }.onFailure {
-        Log.w(LOG_TAG, "prunePendingUploadsDirBestEffort failed: ${it.message}")
-    }
-}
-
 /* ============================================================
  * Voice scan helpers (physical files)
  * ============================================================ */
 
+/**
+ * Scan exported voice WAV files under exports/voice and return only files whose
+ * names are included in [expectedNames].
+ *
+ * This ensures we upload only files referenced by the ViewModel manifest,
+ * avoiding accidental uploads of leftovers from other runs.
+ */
 private fun scanVoiceFilesByNames(
     context: Context,
     expectedNames: Set<String>
@@ -973,17 +981,34 @@ private fun scanVoiceFilesByNames(
     return wavFiles.sortedByDescending { it.lastModified() }
 }
 
+/**
+ * Delete sidecar metadata files for a given WAV if they exist.
+ *
+ * Expected patterns:
+ *  - <baseName>.meta.json
+ *
+ * This is safe even if your current export pipeline no longer writes meta files.
+ */
 private fun deleteVoiceSidecars(wavFile: File) {
     val dir = wavFile.parentFile ?: return
     val base = wavFile.name.substringBeforeLast('.', wavFile.name)
     val meta = File(dir, "$base.meta.json")
-    if (meta.exists()) runCatching { meta.delete() }
+    if (meta.exists()) {
+        runCatching { meta.delete() }
+    }
 }
 
 /* ============================================================
  * Logcat capture helpers (diagnostics)
  * ============================================================ */
 
+/**
+ * Capture a best-effort logcat snapshot for this survey run as a gzip file
+ * under app-private storage.
+ *
+ * The file is placed under /files/pending_uploads so it can be uploaded later
+ * by WorkManager even if the device is currently offline.
+ */
 private fun captureSessionLogcatToPendingFile(
     context: Context,
     surveyUuid: String,
@@ -1031,6 +1056,15 @@ private fun captureSessionLogcatToPendingFile(
     return outFile
 }
 
+/**
+ * Collect logcat output as bytes with multiple fallback strategies.
+ *
+ * Strategy priority (best to worst):
+ *  1) logcat -d --pid=<pid> -v threadtime -s <tags...>
+ *  2) logcat -d --pid=<pid> -v threadtime
+ *  3) logcat -d -v threadtime -s <tags...>
+ *  4) logcat -d -v threadtime
+ */
 private fun collectLogcatBytesBestEffort(
     pid: Int,
     maxBytes: Int,
@@ -1050,11 +1084,13 @@ private fun collectLogcatBytesBestEffort(
         }
 }
 
+/**
+ * Execute a command and read stdout up to [maxBytes].
+ */
 private fun execAndReadCapped(cmd: Array<String>, maxBytes: Int): ByteArray {
-    val pb = ProcessBuilder(*cmd).redirectErrorStream(true)
-    val proc = pb.start()
-
+    val proc = Runtime.getRuntime().exec(cmd)
     val input = BufferedInputStream(proc.inputStream)
+
     val out = ByteArray(maxBytes)
     var total = 0
 
@@ -1065,16 +1101,13 @@ private fun execAndReadCapped(cmd: Array<String>, maxBytes: Int): ByteArray {
     }
 
     runCatching { input.close() }
-
-    // Avoid hanging forever.
-    runCatching { proc.waitFor(2, TimeUnit.SECONDS) }
     runCatching { proc.destroy() }
 
     return if (total == out.size) out else out.copyOf(total)
 }
 
 /* ============================================================
- * Auto-save helpers
+ * Auto-save helpers (no user interaction)
  * ============================================================ */
 
 private data class SaveResult(
@@ -1083,6 +1116,12 @@ private data class SaveResult(
     val location: String
 )
 
+/**
+ * Save JSON to a stable device location without user interaction.
+ *
+ * - API 29+: MediaStore Downloads/SurveyNav
+ * - API 28-: App-specific external Downloads/SurveyNav
+ */
 private fun saveJsonAutomatically(
     context: Context,
     fileName: String,
@@ -1104,7 +1143,10 @@ private fun saveToDownloadsQPlus(
     val values = ContentValues().apply {
         put(MediaStore.Downloads.DISPLAY_NAME, fileName)
         put(MediaStore.Downloads.MIME_TYPE, "application/json")
-        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/SurveyNav")
+        put(
+            MediaStore.Downloads.RELATIVE_PATH,
+            Environment.DIRECTORY_DOWNLOADS + "/SurveyNav"
+        )
         put(MediaStore.Downloads.IS_PENDING, 1)
     }
 
@@ -1137,7 +1179,8 @@ private fun saveToAppExternalPreQ(
     fileName: String,
     content: String
 ): SaveResult {
-    val base = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+    val base = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        ?: context.filesDir
     val dir = File(base, "SurveyNav").apply { mkdirs() }
     val file = File(dir, fileName)
     file.writeText(content, Charsets.UTF_8)
@@ -1150,14 +1193,20 @@ private fun saveToAppExternalPreQ(
 }
 
 /* ============================================================
- * Snackbar + JSON + File read utilities
+ * Snackbar + JSON utilities
  * ============================================================ */
 
+/**
+ * Show a snackbar message while ensuring only one active snackbar at a time.
+ */
 private suspend fun SnackbarHostState.showOnce(message: String) {
     currentSnackbarData?.dismiss()
     showSnackbar(message)
 }
 
+/**
+ * Minimal JSON string escaper for manual export.
+ */
 private fun escapeJson(s: String): String =
     buildString(s.length + 8) {
         s.forEach { ch ->
@@ -1171,32 +1220,3 @@ private fun escapeJson(s: String): String =
             }
         }
     }
-
-/**
- * Read a file into memory safely with a hard cap.
- *
- * @throws IllegalStateException if file exceeds cap
- */
-private fun readFileBytesCapped(file: File, capBytes: Int): ByteArray {
-    val len = file.length()
-    if (len <= 0L) return ByteArray(0)
-    if (len > capBytes.toLong()) {
-        throw IllegalStateException("File too large to read safely: ${file.name} size=$len cap=$capBytes")
-    }
-
-    FileInputStream(file).use { fis ->
-        val baos = ByteArrayOutputStream(len.toInt().coerceAtMost(capBytes))
-        val buf = ByteArray(64 * 1024)
-        var total = 0
-        while (true) {
-            val n = fis.read(buf)
-            if (n <= 0) break
-            total += n
-            if (total > capBytes) {
-                throw IllegalStateException("Read exceeds cap: ${file.name} total=$total cap=$capBytes")
-            }
-            baos.write(buf, 0, n)
-        }
-        return baos.toByteArray()
-    }
-}

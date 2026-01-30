@@ -5,50 +5,36 @@
  *  File: SurveyConfigLoader.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
- *  © 2025 IshizukiTech LLC. All rights reserved.
+ *  © 2026 IshizukiTech LLC. All rights reserved.
  * =====================================================================
  *
  *  Summary:
  *  ---------------------------------------------------------------------
  *  Strongly-typed survey configuration model and loader.
- *  Supports JSON and YAML formats, SLM metadata, QA-Eval (EVAL -> optional Follow-up),
- *  model defaults, Whisper metadata, and structural validation for graph-based
- *  survey flows.
+ *  Supports JSON and YAML formats, SLM metadata, model defaults,
+ *  Whisper metadata, and structural validation for graph-based survey flows.
  *
- *  Update (2026-01):
+ *  Update (single-step + double-step YAML split support):
  *  ---------------------------------------------------------------------
- *   • Fix: Accept both snake_case and camelCase keys for core graph/prompt fields:
- *       - graph.start_id / graph.startId
- *       - prompts[].node_id / prompts[].nodeId
- *       - nodes[].next_id / nodes[].nextId
- *     via custom serializers (no unsafe text rewriting).
+ *   • Prompt entries now support:
+ *     - prompt (legacy one-step)
+ *     - eval_prompt + followup_prompt (inline two-step, legacy)
+ *     - prompts_eval[] + prompts_followup[] (split two-step, recommended)
+ *   • SLM meta now supports:
+ *     - key_contract_eval / key_contract_followup
+ *     - length_budget_eval / length_budget_followup
+ *     - strict_output_eval / strict_output_followup
+ *     - followup_output_mode: "JSON" or "TEXT" (2-call followup output control)
+ *     - (fallback to key_contract / length_budget / strict_output when phase-specific fields are missing)
  *
- *   • Improve: Validation now separates Errors vs Warnings
- *       - requireValid() throws ONLY on errors (warnings are logged)
- *       - Unreachable nodes / self-loop / legacy config notices are warnings
- *
- *   • Improve: Stronger validation
- *       - Detect blank prompt nodeId / blank prompt template
- *       - Detect AI nodes with no prompt defined (any stage)
- *       - Warn on self-loop nextId
- *       - Warn on unreachable nodes from startId (soft rule)
- *
- *   • Improve: Prompt stage utilities (BASE/EVAL/FOLLOWUP) with tolerant parsing.
- *
- *   • Fix (compile): Allow `Prompt.containsStageDelimiter()` so call sites can do:
- *       prompts.filter { it.containsStageDelimiter() }
- *     without receiver mismatch (Prompt vs String).
- *
- *  Update (2026-01 QA-Eval):
+ *  Notes:
  *  ---------------------------------------------------------------------
- *   • New: Add `qa_eval:` section (preferred) to control 1-call / 2-call workflows:
- *       - mode: one_call | two_call
- *       - followup_trigger: needs_followup | score_below_threshold | either
- *       - max_tokens_eval / max_tokens_followup
- *       - fallback_to_inline_followup
- *     while keeping legacy `two_step:` support for backward compatibility.
+ *   • Validation assumes a single-successor graph using nextId.
+ *     If you later introduce branching (per-option next ids), update validation.
  * =====================================================================
  */
+
+@file:Suppress("MemberVisibilityCanBePrivate", "unused")
 
 package com.negi.survey.config
 
@@ -58,172 +44,528 @@ import com.charleskorn.kaml.Yaml
 import com.charleskorn.kaml.YamlConfiguration
 import java.io.File
 import java.nio.charset.Charset
-import kotlinx.serialization.KSerializer
+import java.util.ArrayDeque
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
-import kotlinx.serialization.builtins.ListSerializer
-import kotlinx.serialization.builtins.nullable
-import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.descriptors.SerialDescriptor
-import kotlinx.serialization.descriptors.buildClassSerialDescriptor
-import kotlinx.serialization.descriptors.element
 import kotlinx.serialization.encodeToString
-import kotlinx.serialization.encoding.CompositeDecoder
-import kotlinx.serialization.encoding.Decoder
-import kotlinx.serialization.encoding.Encoder
-import kotlinx.serialization.encoding.decodeStructure
-import kotlinx.serialization.encoding.encodeStructure
 import kotlinx.serialization.json.Json
 
+private const val TAG = "SurveyConfigLoader"
+
 /**
- * Top-level configuration model for a survey.
- *
- * Aggregates the prompt table, graph structure, SLM metadata, QA-Eval metadata,
- * Whisper metadata, and model defaults that describe how a survey should be
- * executed at runtime.
+ * Root survey configuration model.
  */
 @Serializable
 data class SurveyConfig(
+    /**
+     * Legacy prompt list:
+     * - One-step: prompt
+     * - Inline two-step: eval_prompt + followup_prompt
+     */
     val prompts: List<Prompt> = emptyList(),
+
+    /**
+     * Split two-step prompts (recommended for "double-step only" YAML).
+     * Each list uses entries of { nodeId, prompt }.
+     */
+    @SerialName("prompts_eval") val promptsEval: List<NodePrompt> = emptyList(),
+    @SerialName("prompts_followup") val promptsFollowup: List<NodePrompt> = emptyList(),
+
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
-
-    /**
-     * Preferred QA evaluation config (new).
-     *
-     * - Used to support 1-call (eval only) and 2-call (eval + followup generation) flows.
-     * - If both qa_eval and two_step are present, qa_eval takes precedence.
-     */
-    @SerialName("qa_eval") val qaEval: QaEvalMeta = QaEvalMeta(),
-
-    /**
-     * Legacy two-step metadata (old).
-     *
-     * - Kept for backward compatibility with older configs.
-     * - Only contains a subset of QA-eval knobs.
-     */
-    @SerialName("two_step") val twoStep: TwoStepMeta = TwoStepMeta(),
-
     val whisper: WhisperMeta = WhisperMeta(),
     @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
 ) {
 
-    // ---------------------------------------------------------------------
-    // prompts
-    // ---------------------------------------------------------------------
-
     /**
-     * Prompt stage token derived from staged prompt identifiers.
-     */
-    enum class PromptStage {
-        BASE,
-        EVAL,
-        FOLLOWUP,
-        UNKNOWN
-    }
-
-    /**
-     * A single prompt template entry associated with a specific graph node.
+     * A prompt template entry for a graph node.
+     *
+     * Supported forms:
+     * - One-step (legacy): prompt
+     * - Inline two-step (legacy): eval_prompt + followup_prompt
      *
      * Notes:
-     * - Supports both nodeId and node_id in configs via custom serializer.
-     * - Supports staged node ids like "Q1#eval" or "Q1#followup".
+     * - Do NOT set both prompt and eval_prompt/followup_prompt together.
+     * - Inline two-step is considered "complete" only when BOTH eval_prompt and followup_prompt are present.
      */
-    @Serializable(with = PromptSerializer::class)
+    @Serializable
     data class Prompt(
         val nodeId: String,
-        val prompt: String
+
+        /** Legacy one-step prompt template. */
+        @SerialName("prompt") val prompt: String? = null,
+
+        /** Inline two-step evaluation prompt (A). */
+        @SerialName("eval_prompt") val evalPrompt: String? = null,
+
+        /** Inline two-step follow-up prompt (2A). */
+        @SerialName("followup_prompt") val followupPrompt: String? = null
     ) {
+        /** True when this entry has any inline two-step field present (may be incomplete). */
+        fun isTwoStepAny(): Boolean = !evalPrompt.isNullOrBlank() || !followupPrompt.isNullOrBlank()
 
-        /**
-         * Extract the base node id from staged prompt identifiers.
-         */
-        fun baseNodeId(): String = nodeId.baseNodeId()
+        /** True only when this entry is a complete inline two-step prompt definition. */
+        fun isTwoStepComplete(): Boolean = !evalPrompt.isNullOrBlank() && !followupPrompt.isNullOrBlank()
 
-        /**
-         * Extract the stage token (e.g., "eval", "followup") from a staged prompt id.
-         * Returns null if the nodeId does not contain a stage delimiter.
-         */
-        fun stageTokenOrNull(): String? = nodeId.stageTokenOrNull()
+        /** Backward-compatible alias: inline two-step is active only when complete. */
+        fun isTwoStep(): Boolean = isTwoStepComplete()
 
-        /**
-         * Resolve the stage into a [PromptStage] using tolerant parsing.
-         */
-        fun stage(): PromptStage = stageTokenOrNull().toPromptStage()
-
-        /**
-         * Return true if this prompt id looks like a staged identifier.
-         *
-         * This exists so call sites can do `it.containsStageDelimiter()` where `it` is Prompt,
-         * avoiding a receiver mismatch with the file-private String extension.
-         */
-        fun containsStageDelimiter(): Boolean = nodeId.containsStageDelimiter()
+        /** True when this entry is a legacy one-step prompt definition. */
+        fun isOneStep(): Boolean = !prompt.isNullOrBlank()
     }
 
-    // ---------------------------------------------------------------------
-    // graph
-    // ---------------------------------------------------------------------
-
     /**
-     * Graph definition for the survey flow.
-     *
-     * Notes:
-     * - Supports startId and start_id in configs via custom serializer.
+     * Split prompt entry for prompts_eval/prompts_followup.
      */
-    @Serializable(with = GraphSerializer::class)
+    @Serializable
+    data class NodePrompt(
+        val nodeId: String,
+        val prompt: String = ""
+    ) {
+        fun isValid(): Boolean = nodeId.isNotBlank() && prompt.isNotBlank()
+    }
+
+    @Serializable
     data class Graph(
         val startId: String,
         val nodes: List<NodeDTO> = emptyList()
     )
 
-    // ---------------------------------------------------------------------
-    // Validation
-    // ---------------------------------------------------------------------
+    /**
+     * Follow-up output mode for 2-call pipelines.
+     *
+     * JSON: follow-up call returns JSON (e.g., {"followup_question": "..."}).
+     * TEXT: follow-up call returns plain text only (single line) or empty output.
+     */
+    enum class FollowupOutputMode { JSON, TEXT;
+
+        companion object {
+            fun parse(raw: String?): FollowupOutputMode {
+                val norm = raw?.trim()?.uppercase().orEmpty()
+                return when (norm) {
+                    "TEXT", "PLAIN", "PLAIN_TEXT", "PLAINTEXT" -> TEXT
+                    "JSON" -> JSON
+                    else -> JSON
+                }
+            }
+        }
+    }
+
+    @Serializable
+    data class SlmMeta(
+        @SerialName("accelerator") val accelerator: String? = null,
+        @SerialName("max_tokens") val maxTokens: Int? = null,
+        @SerialName("top_k") val topK: Int? = null,
+        @SerialName("top_p") val topP: Double? = null,
+        @SerialName("temperature") val temperature: Double? = null,
+
+        @SerialName("user_turn_prefix") val userTurnPrefix: String? = null,
+        @SerialName("model_turn_prefix") val modelTurnPrefix: String? = null,
+        @SerialName("turn_end") val turnEnd: String? = null,
+
+        @SerialName("empty_json_instruction") val emptyJsonInstruction: String? = null,
+        @SerialName("preamble") val preamble: String? = null,
+
+        /** One-step contract (and fallback for eval/followup if phase-specific is missing). */
+        @SerialName("key_contract") val keyContract: String? = null,
+
+        /** Two-step eval contract (preferred). */
+        @SerialName("key_contract_eval") val keyContractEval: String? = null,
+
+        /** Two-step follow-up contract (preferred). */
+        @SerialName("key_contract_followup") val keyContractFollowup: String? = null,
+
+        /** One-step length budget (and fallback for eval/followup if phase-specific is missing). */
+        @SerialName("length_budget") val lengthBudget: String? = null,
+
+        /** Two-step eval length budget (preferred). */
+        @SerialName("length_budget_eval") val lengthBudgetEval: String? = null,
+
+        /** Two-step follow-up length budget (preferred). */
+        @SerialName("length_budget_followup") val lengthBudgetFollowup: String? = null,
+
+        /** One-step strict output (and fallback). */
+        @SerialName("strict_output") val strictOutput: String? = null,
+
+        /** Two-step eval strict output (preferred). */
+        @SerialName("strict_output_eval") val strictOutputEval: String? = null,
+
+        /** Two-step follow-up strict output (preferred). */
+        @SerialName("strict_output_followup") val strictOutputFollowup: String? = null,
+
+        /**
+         * Follow-up output mode:
+         * - "JSON": follow-up call outputs JSON
+         * - "TEXT": follow-up call outputs plain text only
+         *
+         * Default: JSON
+         */
+        @SerialName("followup_output_mode") val followupOutputMode: String? = null,
+
+        @SerialName("scoring_rule") val scoringRule: String? = null
+    ) {
+        /** Resolve follow-up output mode, defaulting to JSON. */
+        fun resolvedFollowupOutputMode(): FollowupOutputMode =
+            FollowupOutputMode.parse(followupOutputMode)
+    }
+
+    @Serializable
+    data class WhisperMeta(
+        @SerialName("enabled") val enabled: Boolean? = null,
+        @SerialName("asset_model_path") val assetModelPath: String? = null,
+        @SerialName("language") val language: String? = null,
+        @SerialName("translate") val translate: Boolean? = null,
+        @SerialName("print_timestamp") val printTimestamp: Boolean? = null,
+        @SerialName("target_sample_rate") val targetSampleRate: Int? = null,
+        @SerialName("record_sample_rates") val recordSampleRates: List<Int>? = null,
+        @SerialName("compute_checksum") val computeChecksum: Boolean? = null
+    )
+
+    @Serializable
+    data class ModelDefaults(
+        /** Optional model name label for UI/debug. */
+        @SerialName("model_name") val modelName: String? = null,
+
+        @SerialName("default_model_url") val defaultModelUrl: String? = null,
+        @SerialName("default_file_name") val defaultFileName: String? = null,
+        @SerialName("timeout_ms") val timeoutMs: Long? = null,
+        @SerialName("ui_throttle_ms") val uiThrottleMs: Long? = null,
+        @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
+    )
 
     /**
-     * Validation result separating errors and warnings.
+     * Resolve a legacy one-step prompt (prompt) for the given nodeId.
+     *
+     * This intentionally ignores two-step prompts.
      */
-    data class ValidationResult(
-        val errors: List<String>,
-        val warnings: List<String>
-    ) {
-        val isOk: Boolean get() = errors.isEmpty()
+    fun resolveOneStepPrompt(nodeId: String): String? {
+        val id = nodeId.trim()
+        if (id.isBlank()) return null
+        val p = prompts.firstOrNull { it.nodeId.trim() == id } ?: return null
+        return p.prompt?.takeIf { it.isNotBlank() }
     }
 
     /**
-     * Validate the internal structure and return errors and warnings.
+     * Resolve an eval prompt for the given nodeId (two-step).
      *
-     * - Errors: should prevent execution (requireValid throws)
-     * - Warnings: safe to run, but likely indicates misconfiguration
+     * Priority:
+     *  1) Inline two-step (eval_prompt) when complete
+     *  2) Split two-step (prompts_eval) when complete pair exists
+     *
+     * Note: Ambiguous cases should be rejected by validation.
      */
-    fun validateDetailed(): ValidationResult {
-        val errors = mutableListOf<String>()
-        val warnings = mutableListOf<String>()
+    fun resolveEvalPrompt(nodeId: String): String? {
+        val id = nodeId.trim()
+        if (id.isBlank()) return null
 
-        // --- graph basic sanity ---
+        val legacy = prompts.firstOrNull { it.nodeId.trim() == id }
+        if (legacy?.isTwoStepComplete() == true) {
+            return legacy.evalPrompt?.takeIf { it.isNotBlank() }
+        }
+
+        val eval = promptsEval.firstOrNull { it.nodeId.trim() == id }?.prompt
+        val follow = promptsFollowup.firstOrNull { it.nodeId.trim() == id }?.prompt
+        if (!eval.isNullOrBlank() && !follow.isNullOrBlank()) return eval
+
+        return null
+    }
+
+    /**
+     * Resolve a follow-up prompt for the given nodeId (two-step).
+     *
+     * Priority:
+     *  1) Inline two-step (followup_prompt) when complete
+     *  2) Split two-step (prompts_followup) when complete pair exists
+     *
+     * Note: Ambiguous cases should be rejected by validation.
+     */
+    fun resolveFollowupPrompt(nodeId: String): String? {
+        val id = nodeId.trim()
+        if (id.isBlank()) return null
+
+        val legacy = prompts.firstOrNull { it.nodeId.trim() == id }
+        if (legacy?.isTwoStepComplete() == true) {
+            return legacy.followupPrompt?.takeIf { it.isNotBlank() }
+        }
+
+        val eval = promptsEval.firstOrNull { it.nodeId.trim() == id }?.prompt
+        val follow = promptsFollowup.firstOrNull { it.nodeId.trim() == id }?.prompt
+        if (!eval.isNullOrBlank() && !follow.isNullOrBlank()) return follow
+
+        return null
+    }
+
+    /**
+     * Compose the system prompt for one-step mode.
+     *
+     * Backward-compatible alias: composeSystemPrompt() uses this.
+     */
+    fun composeSystemPromptOneStep(): String {
+        val parts = listOf(
+            slm.preamble,
+            slm.keyContract,
+            slm.lengthBudget,
+            slm.scoringRule,
+            slm.strictOutput,
+            slm.emptyJsonInstruction
+        ).filterNot { it.isNullOrBlank() }
+            .map { it!!.trim() }
+        return parts.joinToString("\n")
+    }
+
+    /**
+     * Compose the system prompt for two-step EVAL phase.
+     *
+     * Uses key_contract_eval/length_budget_eval/strict_output_eval when present,
+     * otherwise falls back to key_contract/length_budget/strict_output.
+     *
+     * Note: EVAL should remain JSON-only for reliable parsing.
+     */
+    fun composeSystemPromptEval(): String {
+        val contract = slm.keyContractEval?.takeIf { it.isNotBlank() } ?: slm.keyContract
+        val budget = slm.lengthBudgetEval?.takeIf { it.isNotBlank() } ?: slm.lengthBudget
+        val strict = slm.strictOutputEval?.takeIf { it.isNotBlank() } ?: slm.strictOutput
+
+        val parts = listOf(
+            slm.preamble,
+            contract,
+            budget,
+            slm.scoringRule,
+            strict,
+            slm.emptyJsonInstruction
+        ).filterNot { it.isNullOrBlank() }
+            .map { it!!.trim() }
+        return parts.joinToString("\n")
+    }
+
+    /**
+     * Default strict instructions for follow-up TEXT-only mode.
+     *
+     * This is used when followup_output_mode=TEXT but strict_output_followup is empty.
+     */
+    private fun defaultFollowupStrictText(): String = """
+        STRICT OUTPUT (NO MARKDOWN):
+        - Output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
+        - No JSON, no quotes, no extra text.
+    """.trimIndent()
+
+    /**
+     * Compose the system prompt for two-step FOLLOWUP phase.
+     *
+     * Uses key_contract_followup/length_budget_followup/strict_output_followup when present,
+     * otherwise falls back to key_contract/length_budget/strict_output.
+     *
+     * If followup_output_mode=TEXT:
+     * - Do NOT include empty_json_instruction (it tends to bias output toward JSON).
+     * - Prefer strict_output_followup or a built-in text-only strict.
+     */
+    fun composeSystemPromptFollowup(): String {
+        val contract = slm.keyContractFollowup?.takeIf { it.isNotBlank() } ?: slm.keyContract
+        val budget = slm.lengthBudgetFollowup?.takeIf { it.isNotBlank() } ?: slm.lengthBudget
+        val mode = slm.resolvedFollowupOutputMode()
+
+        val strict = when (mode) {
+            FollowupOutputMode.TEXT -> slm.strictOutputFollowup?.takeIf { it.isNotBlank() }
+                ?: defaultFollowupStrictText()
+            FollowupOutputMode.JSON -> slm.strictOutputFollowup?.takeIf { it.isNotBlank() }
+                ?: slm.strictOutput
+        }
+
+        val parts = ArrayList<String>(8)
+        slm.preamble?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+        contract?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+        budget?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+        slm.scoringRule?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+        strict?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+
+        // Important: exclude empty_json_instruction for TEXT follow-up.
+        if (mode == FollowupOutputMode.JSON) {
+            slm.emptyJsonInstruction?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+        }
+
+        return parts.joinToString("\n")
+    }
+
+    /**
+     * Compose the system prompt from SLM meta fields (one-step default).
+     */
+    fun composeSystemPrompt(): String = composeSystemPromptOneStep()
+
+    /**
+     * Produce a normalized prompt list:
+     * - Start with legacy prompts as-is.
+     * - Add split two-step entries that are not present in legacy prompts.
+     *
+     * This is useful for JSONL export and debugging.
+     */
+    fun normalizedPrompts(): List<Prompt> {
+        val legacyById = LinkedHashMap<String, Prompt>()
+        prompts.forEach { p ->
+            val id = p.nodeId.trim()
+            if (id.isNotBlank() && !legacyById.containsKey(id)) {
+                legacyById[id] = p
+            }
+        }
+
+        val evalById = promptsEval
+            .asSequence()
+            .map { it.nodeId.trim() to it.prompt }
+            .filter { it.first.isNotBlank() }
+            .toMap()
+
+        val followById = promptsFollowup
+            .asSequence()
+            .map { it.nodeId.trim() to it.prompt }
+            .filter { it.first.isNotBlank() }
+            .toMap()
+
+        val out = ArrayList<Prompt>(legacyById.size + evalById.size)
+
+        // Keep legacy prompts.
+        out.addAll(legacyById.values)
+
+        // Add split prompts (only when the pair is complete AND the nodeId is not already defined in legacy).
+        val splitIds = (evalById.keys + followById.keys).toSet()
+        splitIds.asSequence()
+            .sorted()
+            .forEach { id ->
+                if (legacyById.containsKey(id)) return@forEach
+                val e = evalById[id]
+                val f = followById[id]
+                if (!e.isNullOrBlank() && !f.isNullOrBlank()) {
+                    out += Prompt(nodeId = id, prompt = null, evalPrompt = e, followupPrompt = f)
+                }
+            }
+
+        return out
+    }
+
+    /**
+     * Encode prompts as JSON lines (one object per line).
+     *
+     * This exports the normalized prompt list, so split two-step prompts are included as inline two-step entries.
+     */
+    fun toJsonl(): List<String> =
+        SurveyConfigLoader.jsonCompact.let { json ->
+            normalizedPrompts().map { json.encodeToString(Prompt.serializer(), it) }
+        }
+
+    /**
+     * Encode the whole config into JSON.
+     */
+    fun toJson(pretty: Boolean = true): String =
+        (if (pretty) SurveyConfigLoader.jsonPretty else SurveyConfigLoader.jsonCompact)
+            .encodeToString(serializer(), this)
+
+    /**
+     * Encode the whole config into YAML.
+     */
+    fun toYaml(strict: Boolean = false): String =
+        SurveyConfigLoader.yaml(strict).encodeToString(serializer(), this)
+
+    /**
+     * Debug summary string for logcat.
+     */
+    fun debugSummary(maxIds: Int = 8): String {
+        fun takeIds(xs: List<String>, n: Int): String {
+            val t = xs.asSequence().map { it.trim() }.filter { it.isNotBlank() }.distinct().take(n).toList()
+            return if (t.isEmpty()) "-" else t.joinToString(",")
+        }
+
+        val legacyIds = prompts.map { it.nodeId }
+        val evalIds = promptsEval.map { it.nodeId }
+        val followIds = promptsFollowup.map { it.nodeId }
+
+        val legacyOne = prompts.count { it.isOneStep() }
+        val legacyInlineTwo = prompts.count { it.isTwoStepComplete() }
+
+        val followMode = slm.resolvedFollowupOutputMode().name
+
+        return "legacy=${prompts.size}(one=$legacyOne,inline2=$legacyInlineTwo) " +
+                "splitEval=${promptsEval.size} splitFollow=${promptsFollowup.size} " +
+                "followMode=$followMode " +
+                "legacyIds=[${takeIds(legacyIds, maxIds)}] " +
+                "evalIds=[${takeIds(evalIds, maxIds)}] " +
+                "followIds=[${takeIds(followIds, maxIds)}]"
+    }
+
+    /**
+     * Debug dump: system prompt previews + prompt coverage for AI nodes.
+     */
+    fun debugDump(maxPreviewChars: Int = 320): String {
+        fun preview(s: String): String {
+            val t = s.replace("\r", "\\r").replace("\n", "\\n")
+            return if (t.length <= maxPreviewChars) t else t.take(maxPreviewChars) + "...(truncated)"
+        }
+
+        val evalSys = composeSystemPromptEval()
+        val followSys = composeSystemPromptFollowup()
+        val oneSys = composeSystemPromptOneStep()
+
+        val aiIds = graph.nodes
+            .asSequence()
+            .filter { it.nodeType() == NodeType.AI }
+            .map { it.id.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+
+        val coverage = aiIds.joinToString(",") { id ->
+            val one = resolveOneStepPrompt(id) != null
+            val two = resolveEvalPrompt(id) != null && resolveFollowupPrompt(id) != null
+            "$id(one=$one,two=$two)"
+        }
+
+        return buildString {
+            append("SurveyConfigDump(").append(debugSummary()).append(")\n")
+            append("System(oneStep,len=").append(oneSys.length).append("): ").append(preview(oneSys)).append("\n")
+            append("System(eval,len=").append(evalSys.length).append("): ").append(preview(evalSys)).append("\n")
+            append("System(followup,len=").append(followSys.length).append("): ").append(preview(followSys)).append("\n")
+            append("AI coverage: ").append(coverage.ifBlank { "-" })
+        }
+    }
+
+    /**
+     * Validate the config and return a list of issues (empty if valid).
+     *
+     * Note:
+     * - Validation assumes a single-successor graph via nextId.
+     */
+    fun validate(): List<String> {
+        val issues = mutableListOf<String>()
+
         if (graph.startId.isBlank()) {
-            errors += "graph.startId is blank"
+            issues += "graph.startId is blank"
         }
         if (graph.nodes.isEmpty()) {
-            errors += "graph.nodes is empty"
-            return ValidationResult(errors = errors, warnings = warnings)
+            issues += "graph.nodes is empty"
+            return issues
         }
 
-        // --- node id sanity ---
-        val ids = graph.nodes.map { it.id }
-        if (ids.any { it.isBlank() }) {
-            errors += "graph.nodes contains blank id entries"
-        }
+        val rawIds = graph.nodes.map { it.id }
+        val ids = rawIds.map { it.trim() }
         val idSet = ids.filter { it.isNotBlank() }.toSet()
 
-        // --- startId existence ---
-        if (graph.startId.isNotBlank() && graph.startId !in idSet) {
-            errors += "graph.startId='${graph.startId}' not found in node ids: ${idSet.joinToString(",")}"
+        val blankIds = rawIds.filter { it.isBlank() }.distinct()
+        if (blankIds.isNotEmpty()) {
+            issues += "graph.nodes contains blank id entries"
         }
 
-        // --- duplicate node id check ---
+        val trimmedMismatch = graph.nodes
+            .map { it.id }
+            .filter { it.isNotBlank() }
+            .filter { it != it.trim() }
+            .distinct()
+        if (trimmedMismatch.isNotEmpty()) {
+            issues += "graph.nodes contains ids with leading/trailing whitespace: ${trimmedMismatch.joinToString(",")}"
+        }
+
+        val startIdNorm = graph.startId.trim()
+        if (startIdNorm.isNotBlank() && startIdNorm !in idSet) {
+            issues += "graph.startId='${graph.startId}' not found in node ids: ${idSet.joinToString(",")}"
+        }
+
         val duplicateIds = ids
             .filter { it.isNotBlank() }
             .groupingBy { it }
@@ -231,799 +573,391 @@ data class SurveyConfig(
             .filterValues { it > 1 }
             .keys
         if (duplicateIds.isNotEmpty()) {
-            errors += "duplicate node ids: ${duplicateIds.joinToString(",")}"
+            issues += "duplicate node ids: ${duplicateIds.joinToString(",")}"
         }
 
-        // --- node type sanity ---
+        val blankTypes = graph.nodes
+            .filter { it.type.isBlank() }
+            .map { it.id }
+            .filter { it.isNotBlank() }
+        if (blankTypes.isNotEmpty()) {
+            issues += "nodes with blank type: ${blankTypes.joinToString(",")}"
+        }
+
         val unknownTypes = graph.nodes
+            .filter { it.type.isNotBlank() }
             .filter { it.nodeType() == NodeType.UNKNOWN }
             .map { it.id }
             .filter { it.isNotBlank() }
         if (unknownTypes.isNotEmpty()) {
-            errors += "nodes with unknown type: ${unknownTypes.joinToString(",")}"
+            issues += "nodes with unknown type: ${unknownTypes.joinToString(",")}"
         }
 
-        // --- START node semantics (soft rules) ---
-        val startNode = graph.nodes.firstOrNull { it.id == graph.startId }
+        val startNode = graph.nodes.firstOrNull { it.id.trim() == startIdNorm }
         if (startNode != null && startNode.nodeType() != NodeType.START) {
-            warnings += "graph.startId points to a non-START node (id='${startNode.id}', type='${startNode.type}')"
+            issues += "graph.startId points to a non-START node (id='${startNode.id}', type='${startNode.type}')"
         }
+
         val explicitStarts = graph.nodes.count { it.nodeType() == NodeType.START }
-        if (explicitStarts > 1) {
-            warnings += "multiple START nodes detected (count=$explicitStarts)"
+        if (explicitStarts == 0) {
+            issues += "no START node detected (expected exactly one START node)"
+        } else if (explicitStarts > 1) {
+            issues += "multiple START nodes detected (count=$explicitStarts)"
         }
 
-        // --- prompts sanity ---
-        if (prompts.any { it.nodeId.isBlank() }) {
-            errors += "prompts contain blank nodeId entries"
-        }
-        val blankPromptBodies = prompts
+        val doneIds = graph.nodes
             .asSequence()
-            .filter { it.prompt.isBlank() }
-            .map { it.nodeId }
+            .filter { it.nodeType() == NodeType.DONE }
+            .map { it.id.trim() }
+            .filter { it.isNotBlank() }
             .toList()
-        if (blankPromptBodies.isNotEmpty()) {
-            errors += "prompts contain blank prompt templates for nodeIds: ${blankPromptBodies.joinToString(",")}"
+        if (doneIds.isEmpty()) {
+            issues += "no DONE node detected (expected at least one terminal node)"
         }
 
-        // --- prompts target existence check (staged ids supported) ---
-        val unknownPromptTargets = prompts
-            .asSequence()
-            .map { it.nodeId.baseNodeId() }
+        // --- prompts sanity (legacy prompts[]) ---
+        val legacyBlankTargets = prompts.map { it.nodeId }.filter { it.isBlank() }.distinct()
+        if (legacyBlankTargets.isNotEmpty()) {
+            issues += "prompts contain blank nodeId entries"
+        }
+
+        val legacyUnknownTargets = prompts
+            .map { it.nodeId.trim() }
             .filter { it.isNotBlank() }
             .filter { it !in idSet }
             .distinct()
-            .toList()
-        if (unknownPromptTargets.isNotEmpty()) {
-            errors += "prompts contain unknown nodeIds (base ids): ${unknownPromptTargets.joinToString(",")}"
+        if (legacyUnknownTargets.isNotEmpty()) {
+            issues += "prompts contain unknown nodeIds: ${legacyUnknownTargets.joinToString(",")}"
         }
 
-        // --- prompt target duplication check (base + stage) ---
-        val duplicatePromptKeys = prompts
-            .asSequence()
-            .map { p ->
-                val base = p.nodeId.baseNodeId()
-                val stage = p.nodeId.stageTokenOrNull()?.lowercase()?.trim().orEmpty()
-                if (stage.isEmpty()) base else "$base#$stage"
-            }
+        val legacyDuplicateTargets = prompts
+            .map { it.nodeId.trim() }
             .filter { it.isNotBlank() }
             .groupingBy { it }
             .eachCount()
             .filterValues { it > 1 }
             .keys
-            .toList()
-        if (duplicatePromptKeys.isNotEmpty()) {
-            errors += "multiple prompts defined for nodeIds (base+stage): ${duplicatePromptKeys.joinToString(",")}"
+        if (legacyDuplicateTargets.isNotEmpty()) {
+            issues += "multiple prompts defined for nodeIds: ${legacyDuplicateTargets.joinToString(",")}"
         }
 
-        // --- staged prompt sanity (soft) ---
-        val blankStagePrompts = prompts
-            .asSequence()
-            .map { it.nodeId }
-            .filter { it.containsStageDelimiter() }
-            .filter { it.stageTokenOrNull().isNullOrBlank() }
-            .toList()
-        if (blankStagePrompts.isNotEmpty()) {
-            warnings += "prompts contain staged nodeIds with blank stage token: ${blankStagePrompts.joinToString(",")}"
+        // --- prompts sanity (split prompts_eval/prompts_followup) ---
+        fun duplicateNodeIds(list: List<NodePrompt>, label: String) {
+            val dup = list
+                .map { it.nodeId.trim() }
+                .filter { it.isNotBlank() }
+                .groupingBy { it }
+                .eachCount()
+                .filterValues { it > 1 }
+                .keys
+            if (dup.isNotEmpty()) issues += "$label contains duplicate nodeIds: ${dup.joinToString(",")}"
         }
 
-        // --- Unknown stage prompts (soft) ---
-        val unknownStagePrompts = prompts
-            .asSequence()
-            .filter { it.containsStageDelimiter() }
-            .filter { it.stage() == PromptStage.UNKNOWN }
-            .map { it.nodeId }
-            .toList()
-        if (unknownStagePrompts.isNotEmpty()) {
-            warnings += "prompts contain unknown stage tokens: ${unknownStagePrompts.joinToString(",")}"
+        duplicateNodeIds(promptsEval, "prompts_eval")
+        duplicateNodeIds(promptsFollowup, "prompts_followup")
+
+        fun unknownNodeIds(list: List<NodePrompt>, label: String) {
+            val unk = list
+                .map { it.nodeId.trim() }
+                .filter { it.isNotBlank() }
+                .filter { it !in idSet }
+                .distinct()
+            if (unk.isNotEmpty()) issues += "$label contains unknown nodeIds: ${unk.joinToString(",")}"
         }
 
-        // --- AI nodes should have a prompt defined (any stage is acceptable) ---
-        val aiIds = graph.nodes
-            .asSequence()
-            .filter { it.nodeType() == NodeType.AI }
-            .map { it.id }
-            .filter { it.isNotBlank() }
-            .toList()
+        unknownNodeIds(promptsEval, "prompts_eval")
+        unknownNodeIds(promptsFollowup, "prompts_followup")
 
-        val promptBaseSet = prompts
-            .asSequence()
-            .map { it.nodeId.baseNodeId() }
-            .filter { it.isNotBlank() }
-            .toSet()
+        val evalMap = promptsEval.associateBy({ it.nodeId.trim() }, { it.prompt })
+        val followMap = promptsFollowup.associateBy({ it.nodeId.trim() }, { it.prompt })
 
-        val aiMissingPrompts = aiIds.filter { it !in promptBaseSet }
-        if (aiMissingPrompts.isNotEmpty()) {
-            errors += "AI nodes with no prompt defined: ${aiMissingPrompts.joinToString(",")}"
+        val allPromptIds: Set<String> = run {
+            val a = prompts.map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
+            val b = promptsEval.map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
+            val c = promptsFollowup.map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
+            a + b + c
         }
 
-        // --- nextId reference existence check + self-loop warning ---
-        graph.nodes.forEach { node ->
-            val next = node.nextId?.takeIf { it.isNotBlank() }
-            if (next != null) {
-                if (next !in idSet) {
-                    errors += "node '${node.id}' references unknown nextId='$next'"
+        var hasAnyTwoStep = false
+
+        allPromptIds.asSequence().sorted().forEach { id ->
+            val legacy = prompts.firstOrNull { it.nodeId.trim() == id }
+
+            val legacyHasOne = legacy?.isOneStep() == true
+            val legacyHasTwoAny = legacy?.isTwoStepAny() == true
+            val legacyHasTwoComplete = legacy?.isTwoStepComplete() == true
+
+            val splitEval = evalMap[id]
+            val splitFollow = followMap[id]
+            val splitHasAny = !splitEval.isNullOrBlank() || !splitFollow.isNullOrBlank()
+            val splitHasComplete = !splitEval.isNullOrBlank() && !splitFollow.isNullOrBlank()
+
+            if (legacy != null) {
+                if (!legacyHasOne && !legacyHasTwoAny) {
+                    issues += "prompt for nodeId='$id' has no prompt/eval_prompt/followup_prompt"
                 }
-                if (next == node.id) {
-                    warnings += "node '${node.id}' has self-loop nextId='${node.id}'"
+
+                if (legacyHasOne && legacyHasTwoAny) {
+                    issues += "prompt for nodeId='$id' sets both 'prompt' and (eval_prompt/followup_prompt) (ambiguous)"
+                }
+
+                if (legacyHasTwoAny && !legacyHasTwoComplete) {
+                    if (legacy.evalPrompt.isNullOrBlank() && !legacy.followupPrompt.isNullOrBlank()) {
+                        issues += "inline two-step prompt for nodeId='$id' has followup_prompt but missing eval_prompt"
+                    }
+                    if (!legacy.evalPrompt.isNullOrBlank() && legacy.followupPrompt.isNullOrBlank()) {
+                        issues += "inline two-step prompt for nodeId='$id' has eval_prompt but missing followup_prompt"
+                    }
+                }
+            }
+
+            if (splitHasAny && !splitHasComplete) {
+                if (splitEval.isNullOrBlank() && !splitFollow.isNullOrBlank()) {
+                    issues += "split two-step for nodeId='$id' has prompts_followup but missing prompts_eval"
+                }
+                if (!splitEval.isNullOrBlank() && splitFollow.isNullOrBlank()) {
+                    issues += "split two-step for nodeId='$id' has prompts_eval but missing prompts_followup"
+                }
+            }
+
+            // Disallow mixed representations for the same nodeId to avoid ambiguous runtime selection.
+            if (legacy != null && splitHasAny) {
+                issues += "nodeId='$id' uses both legacy prompts[] and split prompts_eval/prompts_followup (ambiguous)"
+            }
+
+            val isTwoStepForId = legacyHasTwoComplete || splitHasComplete
+            if (isTwoStepForId) hasAnyTwoStep = true
+        }
+
+        // If two-step prompts exist, ensure we have at least some contract to run.
+        if (hasAnyTwoStep) {
+            val hasEvalContract = !(slm.keyContractEval.isNullOrBlank() && slm.keyContract.isNullOrBlank())
+            val hasFollowContract = !(slm.keyContractFollowup.isNullOrBlank() && slm.keyContract.isNullOrBlank())
+
+            if (!hasEvalContract) issues += "two-step prompts present but missing slm.key_contract_eval (and slm.key_contract fallback is also empty)"
+            if (!hasFollowContract) issues += "two-step prompts present but missing slm.key_contract_followup (and slm.key_contract fallback is also empty)"
+
+            // Text-only follow-up sanity (best-effort heuristic).
+            val mode = slm.resolvedFollowupOutputMode()
+            if (mode == FollowupOutputMode.TEXT) {
+                val followContract = (slm.keyContractFollowup ?: slm.keyContract).orEmpty()
+                val strict = (slm.strictOutputFollowup ?: slm.strictOutput).orEmpty()
+                val hasJsonHints =
+                    followContract.contains("RAW JSON", ignoreCase = true) ||
+                            followContract.contains("JSON", ignoreCase = true) ||
+                            followContract.contains("\"followup_question\"", ignoreCase = true) ||
+                            followContract.contains("Keys", ignoreCase = true)
+                val strictHasJsonHints =
+                    strict.contains("RAW JSON", ignoreCase = true) ||
+                            strict.contains("COMPACT JSON", ignoreCase = true)
+
+                if (hasJsonHints) {
+                    issues += "followup_output_mode=TEXT but key_contract_followup appears JSON-oriented (update contract to plain text only)"
+                }
+                if (strictHasJsonHints) {
+                    issues += "followup_output_mode=TEXT but strict_output_followup/strict_output appears JSON-oriented (provide strict_output_followup for text-only)"
                 }
             }
         }
 
-        // --- Reachability check (soft rule) ---
-        val reachable = graph.reachableNodeIds()
-        val unreachable = idSet.minus(reachable)
-        if (unreachable.isNotEmpty()) {
-            warnings += "unreachable nodes from startId='${graph.startId}': ${unreachable.joinToString(",")}"
+        // Ensure every AI node has at least one usable prompt definition.
+        graph.nodes
+            .asSequence()
+            .filter { it.nodeType() == NodeType.AI }
+            .map { it.id.trim() }
+            .filter { it.isNotBlank() }
+            .forEach { id ->
+                val hasOne = resolveOneStepPrompt(id) != null
+                val hasTwo = resolveEvalPrompt(id) != null && resolveFollowupPrompt(id) != null
+                if (!hasOne && !hasTwo) {
+                    issues += "AI node '$id' has no usable prompt (one-step or complete two-step)"
+                }
+            }
+
+        // --- nextId reference existence check ---
+        graph.nodes.forEach { node ->
+            node.nextId
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { next ->
+                    if (next !in idSet) {
+                        issues += "node '${node.id}' references unknown nextId='$next'"
+                    }
+                }
         }
 
-        // --- AI node question non-empty check ---
         graph.nodes
             .asSequence()
             .filter { it.nodeType() == NodeType.AI && it.question.isBlank() }
-            .forEach {
-                errors += "AI node '${it.id}' has empty question"
-            }
+            .forEach { issues += "AI node '${it.id}' has empty question" }
 
-        // --- Choice nodes should have non-empty options ---
         graph.nodes
             .asSequence()
             .filter {
                 val t = it.nodeType()
                 t == NodeType.SINGLE_CHOICE || t == NodeType.MULTI_CHOICE
             }
-            .filter { it.options.isEmpty() }
-            .forEach {
-                errors += "Choice node '${it.id}' has empty options"
-            }
-
-        // --- QA-eval sanity (preferred) + legacy two_step sanity ---
-        val qaHas = qaEval.hasAnySetting()
-        val legacyHas = twoStep.hasAnySetting()
-
-        if (qaHas && legacyHas) {
-            warnings += "both qa_eval and two_step are specified; qa_eval takes precedence"
-        } else if (!qaHas && legacyHas) {
-            warnings += "legacy two_step is used; please migrate to qa_eval"
-        }
-
-        // Validate qa_eval if present
-        if (qaHas) {
-            qaEval.evalOkScoreThreshold?.let { th ->
-                if (th !in 1..100) {
-                    errors += "qa_eval.eval_ok_score_threshold must be in [1,100] (got $th)"
+            .forEach { node ->
+                if (node.options.isEmpty()) {
+                    issues += "Choice node '${node.id}' has empty options"
+                } else {
+                    val blankOpts = node.options.filter { it.isBlank() }.distinct()
+                    if (blankOpts.isNotEmpty()) {
+                        issues += "Choice node '${node.id}' contains blank option entries"
+                    }
                 }
             }
 
-            val parsedMode = QaEvalMeta.Mode.from(qaEval.mode)
-            if (qaEval.mode != null && parsedMode == QaEvalMeta.Mode.UNKNOWN) {
-                errors += "qa_eval.mode is unknown (got '${qaEval.mode}')"
+        graph.nodes
+            .asSequence()
+            .filter { it.nodeType() == NodeType.DONE }
+            .filter { !it.nextId.isNullOrBlank() }
+            .forEach { node ->
+                issues += "DONE node '${node.id}' should not define nextId (got nextId='${node.nextId}')"
             }
 
-            val parsedTrig = QaEvalMeta.FollowupTrigger.from(qaEval.followupTrigger)
-            if (qaEval.followupTrigger != null && parsedTrig == QaEvalMeta.FollowupTrigger.UNKNOWN) {
-                errors += "qa_eval.followup_trigger is unknown (got '${qaEval.followupTrigger}')"
+        graph.nodes
+            .asSequence()
+            .filter { it.nodeType() != NodeType.DONE && it.nodeType() != NodeType.UNKNOWN }
+            .forEach { node ->
+                val next = node.nextId?.trim().orEmpty()
+                if (next.isBlank()) {
+                    issues += "non-terminal node '${node.id}' has empty nextId"
+                }
             }
 
-            qaEval.maxTokensEval?.let { if (it <= 0) errors += "qa_eval.max_tokens_eval must be > 0 (got $it)" }
-            qaEval.maxTokensFollowup?.let { if (it <= 0) errors += "qa_eval.max_tokens_followup must be > 0 (got $it)" }
+        // --- Reachability / cycle detection (single-successor graph) ---
+        run {
+            if (startIdNorm.isBlank() || startIdNorm !in idSet) return@run
+
+            val nodeById = LinkedHashMap<String, NodeDTO>()
+            graph.nodes.forEach { n ->
+                val k = n.id.trim()
+                if (k.isNotBlank() && !nodeById.containsKey(k)) {
+                    nodeById[k] = n
+                }
+            }
+
+            val visited = LinkedHashSet<String>()
+            val queue: ArrayDeque<String> = ArrayDeque()
+            queue.add(startIdNorm)
+
+            while (queue.isNotEmpty()) {
+                val cur = queue.removeFirst()
+                if (!visited.add(cur)) continue
+                val node = nodeById[cur] ?: continue
+                val next = node.nextId?.trim()?.takeIf { it.isNotBlank() }
+                if (next != null && next in idSet) queue.add(next)
+            }
+
+            val unreachable = idSet - visited
+            if (unreachable.isNotEmpty()) {
+                issues += "unreachable nodes from startId='$startIdNorm': ${unreachable.ellipsisJoin()}"
+            }
+
+            if (doneIds.isNotEmpty()) {
+                val reachableDone = doneIds.any { it in visited }
+                if (!reachableDone) {
+                    issues += "no DONE node is reachable from startId='$startIdNorm' (reachable=${visited.size}, total=${idSet.size})"
+                }
+            }
+
+            run {
+                val seen = HashSet<String>()
+                var cur: String? = startIdNorm
+                var cycle = false
+                while (cur != null && cur in idSet) {
+                    if (!seen.add(cur)) {
+                        cycle = true
+                        break
+                    }
+                    val n = nodeById[cur]
+                    cur = n?.nextId?.trim()?.takeIf { it.isNotBlank() }
+                }
+                if (cycle) {
+                    issues += "cycle detected in nextId chain starting from startId='$startIdNorm'"
+                }
+            }
         }
 
-        // Validate legacy two_step thresholds if present
-        twoStep.evalOkScoreThreshold?.let { th ->
-            if (th !in 1..100) {
-                errors += "two_step.eval_ok_score_threshold must be in [1,100] (got $th)"
-            }
-        }
-
-        // --- SLM param sanity (optional, only if given) ---
+        // --- SLM param sanity ---
         slm.accelerator?.let { acc ->
             val a = acc.trim().uppercase()
-            if (a != "CPU" && a != "GPU") {
-                errors += "slm.accelerator should be 'CPU' or 'GPU' (got '$acc')"
-            }
+            if (a != "CPU" && a != "GPU") issues += "slm.accelerator should be 'CPU' or 'GPU' (got '$acc')"
         }
-        slm.maxTokens?.let { if (it <= 0) errors += "slm.max_tokens must be > 0 (got $it)" }
-        slm.topK?.let { if (it < 0) errors += "slm.top_k must be >= 0 (got $it)" }
-        slm.topP?.let { if (it !in 0.0..1.0) errors += "slm.top_p must be in [0.0,1.0] (got $it)" }
-        slm.temperature?.let { if (it < 0.0) errors += "slm.temperature must be >= 0.0 (got $it)" }
-        slm.repetitionPenalty?.let { if (it <= 0.0) errors += "slm.repetition_penalty must be > 0.0 (got $it)" }
+        slm.maxTokens?.let { if (it <= 0) issues += "slm.max_tokens must be > 0 (got $it)" }
+        slm.topK?.let { if (it <= 0) issues += "slm.top_k must be >= 1 (got $it)" }
+        slm.topP?.let { if (it !in 0.0..1.0) issues += "slm.top_p must be in [0.0,1.0] (got $it)" }
+        slm.temperature?.let { if (it !in 0.0..2.0) issues += "slm.temperature must be in [0.0,2.0] (got $it)" }
 
-        // --- Whisper param sanity (optional, only if given) ---
-        whisper.assetModelPath?.let { if (it.isBlank()) errors += "whisper.asset_model_path is blank" }
+        // --- Whisper sanity ---
+        whisper.assetModelPath?.let { if (it.isBlank()) issues += "whisper.asset_model_path is blank" }
         whisper.language?.let { lang ->
             val norm = lang.trim().lowercase()
             if (norm !in setOf("auto", "en", "ja", "sw")) {
-                errors += "whisper.language should be one of 'auto','en','ja','sw' (got '$lang')"
+                issues += "whisper.language should be one of 'auto','en','ja','sw' (got '$lang')"
             }
         }
-        whisper.targetSampleRate?.let { if (it <= 0) errors += "whisper.target_sample_rate must be > 0 (got $it)" }
+        whisper.targetSampleRate?.let { if (it <= 0) issues += "whisper.target_sample_rate must be > 0 (got $it)" }
         whisper.recordSampleRates?.let { rs ->
             if (rs.isEmpty()) {
-                errors += "whisper.record_sample_rates is empty"
+                issues += "whisper.record_sample_rates is empty"
             } else {
                 val bad = rs.filter { it <= 0 }.distinct()
-                if (bad.isNotEmpty()) {
-                    errors += "whisper.record_sample_rates contains non-positive entries: ${bad.joinToString(",")}"
-                }
+                if (bad.isNotEmpty()) issues += "whisper.record_sample_rates contains non-positive entries: ${bad.joinToString(",")}"
             }
         }
 
-        // --- Model defaults sanity (optional, only if given) ---
-        modelDefaults.defaultModelUrl?.let { if (it.isBlank()) errors += "model_defaults.default_model_url is blank" }
-        modelDefaults.defaultFileName?.let { if (it.isBlank()) errors += "model_defaults.default_file_name is blank" }
-        modelDefaults.timeoutMs?.let { if (it <= 0L) errors += "model_defaults.timeout_ms must be > 0 (got $it)" }
-        modelDefaults.uiThrottleMs?.let { if (it < 0L) errors += "model_defaults.ui_throttle_ms must be >= 0 (got $it)" }
-        modelDefaults.uiMinDeltaBytes?.let { if (it < 0L) errors += "model_defaults.ui_min_delta_bytes must be >= 0 (got $it)" }
+        // --- Model defaults sanity ---
+        modelDefaults.modelName?.let { if (it.isBlank()) issues += "model_defaults.model_name is blank" }
+        modelDefaults.defaultModelUrl?.let { if (it.isBlank()) issues += "model_defaults.default_model_url is blank" }
+        modelDefaults.defaultFileName?.let { if (it.isBlank()) issues += "model_defaults.default_file_name is blank" }
+        modelDefaults.timeoutMs?.let { if (it <= 0L) issues += "model_defaults.timeout_ms must be > 0 (got $it)" }
+        modelDefaults.uiThrottleMs?.let { if (it < 0L) issues += "model_defaults.ui_throttle_ms must be >= 0 (got $it)" }
+        modelDefaults.uiMinDeltaBytes?.let { if (it < 0L) issues += "model_defaults.ui_min_delta_bytes must be >= 0 (got $it)" }
 
-        return ValidationResult(errors = errors, warnings = warnings)
+        return issues
     }
 
     /**
-     * Validate and return a flat list.
-     *
-     * - Errors are listed first
-     * - Warnings are prefixed with "WARN:"
-     */
-    fun validate(): List<String> {
-        val r = validateDetailed()
-        return buildList {
-            addAll(r.errors)
-            addAll(r.warnings.map { "WARN: $it" })
-        }
-    }
-
-    /**
-     * Validate and throw an [IllegalArgumentException] if errors are found.
-     *
-     * Warnings are logged but do not throw.
+     * Throw when validation fails.
      */
     fun requireValid() {
-        val r = validateDetailed()
-        if (r.warnings.isNotEmpty()) {
-            Log.w("SurveyConfig", "Validation warnings:\n- " + r.warnings.joinToString("\n- "))
-        }
-        require(r.errors.isEmpty()) {
-            "SurveyConfig validation failed:\n- " + r.errors.joinToString("\n- ")
+        val issues = validate()
+        require(issues.isEmpty()) {
+            "SurveyConfig validation failed:\n- " + issues.joinToString("\n- ")
         }
     }
 
-    // ---------------------------------------------------------------------
-    // QA-Eval metadata (preferred) + Legacy Two-step metadata (compat)
-    // ---------------------------------------------------------------------
-
-    /**
-     * QA evaluation flow configuration (preferred).
-     *
-     * This is a superset of the legacy two_step config.
-     */
-    @Serializable
-    data class QaEvalMeta(
-        @SerialName("enabled") val enabled: Boolean? = null,
-        @SerialName("mode") val mode: String? = null,
-        @SerialName("followup_trigger") val followupTrigger: String? = null,
-        @SerialName("eval_ok_score_threshold") val evalOkScoreThreshold: Int? = null,
-        @SerialName("skip_followup_when_ok") val skipFollowupWhenOk: Boolean? = null,
-        @SerialName("fallback_to_inline_followup") val fallbackToInlineFollowup: Boolean? = null,
-        @SerialName("max_tokens_eval") val maxTokensEval: Int? = null,
-        @SerialName("max_tokens_followup") val maxTokensFollowup: Int? = null
-    ) {
-
-        /** Workflow mode. */
-        enum class Mode {
-            ONE_CALL,
-            TWO_CALL,
-            UNKNOWN;
-
-            companion object {
-                /** Parse mode from raw text (tolerant). */
-                fun from(raw: String?): Mode {
-                    val t = raw?.trim()?.lowercase().orEmpty()
-                    return when (t) {
-                        "one_call", "onecall", "one-call", "1call", "1_call", "single_call" -> ONE_CALL
-                        "two_call", "twocall", "two-call", "2call", "2_call", "double_call" -> TWO_CALL
-                        "" -> UNKNOWN
-                        else -> UNKNOWN
-                    }
-                }
-            }
-        }
-
-        /** Follow-up triggering policy. */
-        enum class FollowupTrigger {
-            NEEDS_FOLLOWUP,
-            SCORE_BELOW_THRESHOLD,
-            EITHER,
-            UNKNOWN;
-
-            companion object {
-                /** Parse trigger from raw text (tolerant). */
-                fun from(raw: String?): FollowupTrigger {
-                    val t = raw?.trim()?.lowercase().orEmpty()
-                    return when (t) {
-                        "needs_followup", "needsfollowup", "needs", "missing" -> NEEDS_FOLLOWUP
-                        "score_below_threshold", "scorebelowthreshold", "score_below", "score" -> SCORE_BELOW_THRESHOLD
-                        "either", "any" -> EITHER
-                        "" -> UNKNOWN
-                        else -> UNKNOWN
-                    }
-                }
-            }
-        }
-
-        /**
-         * Resolved, strongly typed QA-eval settings for runtime.
-         */
-        data class Resolved(
-            val enabled: Boolean,
-            val mode: Mode,
-            val followupTrigger: FollowupTrigger,
-            val evalOkScoreThreshold: Int,
-            val skipFollowupWhenOk: Boolean,
-            val fallbackToInlineFollowup: Boolean,
-            val maxTokensEval: Int,
-            val maxTokensFollowup: Int,
-            val source: String
-        )
-
-        /** True if any QA-eval field is explicitly provided. */
-        fun hasAnySetting(): Boolean =
-            enabled != null ||
-                    !mode.isNullOrBlank() ||
-                    !followupTrigger.isNullOrBlank() ||
-                    evalOkScoreThreshold != null ||
-                    skipFollowupWhenOk != null ||
-                    fallbackToInlineFollowup != null ||
-                    maxTokensEval != null ||
-                    maxTokensFollowup != null
-
-        /** Resolve enabled with a default. */
-        fun enabledOr(defaultValue: Boolean = false): Boolean = enabled ?: defaultValue
-
-        /** Resolve eval_ok_score_threshold with a default. */
-        fun okScoreThresholdOr(defaultValue: Int = 85): Int = evalOkScoreThreshold ?: defaultValue
-
-        /** Resolve skip_followup_when_ok with a default. */
-        fun skipFollowupWhenOkOr(defaultValue: Boolean = true): Boolean = skipFollowupWhenOk ?: defaultValue
-
-        /** Resolve fallback_to_inline_followup with a default. */
-        fun fallbackToInlineFollowupOr(defaultValue: Boolean = true): Boolean = fallbackToInlineFollowup ?: defaultValue
-
-        /** Resolve max_tokens_eval with a default. */
-        fun maxTokensEvalOr(defaultValue: Int = 512): Int = maxTokensEval ?: defaultValue
-
-        /** Resolve max_tokens_followup with a default. */
-        fun maxTokensFollowupOr(defaultValue: Int = 128): Int = maxTokensFollowup ?: defaultValue
-
-        /** Resolve mode with a default. */
-        fun modeOr(defaultValue: Mode = Mode.ONE_CALL): Mode {
-            val parsed = Mode.from(mode)
-            return if (parsed == Mode.UNKNOWN) defaultValue else parsed
-        }
-
-        /** Resolve followup_trigger with a default. */
-        fun followupTriggerOr(defaultValue: FollowupTrigger = FollowupTrigger.NEEDS_FOLLOWUP): FollowupTrigger {
-            val parsed = FollowupTrigger.from(followupTrigger)
-            return if (parsed == FollowupTrigger.UNKNOWN) defaultValue else parsed
-        }
-
-        companion object {
-            /**
-             * Resolve QA-eval settings using:
-             * - qa_eval (preferred) when any field is set
-             * - otherwise fallback to legacy two_step
-             */
-            fun resolve(primary: QaEvalMeta, legacy: TwoStepMeta): Resolved {
-                val primaryHas = primary.hasAnySetting()
-                val legacyHas = legacy.hasAnySetting()
-
-                val src = when {
-                    primaryHas -> "qa_eval"
-                    legacyHas -> "two_step"
-                    else -> "defaults"
-                }
-
-                val enabled = when {
-                    primary.enabled != null -> primary.enabled
-                    legacy.enabled != null -> legacy.enabled
-                    else -> false
-                } ?: false
-
-                val evalTh = when {
-                    primary.evalOkScoreThreshold != null -> primary.evalOkScoreThreshold
-                    legacy.evalOkScoreThreshold != null -> legacy.evalOkScoreThreshold
-                    else -> 85
-                } ?: 85
-
-                val skipFu = when {
-                    primary.skipFollowupWhenOk != null -> primary.skipFollowupWhenOk
-                    legacy.skipFollowupWhenOk != null -> legacy.skipFollowupWhenOk
-                    else -> true
-                } ?: true
-
-                val mode = primary.modeOr(defaultValue = Mode.ONE_CALL)
-                val trigger = primary.followupTriggerOr(defaultValue = FollowupTrigger.NEEDS_FOLLOWUP)
-
-                val fallbackInline = primary.fallbackToInlineFollowupOr(defaultValue = true)
-                val maxEval = primary.maxTokensEvalOr(defaultValue = 512)
-                val maxFu = primary.maxTokensFollowupOr(defaultValue = 128)
-
-                return Resolved(
-                    enabled = enabled,
-                    mode = mode,
-                    followupTrigger = trigger,
-                    evalOkScoreThreshold = evalTh,
-                    skipFollowupWhenOk = skipFu,
-                    fallbackToInlineFollowup = fallbackInline,
-                    maxTokensEval = maxEval,
-                    maxTokensFollowup = maxFu,
-                    source = src
-                )
-            }
-        }
+    private fun Collection<String>.ellipsisJoin(limit: Int = 32): String {
+        val sorted = this.asSequence().map { it.trim() }.filter { it.isNotBlank() }.distinct().sorted().toList()
+        if (sorted.size <= limit) return sorted.joinToString(",")
+        val head = sorted.take(limit).joinToString(",")
+        return "$head,...(+${sorted.size - limit})"
     }
-
-    /**
-     * Legacy two-step SLM flow configuration.
-     *
-     * NOTE:
-     * - This remains supported for backward compatibility.
-     * - Prefer using `qa_eval` going forward.
-     */
-    @Serializable
-    data class TwoStepMeta(
-        @SerialName("enabled") val enabled: Boolean? = null,
-        @SerialName("eval_ok_score_threshold") val evalOkScoreThreshold: Int? = null,
-        @SerialName("skip_followup_when_ok") val skipFollowupWhenOk: Boolean? = null
-    ) {
-        /** True if any legacy field is explicitly provided. */
-        fun hasAnySetting(): Boolean =
-            enabled != null ||
-                    evalOkScoreThreshold != null ||
-                    skipFollowupWhenOk != null
-
-        /** Resolve enabled with a default. */
-        fun enabledOr(defaultValue: Boolean = false): Boolean = enabled ?: defaultValue
-
-        /** Resolve eval_ok_score_threshold with a default. */
-        fun okScoreThresholdOr(defaultValue: Int = 85): Int = evalOkScoreThreshold ?: defaultValue
-
-        /** Resolve skip_followup_when_ok with a default. */
-        fun skipFollowupWhenOkOr(defaultValue: Boolean = true): Boolean = skipFollowupWhenOk ?: defaultValue
-    }
-
-    /**
-     * Resolve effective QA-eval settings for runtime.
-     *
-     * Priority:
-     * - qa_eval (if any field is explicitly provided)
-     * - else two_step (legacy)
-     * - else defaults
-     */
-    fun resolveQaEval(): QaEvalMeta.Resolved = QaEvalMeta.resolve(qaEval, twoStep)
-
-    // ---------------------------------------------------------------------
-    // SLM metadata
-    // ---------------------------------------------------------------------
-
-    /**
-     * SLM runtime parameters and system-prompt metadata.
-     *
-     * All fields are optional. Snake_case field names have explicit [SerialName]
-     * annotations to keep YAML/JSON key resolution stable.
-     */
-    @Serializable
-    data class SlmMeta(
-        /** Preferred accelerator type, "CPU" or "GPU". */
-        @SerialName("accelerator") val accelerator: String? = null,
-
-        /**
-         * Maximum number of tokens for the backend.
-         *
-         * Note: On some backends, this may represent (input + output) tokens.
-         */
-        @SerialName("max_tokens") val maxTokens: Int? = null,
-
-        /** Top-k sampling parameter. */
-        @SerialName("top_k") val topK: Int? = null,
-
-        /** Top-p (nucleus) sampling parameter. */
-        @SerialName("top_p") val topP: Double? = null,
-
-        /** Temperature parameter for sampling. */
-        @SerialName("temperature") val temperature: Double? = null,
-
-        /** Repetition penalty, if supported by the backend. */
-        @SerialName("repetition_penalty") val repetitionPenalty: Double? = null,
-
-        /** Optional stop sequences, if supported by the backend. */
-        @SerialName("stop_sequences") val stopSequences: List<String>? = null,
-
-        /** Prefix prepended before user turns, if any. */
-        @SerialName("user_turn_prefix") val user_turn_prefix: String? = null,
-
-        /** Prefix prepended before model turns, if any. */
-        @SerialName("model_turn_prefix") val model_turn_prefix: String? = null,
-
-        /** Token that marks the end of a turn. */
-        @SerialName("turn_end") val turn_end: String? = null,
-
-        /** Instruction describing what to output for empty JSON. */
-        @SerialName("empty_json_instruction") val empty_json_instruction: String? = null,
-
-        /** Global preamble text for the system prompt. */
-        @SerialName("preamble") val preamble: String? = null,
-
-        /** Contract that describes model behavior and scope (legacy single-step). */
-        @SerialName("key_contract") val key_contract: String? = null,
-
-        /** Narrative about the allowed length for answers (legacy single-step). */
-        @SerialName("length_budget") val length_budget: String? = null,
-
-        /** Description of how scoring should work. */
-        @SerialName("scoring_rule") val scoring_rule: String? = null,
-
-        /** Extra constraints to enforce strict output formats (legacy single-step). */
-        @SerialName("strict_output") val strict_output: String? = null,
-
-        /** Contract for the EVAL step (strict JSON output, gating keys, etc.). */
-        @SerialName("eval_key_contract") val eval_key_contract: String? = null,
-
-        /** Length constraints for the EVAL step. */
-        @SerialName("eval_length_budget") val eval_length_budget: String? = null,
-
-        /** Strict-output constraints for the EVAL step. */
-        @SerialName("eval_strict_output") val eval_strict_output: String? = null,
-
-        /** Contract for the follow-up step (e.g., plain text, single sentence). */
-        @SerialName("followup_contract") val followup_contract: String? = null
-    ) {
-        /** Convenience alias (camelCase) for call sites. */
-        val userTurnPrefix: String? get() = user_turn_prefix
-
-        /** Convenience alias (camelCase) for call sites. */
-        val modelTurnPrefix: String? get() = model_turn_prefix
-
-        /** Convenience alias (camelCase) for call sites. */
-        val turnEnd: String? get() = turn_end
-
-        /** Convenience alias (camelCase) for call sites. */
-        val emptyJsonInstruction: String? get() = empty_json_instruction
-
-        /** Convenience alias (camelCase) for call sites. */
-        val keyContract: String? get() = key_contract
-
-        /** Convenience alias (camelCase) for call sites. */
-        val lengthBudget: String? get() = length_budget
-
-        /** Convenience alias (camelCase) for call sites. */
-        val scoringRule: String? get() = scoring_rule
-
-        /** Convenience alias (camelCase) for call sites. */
-        val strictOutput: String? get() = strict_output
-
-        /** Convenience alias (camelCase) for call sites. */
-        val evalKeyContract: String? get() = eval_key_contract
-
-        /** Convenience alias (camelCase) for call sites. */
-        val evalLengthBudget: String? get() = eval_length_budget
-
-        /** Convenience alias (camelCase) for call sites. */
-        val evalStrictOutput: String? get() = eval_strict_output
-
-        /** Convenience alias (camelCase) for call sites. */
-        val followupContract: String? get() = followup_contract
-    }
-
-    // ---------------------------------------------------------------------
-    // Whisper metadata
-    // ---------------------------------------------------------------------
-
-    /**
-     * Whisper runtime parameters used by on-device speech input.
-     */
-    @Serializable
-    data class WhisperMeta(
-        /** Enable or disable Whisper voice features at runtime. */
-        @SerialName("enabled") val enabled: Boolean? = null,
-
-        /** Asset path like "models/ggml-small-q5_1.bin". */
-        @SerialName("asset_model_path") val assetModelPath: String? = null,
-
-        /** "auto", "en", "ja", "sw". */
-        @SerialName("language") val language: String? = null,
-
-        /** If true, run Whisper in translation-to-English mode. */
-        @SerialName("translate") val translate: Boolean? = null,
-
-        /** If true, include timestamps in transcription output. */
-        @SerialName("print_timestamp") val printTimestamp: Boolean? = null,
-
-        /** Decoder target sample rate (e.g., 16000). */
-        @SerialName("target_sample_rate") val targetSampleRate: Int? = null,
-
-        /** Recorder preferred sample rates. */
-        @SerialName("record_sample_rates") val recordSampleRates: List<Int>? = null,
-
-        /** Whether to compute SHA-256 for exported WAV. */
-        @SerialName("compute_checksum") val computeChecksum: Boolean? = null
-    )
-
-    // ---------------------------------------------------------------------
-    // Model defaults (download/UI level)
-    // ---------------------------------------------------------------------
-
-    /**
-     * Model download and UI default settings.
-     */
-    @Serializable
-    data class ModelDefaults(
-        /** Default model URL for the download UI. */
-        @SerialName("default_model_url") val defaultModelUrl: String? = null,
-
-        /** Default file name to use when saving the model locally. */
-        @SerialName("default_file_name") val defaultFileName: String? = null,
-
-        /** Optional timeout override for model loading/inference, in milliseconds. */
-        @SerialName("timeout_ms") val timeoutMs: Long? = null,
-
-        /** Optional UI throttling interval for streaming updates, in milliseconds. */
-        @SerialName("ui_throttle_ms") val uiThrottleMs: Long? = null,
-
-        /** Optional minimum number of streamed bytes before pushing a UI update. */
-        @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
-    )
-
-    // ---------------------------------------------------------------------
-    // Prompt lookup helpers
-    // ---------------------------------------------------------------------
-
-    /**
-     * Find the best matching prompt for [nodeId] and [stage].
-     *
-     * Resolution:
-     *  1) stage-specific prompt (base id matches and stage matches)
-     *  2) base prompt (base id matches and stage == BASE)
-     *  3) null
-     */
-    fun findPrompt(nodeId: String, stage: PromptStage = PromptStage.BASE): Prompt? {
-        val base = nodeId.baseNodeId()
-        val stageHit = prompts.firstOrNull { it.baseNodeId() == base && it.stage() == stage }
-        if (stageHit != null) return stageHit
-        return prompts.firstOrNull { it.baseNodeId() == base && it.stage() == PromptStage.BASE }
-    }
-
-    /** Find the prompt template string for [nodeId] and [stage]. */
-    fun findPromptText(nodeId: String, stage: PromptStage = PromptStage.BASE): String? =
-        findPrompt(nodeId, stage)?.prompt
-
-    // ---------------------------------------------------------------------
-    // Prompt composition helpers
-    // ---------------------------------------------------------------------
-
-    /**
-     * Compose a single system prompt string from the legacy SLM metadata fields.
-     */
-    fun composeSystemPrompt(): String {
-        val parts = listOf(
-            slm.preamble,
-            slm.key_contract,
-            slm.length_budget,
-            slm.scoring_rule,
-            slm.strict_output,
-            slm.empty_json_instruction
-        ).filterNot { it.isNullOrBlank() }
-            .map { it!!.trim() }
-
-        return parts.joinToString("\n")
-    }
-
-    /**
-     * Compose a system prompt string for the EVAL step (QA-eval).
-     */
-    fun composeEvalSystemPrompt(): String {
-        val parts = listOf(
-            slm.preamble,
-            slm.eval_key_contract ?: slm.key_contract,
-            slm.eval_length_budget ?: slm.length_budget,
-            slm.scoring_rule,
-            slm.eval_strict_output ?: slm.strict_output,
-            slm.empty_json_instruction
-        ).filterNot { it.isNullOrBlank() }
-            .map { it!!.trim() }
-
-        return parts.joinToString("\n")
-    }
-
-    /**
-     * Compose a system prompt string for the Follow-up step (QA-eval).
-     */
-    fun composeFollowupSystemPrompt(): String {
-        val parts = listOf(
-            slm.preamble,
-            slm.followup_contract
-        ).filterNot { it.isNullOrBlank() }
-            .map { it!!.trim() }
-
-        return parts.joinToString("\n")
-    }
-
-    /**
-     * Compute reachable node ids from [graph.startId] following nextId pointers.
-     *
-     * This graph model currently supports a single linear successor ([NodeDTO.nextId]).
-     * Branching should be represented at a higher layer, or by extending NodeDTO.
-     */
-    private fun Graph.reachableNodeIds(): Set<String> {
-        val byId = nodes.associateBy { it.id }
-        val visited = linkedSetOf<String>()
-
-        var current = startId
-        while (current.isNotBlank() && current !in visited) {
-            visited += current
-            val n = byId[current] ?: break
-            val next = n.nextId?.trim().orEmpty()
-            if (next.isBlank()) break
-            current = next
-        }
-        return visited
-    }
-
-    /**
-     * Export the prompt table as JSON Lines.
-     *
-     * Each list element is a single JSON-encoded [Prompt] record.
-     */
-    fun toJsonl(): List<String> =
-        SurveyConfigLoader.jsonCompact.let { json ->
-            prompts.map { json.encodeToString(PromptSerializer, it) }
-        }
-
-    /**
-     * Serialize the full configuration as JSON.
-     *
-     * @param pretty If true, pretty-print the JSON; otherwise use a compact form.
-     */
-    fun toJson(pretty: Boolean = true): String =
-        (if (pretty) SurveyConfigLoader.jsonPretty else SurveyConfigLoader.jsonCompact)
-            .encodeToString(serializer(), this)
-
-    /**
-     * Serialize the full configuration as YAML.
-     *
-     * @param strict When true, the encoder uses strict mode for YAML.
-     */
-    fun toYaml(strict: Boolean = false): String =
-        SurveyConfigLoader.yaml(strict).encodeToString(serializer(), this)
 }
 
-/** Backward-compatible alias for [SurveyConfig.Prompt]. */
 typealias PromptEntry = SurveyConfig.Prompt
-
-/** Backward-compatible alias for [SurveyConfig.Graph]. */
 typealias GraphConfig = SurveyConfig.Graph
+typealias NodePromptEntry = SurveyConfig.NodePrompt
 
 /**
- * Raw graph node as it is stored in the configuration file.
- *
- * Notes:
- * - Supports nextId and next_id in configs via custom serializer.
+ * Node DTO as loaded from config.
  */
-@Serializable(with = NodeDTOSerializer::class)
+@Serializable
 data class NodeDTO(
-    val id: String,
-    val type: String,
+    val id: String = "",
+    val type: String = "",
     val title: String = "",
     val question: String = "",
     val options: List<String> = emptyList(),
     val nextId: String? = null
 ) {
-    /** Interpret the [type] string as a [NodeType] enum value. */
     fun nodeType(): NodeType = NodeType.from(type)
 }
 
 /**
- * Node type enumeration used at the configuration layer.
+ * Node types used by configuration layer.
  */
 enum class NodeType {
     START,
@@ -1036,13 +970,6 @@ enum class NodeType {
     UNKNOWN;
 
     companion object {
-        /**
-         * Convert a raw string into a [NodeType] enum value.
-         *
-         * Tolerant parsing:
-         * - case-insensitive
-         * - accepts snake_case, kebab-case, and compact/camel-like forms
-         */
         fun from(raw: String?): NodeType {
             val norm = raw
                 ?.trim()
@@ -1053,13 +980,8 @@ enum class NodeType {
             return when (norm) {
                 "START" -> START
                 "TEXT" -> TEXT
-
-                "SINGLE_CHOICE", "SINGLECHOICE", "SINGLE_OPTION", "RADIO" ->
-                    SINGLE_CHOICE
-
-                "MULTI_CHOICE", "MULTICHOICE", "MULTI_OPTION", "CHECKBOX" ->
-                    MULTI_CHOICE
-
+                "SINGLE_CHOICE", "SINGLECHOICE", "SINGLE_OPTION", "RADIO" -> SINGLE_CHOICE
+                "MULTI_CHOICE", "MULTICHOICE", "MULTI_OPTION", "CHECKBOX" -> MULTI_CHOICE
                 "AI", "LLM", "SLM" -> AI
                 "REVIEW" -> REVIEW
                 "DONE", "FINISH", "FINAL" -> DONE
@@ -1069,39 +991,68 @@ enum class NodeType {
     }
 }
 
-/**
- * Supported configuration formats for serialization and deserialization.
- */
-enum class ConfigFormat {
-    JSON,
-    YAML,
-    AUTO
-}
+enum class ConfigFormat { JSON, YAML, AUTO }
 
 /**
- * Loader and writer utilities for [SurveyConfig].
+ * Loader/encoder for SurveyConfig.
  */
 object SurveyConfigLoader {
 
-    /** Compact JSON instance used for reading and minimal writing. */
+    // Runtime-togglable debug flags (do not use const to allow switching without rebuild).
+    @Volatile private var debugFormat: Boolean = false
+    @Volatile private var debugValidate: Boolean = false
+    @Volatile private var debugPrompts: Boolean = false
+    @Volatile private var debugDumpSystemPrompts: Boolean = false
+
+    /**
+     * Enable or disable loader debug flags at runtime.
+     */
+    fun setDebug(
+        format: Boolean? = null,
+        validate: Boolean? = null,
+        prompts: Boolean? = null,
+        dumpSystemPrompts: Boolean? = null
+    ) {
+        format?.let { debugFormat = it }
+        validate?.let { debugValidate = it }
+        prompts?.let { debugPrompts = it }
+        dumpSystemPrompts?.let { debugDumpSystemPrompts = it }
+    }
+
+    internal data class FormatDecision(
+        val format: ConfigFormat,
+        val reason: String,
+        val firstMeaningfulLine: String,
+        val leadingChars: String
+    ) {
+        fun debugString(): String {
+            fun safeInline(s: String, max: Int): String {
+                val t = s.replace("\n", "\\n").replace("\r", "\\r")
+                return if (t.length <= max) t else t.take(max) + "..."
+            }
+            val first = safeInline(firstMeaningfulLine, 180)
+            val lead = safeInline(leadingChars, 32)
+            return "format=${format.name}, reason=$reason, firstLine='$first', leading='$lead'"
+        }
+    }
+
     internal val jsonCompact: Json = Json {
         ignoreUnknownKeys = true
         prettyPrint = false
         isLenient = true
-        coerceInputValues = true
         explicitNulls = false
     }
 
-    /** Pretty-printing JSON instance used for human-friendly output. */
     internal val jsonPretty: Json = Json {
         ignoreUnknownKeys = true
         prettyPrint = true
         isLenient = true
-        coerceInputValues = true
         explicitNulls = false
     }
 
-    /** Create a YAML serializer with a given strictness. */
+    private val yamlLenient: Yaml by lazy { yaml(strict = false) }
+    private val yamlStrict: Yaml by lazy { yaml(strict = true) }
+
     internal fun yaml(strict: Boolean = false): Yaml =
         Yaml(
             configuration = YamlConfiguration(
@@ -1110,7 +1061,6 @@ object SurveyConfigLoader {
             )
         )
 
-    /** Load [SurveyConfig] from an asset file. */
     fun fromAssets(
         context: Context,
         fileName: String,
@@ -1129,16 +1079,23 @@ object SurveyConfigLoader {
             )
         }
 
-    /** Load [SurveyConfig] from an asset file and validate immediately. */
     fun fromAssetsValidated(
         context: Context,
         fileName: String,
         charset: Charset = Charsets.UTF_8,
         format: ConfigFormat = ConfigFormat.AUTO
     ): SurveyConfig =
-        fromAssets(context, fileName, charset, format).also { it.requireValid() }
+        fromAssets(context, fileName, charset, format).also {
+            if (debugPrompts) Log.d(TAG, "Loaded config (assets/$fileName): ${it.debugSummary()}")
+            if (debugValidate) {
+                val issues = it.validate()
+                Log.d(TAG, "fromAssetsValidated -> issues=${issues.size} (${it.debugSummary()})")
+                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
+            }
+            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
+            it.requireValid()
+        }
 
-    /** Load [SurveyConfig] from a regular file on disk. */
     fun fromFile(
         path: String,
         charset: Charset = Charsets.UTF_8,
@@ -1158,344 +1115,206 @@ object SurveyConfigLoader {
             )
         }
 
-    /** Load [SurveyConfig] from a file and validate immediately. */
     fun fromFileValidated(
         path: String,
         charset: Charset = Charsets.UTF_8,
         format: ConfigFormat = ConfigFormat.AUTO
     ): SurveyConfig =
-        fromFile(path, charset, format).also { it.requireValid() }
+        fromFile(path, charset, format).also {
+            if (debugPrompts) Log.d(TAG, "Loaded config (file/$path): ${it.debugSummary()}")
+            if (debugValidate) {
+                val issues = it.validate()
+                Log.d(TAG, "fromFileValidated -> issues=${issues.size} (${it.debugSummary()})")
+                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
+            }
+            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
+            it.requireValid()
+        }
 
-    /**
-     * Parse [SurveyConfig] from a raw string.
-     */
+    fun toFile(
+        config: SurveyConfig,
+        path: String,
+        charset: Charset = Charsets.UTF_8,
+        format: ConfigFormat = ConfigFormat.AUTO,
+        prettyJson: Boolean = true,
+        strictYaml: Boolean = false
+    ) {
+        val file = File(path)
+        file.parentFile?.mkdirs()
+
+        val chosen = when (format) {
+            ConfigFormat.JSON -> ConfigFormat.JSON
+            ConfigFormat.YAML -> ConfigFormat.YAML
+            ConfigFormat.AUTO -> {
+                val lower = file.name.lowercase()
+                when {
+                    lower.endsWith(".yaml") || lower.endsWith(".yml") -> ConfigFormat.YAML
+                    else -> ConfigFormat.JSON
+                }
+            }
+        }
+
+        val text = when (chosen) {
+            ConfigFormat.JSON -> config.toJson(pretty = prettyJson)
+            ConfigFormat.YAML -> config.toYaml(strict = strictYaml)
+            ConfigFormat.AUTO -> error("AUTO should have been resolved before encoding; this is a bug.")
+        }
+
+        file.writeText(text, charset)
+    }
+
     fun fromString(
         text: String,
         format: ConfigFormat = ConfigFormat.AUTO,
         fileNameHint: String? = null
     ): SurveyConfig {
-        val sanitized = text.normalize()
-        val chosen = pickFormat(desired = format, fileName = fileNameHint, text = sanitized)
+        val sanitized = text.normalizeText()
+        val decision = decideFormat(desired = format, fileName = fileNameHint, text = sanitized)
 
-        return try {
-            val cfg = when (chosen) {
-                ConfigFormat.JSON ->
-                    jsonCompact.decodeFromString(SurveyConfig.serializer(), sanitized)
+        if (debugFormat) {
+            Log.d(TAG, "fromString -> ${decision.debugString()} file='${fileNameHint.orEmpty()}'")
+        }
 
-                ConfigFormat.YAML ->
-                    yaml(strict = false).decodeFromString(SurveyConfig.serializer(), sanitized)
-
-                ConfigFormat.AUTO ->
-                    error("AUTO should have been resolved before decoding; this is a bug.")
+        val cfg = try {
+            when (decision.format) {
+                ConfigFormat.JSON -> jsonCompact.decodeFromString(SurveyConfig.serializer(), sanitized)
+                ConfigFormat.YAML -> yamlLenient.decodeFromString(SurveyConfig.serializer(), sanitized)
+                ConfigFormat.AUTO -> error("AUTO should have been resolved before decoding; this is a bug.")
             }
-
-            // Optional debug: warn if legacy two_step is used without qa_eval.
-            val qaResolved = cfg.resolveQaEval()
-            if (qaResolved.source == "two_step") {
-                Log.w("SurveyConfigLoader", "Loaded legacy two_step config; please migrate to qa_eval.")
-            } else if (qaResolved.source == "qa_eval") {
-                Log.d("SurveyConfigLoader", "Loaded qa_eval config (mode=${qaResolved.mode}, trigger=${qaResolved.followupTrigger}).")
-            }
-
-            cfg
         } catch (ex: SerializationException) {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
-                "Parsing error (format=${chosen.name}). First 200 chars: $preview :: ${ex.message}",
+                "Parsing error (${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
+                        "First 200 chars: $preview :: ${ex.message}",
                 ex
             )
         } catch (ex: Exception) {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
-                "Unexpected error while parsing SurveyConfig (format=${chosen.name}). " +
+                "Unexpected error while parsing SurveyConfig " +
+                        "(${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
                         "First 200 chars: $preview :: ${ex.message}",
                 ex
             )
         }
+
+        if (debugPrompts) {
+            Log.d(TAG, "fromString loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
+        }
+        if (debugDumpSystemPrompts) {
+            Log.d(TAG, cfg.debugDump())
+        }
+
+        return cfg
     }
 
-    /** Parse [SurveyConfig] from a string and validate immediately. */
     fun fromStringValidated(
         text: String,
         format: ConfigFormat = ConfigFormat.AUTO,
         fileNameHint: String? = null
     ): SurveyConfig =
-        fromString(text, format, fileNameHint).also { it.requireValid() }
+        fromString(text, format, fileNameHint).also {
+            if (debugValidate) {
+                val issues = it.validate()
+                Log.d(TAG, "fromStringValidated -> issues=${issues.size} (${it.debugSummary()})")
+                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
+            }
+            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
+            it.requireValid()
+        }
 
-    private fun pickFormat(
+    fun fromStringYamlStrictValidated(
+        text: String,
+        fileNameHint: String? = null
+    ): SurveyConfig {
+        val sanitized = text.normalizeText()
+        try {
+            val cfg = yamlStrict.decodeFromString(SurveyConfig.serializer(), sanitized)
+            if (debugPrompts) Log.d(TAG, "strictYaml loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
+            if (debugValidate) {
+                val issues = cfg.validate()
+                Log.d(TAG, "fromStringYamlStrictValidated -> issues=${issues.size} (${cfg.debugSummary()})")
+                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
+            }
+            if (debugDumpSystemPrompts) Log.d(TAG, cfg.debugDump())
+            cfg.requireValid()
+            return cfg
+        } catch (ex: Exception) {
+            val preview = sanitized.safePreview()
+            throw IllegalArgumentException(
+                "Failed strict YAML parse (file='${fileNameHint.orEmpty()}'). First 200 chars: $preview :: ${ex.message}",
+                ex
+            )
+        }
+    }
+
+    private fun decideFormat(
         desired: ConfigFormat,
         fileName: String? = null,
         text: String? = null
-    ): ConfigFormat {
-        if (desired != ConfigFormat.AUTO) return desired
+    ): FormatDecision {
+        val (first, lead) = text.debugPeek()
+
+        if (desired != ConfigFormat.AUTO) {
+            return FormatDecision(desired, "forced by caller", first, lead)
+        }
 
         val lower = fileName?.lowercase().orEmpty()
-        if (lower.endsWith(".json")) return ConfigFormat.JSON
-        if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return ConfigFormat.YAML
+        if (lower.endsWith(".json")) return FormatDecision(ConfigFormat.JSON, "file extension .json", first, lead)
+        if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return FormatDecision(ConfigFormat.YAML, "file extension .yml/.yaml", first, lead)
 
-        return text?.let(::sniffFormat) ?: ConfigFormat.JSON
+        val sniffed = text?.let(::sniffFormat) ?: ConfigFormat.JSON
+        return FormatDecision(
+            sniffed,
+            reason = if (text == null) "no content; default JSON" else "sniffed from content",
+            firstMeaningfulLine = first,
+            leadingChars = lead
+        )
     }
 
-    /**
-     * Heuristic format sniffing:
-     *  - Leading '{' or '[' -> JSON
-     *  - Leading '---', '- ' or typical "key: value" -> YAML
-     *  - Otherwise fall back to JSON.
-     */
     private fun sniffFormat(text: String): ConfigFormat {
         val trimmed = text.trimStart('\uFEFF', ' ', '\n', '\r', '\t')
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) return ConfigFormat.JSON
 
-        val firstNonEmpty = trimmed
+        val firstMeaningful = trimmed
             .lineSequence()
-            .firstOrNull { it.isNotBlank() }
-            ?.trim()
-            ?: ""
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+            .orEmpty()
 
-        if (firstNonEmpty.startsWith("---")) return ConfigFormat.YAML
-        if (firstNonEmpty.startsWith("- ")) return ConfigFormat.YAML
-        if (":" in firstNonEmpty && !firstNonEmpty.startsWith("{")) return ConfigFormat.YAML
+        if (firstMeaningful.startsWith("%YAML")) return ConfigFormat.YAML
+        if (firstMeaningful.startsWith("---")) return ConfigFormat.YAML
+        if (firstMeaningful.startsWith("- ")) return ConfigFormat.YAML
+
+        val yamlKeyPattern = Regex("""^[A-Za-z_][A-Za-z0-9_\-]*\s*:(\s*.*)?$""")
+        if (yamlKeyPattern.containsMatchIn(firstMeaningful)) return ConfigFormat.YAML
 
         return ConfigFormat.JSON
     }
 
-    /**
-     * Normalize BOM and line endings for a raw text string.
-     *
-     * - Removes UTF-8 BOM if present.
-     * - Converts CRLF/CR to LF.
-     * - Trims trailing line breaks.
-     */
-    private fun String.normalize(): String {
-        val s = if (this.isNotEmpty() && this[0] == '\uFEFF') this.drop(1) else this
-        return s.replace("\r\n", "\n")
+    private fun String.normalizeText(): String =
+        this.stripBom()
+            .replace("\r\n", "\n")
             .replace("\r", "\n")
             .trimEnd('\n')
-    }
 
-    /** Return a short preview string for error messages. */
+    private fun String.stripBom(): String =
+        if (this.isNotEmpty() && this[0] == '\uFEFF') this.drop(1) else this
+
     private fun String.safePreview(max: Int = 200): String =
         this.replace("\n", "\\n")
             .replace("\r", "\\r")
             .let { t -> if (t.length <= max) t else t.take(max) + "..." }
-}
 
-/* ───────────────────────────── Serializers ─────────────────────────────── */
-
-private val StringListSer: KSerializer<List<String>> = ListSerializer(String.serializer())
-private val NullableStringSer: KSerializer<String?> = String.serializer().nullable
-
-/**
- * Serializer that accepts both node_id and nodeId, and encodes as node_id.
- */
-private object PromptSerializer : KSerializer<SurveyConfig.Prompt> {
-
-    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("Prompt") {
-        element<String>("node_id", isOptional = true)
-        element<String>("nodeId", isOptional = true)
-        element<String>("prompt", isOptional = true)
-        element<String>("template", isOptional = true) // legacy alias
-    }
-
-    override fun serialize(encoder: Encoder, value: SurveyConfig.Prompt) {
-        encoder.encodeStructure(descriptor) {
-            // Encode snake_case to keep YAML style stable.
-            encodeStringElement(descriptor, 0, value.nodeId)
-            encodeStringElement(descriptor, 2, value.prompt)
-        }
-    }
-
-    override fun deserialize(decoder: Decoder): SurveyConfig.Prompt {
-        var nodeIdSnake: String? = null
-        var nodeIdCamel: String? = null
-        var prompt: String? = null
-        var template: String? = null
-
-        decoder.decodeStructure(descriptor) {
-            while (true) {
-                when (val idx = decodeElementIndex(descriptor)) {
-                    CompositeDecoder.DECODE_DONE -> break
-                    0 -> nodeIdSnake = decodeNullableSerializableElement(descriptor, 0, NullableStringSer)
-                    1 -> nodeIdCamel = decodeNullableSerializableElement(descriptor, 1, NullableStringSer)
-                    2 -> prompt = decodeNullableSerializableElement(descriptor, 2, NullableStringSer)
-                    3 -> template = decodeNullableSerializableElement(descriptor, 3, NullableStringSer)
-                    else -> Unit
-                }
-            }
-        }
-
-        val nodeId = (nodeIdSnake ?: nodeIdCamel ?: "").trim()
-        val body = (prompt ?: template ?: "").trimEnd()
-        return SurveyConfig.Prompt(nodeId = nodeId, prompt = body)
-    }
-}
-
-/**
- * Serializer that accepts both start_id and startId, and encodes as start_id.
- */
-private object GraphSerializer : KSerializer<SurveyConfig.Graph> {
-
-    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("Graph") {
-        element<String>("start_id", isOptional = true)
-        element<String>("startId", isOptional = true)
-        element<List<NodeDTO>>("nodes")
-    }
-
-    override fun serialize(encoder: Encoder, value: SurveyConfig.Graph) {
-        encoder.encodeStructure(descriptor) {
-            encodeStringElement(descriptor, 0, value.startId)
-            encodeSerializableElement(descriptor, 2, ListSerializer(NodeDTO.serializer()), value.nodes)
-        }
-    }
-
-    override fun deserialize(decoder: Decoder): SurveyConfig.Graph {
-        var startSnake: String? = null
-        var startCamel: String? = null
-        var nodes: List<NodeDTO>? = null
-
-        decoder.decodeStructure(descriptor) {
-            while (true) {
-                when (val idx = decodeElementIndex(descriptor)) {
-                    CompositeDecoder.DECODE_DONE -> break
-                    0 -> startSnake = decodeNullableSerializableElement(descriptor, 0, NullableStringSer)
-                    1 -> startCamel = decodeNullableSerializableElement(descriptor, 1, NullableStringSer)
-                    2 -> nodes = decodeSerializableElement(descriptor, 2, ListSerializer(NodeDTO.serializer()))
-                    else -> Unit
-                }
-            }
-        }
-
-        val startId = (startSnake ?: startCamel ?: "").trim()
-        return SurveyConfig.Graph(startId = startId, nodes = nodes ?: emptyList())
-    }
-}
-
-/**
- * Serializer that accepts both next_id and nextId, and encodes as next_id.
- */
-private object NodeDTOSerializer : KSerializer<NodeDTO> {
-
-    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("NodeDTO") {
-        element<String>("id")
-        element<String>("type")
-        element<String>("title", isOptional = true)
-        element<String>("question", isOptional = true)
-        element<List<String>>("options", isOptional = true)
-        element<String?>("next_id", isOptional = true)
-        element<String?>("nextId", isOptional = true)
-    }
-
-    override fun serialize(encoder: Encoder, value: NodeDTO) {
-        encoder.encodeStructure(descriptor) {
-            encodeStringElement(descriptor, 0, value.id)
-            encodeStringElement(descriptor, 1, value.type)
-
-            if (value.title.isNotBlank()) {
-                encodeStringElement(descriptor, 2, value.title)
-            }
-            if (value.question.isNotBlank()) {
-                encodeStringElement(descriptor, 3, value.question)
-            }
-            if (value.options.isNotEmpty()) {
-                encodeSerializableElement(descriptor, 4, StringListSer, value.options)
-            }
-
-            // Encode snake_case to match YAML style.
-            value.nextId?.trim()?.takeIf { it.isNotBlank() }?.let { next ->
-                encodeNullableSerializableElement(descriptor, 5, NullableStringSer, next)
-            }
-        }
-    }
-
-    override fun deserialize(decoder: Decoder): NodeDTO {
-        var id: String? = null
-        var type: String? = null
-        var title: String = ""
-        var question: String = ""
-        var options: List<String> = emptyList()
-        var nextSnake: String? = null
-        var nextCamel: String? = null
-
-        decoder.decodeStructure(descriptor) {
-            while (true) {
-                when (val idx = decodeElementIndex(descriptor)) {
-                    CompositeDecoder.DECODE_DONE -> break
-                    0 -> id = decodeStringElement(descriptor, 0)
-                    1 -> type = decodeStringElement(descriptor, 1)
-                    2 -> title = decodeStringElement(descriptor, 2)
-                    3 -> question = decodeStringElement(descriptor, 3)
-                    4 -> options = decodeSerializableElement(descriptor, 4, StringListSer)
-                    5 -> nextSnake = decodeNullableSerializableElement(descriptor, 5, NullableStringSer)
-                    6 -> nextCamel = decodeNullableSerializableElement(descriptor, 6, NullableStringSer)
-                    else -> Unit
-                }
-            }
-        }
-
-        return NodeDTO(
-            id = (id ?: "").trim(),
-            type = (type ?: "").trim(),
-            title = title,
-            question = question,
-            options = options,
-            nextId = (nextSnake ?: nextCamel)?.trim()?.ifBlank { null }
-        )
-    }
-}
-
-/* ───────────────────────────── Stage helpers ────────────────────────────── */
-
-/**
- * Return true if the string contains any delimiter that suggests a staged prompt id.
- */
-private fun String.containsStageDelimiter(): Boolean =
-    this.contains('#') || this.contains(':') || this.contains('/')
-
-/**
- * Extract base node id from a staged prompt identifier.
- *
- * Examples:
- *  - "Q1#eval"      -> "Q1"
- *  - "Q1:followup"  -> "Q1"
- *  - "Q1/followup"  -> "Q1"
- *  - "Q1"           -> "Q1"
- */
-private fun String.baseNodeId(): String {
-    val raw = this.trim()
-    if (raw.isEmpty()) return raw
-    val cut = raw.indexOfFirst { it == '#' || it == ':' || it == '/' }
-    return if (cut < 0) raw else raw.substring(0, cut).trim()
-}
-
-/**
- * Extract stage token from a staged prompt identifier.
- *
- * Examples:
- *  - "Q1#eval"      -> "eval"
- *  - "Q1:followup"  -> "followup"
- *  - "Q1/followup"  -> "followup"
- *  - "Q1"           -> null
- */
-private fun String.stageTokenOrNull(): String? {
-    val raw = this.trim()
-    if (raw.isEmpty()) return null
-    val cut = raw.indexOfFirst { it == '#' || it == ':' || it == '/' }
-    if (cut < 0) return null
-    if (cut == raw.lastIndex) return ""
-    return raw.substring(cut + 1).trim()
-}
-
-/**
- * Convert a stage token to [SurveyConfig.PromptStage] using tolerant parsing.
- */
-private fun String?.toPromptStage(): SurveyConfig.PromptStage {
-    val t = this?.trim()?.lowercase().orEmpty()
-    if (t.isBlank()) return SurveyConfig.PromptStage.BASE
-
-    return when (t) {
-        "base" -> SurveyConfig.PromptStage.BASE
-        "eval", "evaluation", "judge", "score" -> SurveyConfig.PromptStage.EVAL
-        "followup", "follow_up", "follow-up", "fu", "clarify" -> SurveyConfig.PromptStage.FOLLOWUP
-        else -> SurveyConfig.PromptStage.UNKNOWN
+    private fun String?.debugPeek(): Pair<String, String> {
+        if (this.isNullOrBlank()) return "" to ""
+        val norm = this.stripBom()
+        val lead = norm.trimStart().take(32)
+        val first = norm
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+            .orEmpty()
+        return first to lead
     }
 }

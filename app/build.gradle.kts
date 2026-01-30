@@ -3,6 +3,7 @@ import java.io.ByteArrayOutputStream
 import java.util.Properties
 import org.gradle.api.GradleException
 import org.gradle.api.tasks.Exec
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
@@ -327,10 +328,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-        freeCompilerArgs = listOf("-XXLanguage:+BreakContinueInInlineLambdas")
-        // freeCompilerArgs += listOf("-Xjvm-default=all", "-Xjsr305=strict")
+    /* ============================================================================
+     * Kotlin compiler options (migrated from android.kotlinOptions{})
+     * ========================================================================== */
+
+    kotlin {
+        jvmToolchain(17)
+
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_17)
+            freeCompilerArgs.add("-XXLanguage:+BreakContinueInInlineLambdas")
+        }
     }
 
     buildTypes {
@@ -392,6 +400,7 @@ dependencies {
 
     // Compose BOM
     implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.room.ktx)
     androidTestImplementation(platform(libs.androidx.compose.bom))
 
     // Compose

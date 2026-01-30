@@ -50,14 +50,14 @@ import java.io.File
  * Responsibilities:
  * - Detect BOOT_COMPLETED, LOCKED_BOOT_COMPLETED, and MY_PACKAGE_REPLACED.
  * - Load persistent payloads from app-internal storage.
- * - Re-enqueue each pending upload through [GitHubUploadWorker].
+ * - Re-enqueue each pending upload through [com.negi.survey.net.GitHubUploadWorker].
  *
  * Behavior:
  * - Gracefully no-ops on invalid credentials.
  * - Handles files independently to avoid single-point failures.
  * - Safe under Direct Boot broadcast timing.
  *
- * @see GitHubUploadWorker
+ * @see com.negi.survey.net.GitHubUploadWorker
  */
 class UploadRescheduleReceiver : BroadcastReceiver() {
 

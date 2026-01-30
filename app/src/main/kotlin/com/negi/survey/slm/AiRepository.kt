@@ -16,8 +16,10 @@ package com.negi.survey.slm
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.google.ai.edge.litertlm.Message
 import com.negi.survey.BuildConfig
 import com.negi.survey.config.SurveyConfig
+import com.negi.survey.vm.AiViewModel
 import java.io.File
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -27,10 +29,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -39,60 +40,67 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import org.json.JSONException
-import org.json.JSONObject
 
+/**
+ * Prompt building phase for two-step pipelines.
+ *
+ * - ONE_STEP: legacy single call
+ * - EVAL: step-1 evaluation
+ * - FOLLOWUP: step-2 follow-up generation
+ */
+enum class PromptPhase {
+    ONE_STEP,
+    EVAL,
+    FOLLOWUP
+}
 /**
  * Repository that streams inference results from an on-device LLM backend.
  *
- * Implementations:
- *  - [SlmDirectRepository]: MediaPipe SLM (LlmInference / LlmInferenceSession).
- *  - [LiteRtRepository]: LiteRtLM (Gemma *.litertlm via LiteRtLM object).
+ * Contract:
+ * - Returns a cold [Flow]. Collection actually runs the inference.
+ * - Implementations may enforce process-wide serialization (e.g., via a semaphore).
+ * - Callers are expected to collect in a coroutine scope they control and cancel
+ *   collection to abort/cleanup the underlying engine call (best-effort).
+ */
+/**
+ * Repository that streams inference results from an on-device LLM backend.
  */
 interface Repository {
 
-    /**
-     * Execute a single streaming inference for the given [prompt].
-     *
-     * Contract:
-     * - Returns a cold [Flow]. Collection actually runs the inference.
-     * - Implementations may enforce process-wide serialization (e.g., via a semaphore).
-     * - Callers are expected to collect in a coroutine scope they control and cancel
-     *   collection to abort/cleanup the underlying engine call (best-effort).
-     */
+    /** Execute a single streaming inference for the given [prompt]. */
     suspend fun request(prompt: String): Flow<String>
 
     /** Build the full model-ready prompt string from a user-level [userPrompt]. */
     fun buildPrompt(userPrompt: String): String
+
+    /**
+     * Build the full model-ready prompt string for a specific [phase].
+     *
+     * NOTE:
+     * - Default implementation keeps backward compatibility by delegating to the legacy method.
+     */
+    fun buildPrompt(userPrompt: String, phase: PromptPhase): String = buildPrompt(userPrompt)
 }
+
 
 /* ====================================================================== */
 /*  Shared process-wide inference gate                                     */
 /* ====================================================================== */
 
 /**
- * Single process-wide gate used by both MediaPipe SLM and LiteRtLM backends.
+ * Single process-wide gate used by all backends.
  *
  * Semantics:
- * - At most one active inference flow (SLM or LiteRtLM) may run at once.
- * - IMPORTANT: We must not release the gate until backend cleanup is finished
- *   (best-effort wait), otherwise back-to-back calls can crash native backends.
+ * - At most one active inference flow may run at once.
+ * - The gate is held for the entire lifetime of the streaming Flow collection.
  */
 private val AI_INFERENCE_GATE = Semaphore(1)
-
-/**
- * Dedicated IO scope for trace dumps to avoid blocking callback threads (often Main).
- */
-private val TRACE_IO_SCOPE: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 /* ====================================================================== */
 /*  Logging / Trace utilities                                              */
@@ -101,9 +109,6 @@ private val TRACE_IO_SCOPE: CoroutineScope = CoroutineScope(SupervisorJob() + Di
 private object AiTrace {
 
     private const val TAG = "AiTrace"
-
-    /** Enables verbose prompt/output tracing. */
-    private val ENABLED_DEFAULT: Boolean = BuildConfig.DEBUG
 
     /** Max chars kept in-memory for full output capture (safety cap). */
     private const val MAX_CAPTURE_CHARS: Int = 250_000
@@ -114,10 +119,11 @@ private object AiTrace {
     /** Chunk size per log line (keep below Logcat line limit). */
     private const val LOG_CHUNK: Int = 3_200
 
-    private val installedOnce = AtomicBoolean(false)
-
     @Volatile
     private var appContext: Context? = null
+
+    /** Enables verbose prompt/output tracing. */
+    private val ENABLED_DEFAULT: Boolean = BuildConfig.DEBUG
 
     @Volatile
     var enabled: Boolean = ENABLED_DEFAULT
@@ -130,11 +136,10 @@ private object AiTrace {
      */
     fun install(context: Context) {
         appContext = context.applicationContext
-        if (installedOnce.compareAndSet(false, true)) {
-            Log.d(TAG, "Installed (enabled=$enabled)")
-        }
+        Log.d(TAG, "Installed (enabled=$enabled)")
     }
 
+    /** Append with hard cap; returns false when truncated. */
     fun capAppend(sb: StringBuilder, chunk: String): Boolean {
         if (sb.length >= MAX_CAPTURE_CHARS) return false
         val remaining = MAX_CAPTURE_CHARS - sb.length
@@ -146,6 +151,7 @@ private object AiTrace {
         return false
     }
 
+    /** Short stable hash for prompt/output fingerprinting. */
     fun sha256Short(text: String): String {
         return runCatching {
             val md = MessageDigest.getInstance("SHA-256")
@@ -154,6 +160,9 @@ private object AiTrace {
         }.getOrElse { "sha256_err" }
     }
 
+    /**
+     * Chunked logcat printer to avoid line truncation.
+     */
     fun logLong(tag: String, level: Int, header: String, body: String) {
         if (!enabled) return
 
@@ -206,7 +215,7 @@ private object AiTrace {
 }
 
 /* ====================================================================== */
-/*  Shared prompt utilities                                               */
+/*  Shared prompt utilities                                                */
 /* ====================================================================== */
 
 private fun String.normalizePrompt(): String =
@@ -225,7 +234,7 @@ private fun compactJoin(vararg parts: String): String {
 }
 
 /* ====================================================================== */
-/*  Stream chunk normalization                                            */
+/*  Stream chunk normalization                                             */
 /* ====================================================================== */
 
 /**
@@ -234,540 +243,360 @@ private fun compactJoin(vararg parts: String): String {
  * - ACCUMULATED text (full text so far)
  *
  * This helper normalizes to DELTA output for Flow emission and capture.
+ *
+ * Notes:
+ * - Avoids keeping the entire lastFull string to reduce memory pressure.
+ * - Uses length + small samples to detect monotonic accumulated behavior.
  */
 private class StreamDeltaNormalizer(
-    private val modeHint: PartialMode = PartialMode.AUTO
+    private val modeHint: PartialMode = PartialMode.AUTO,
+    private val prefixSampleChars: Int = 128,
+    private val boundarySampleChars: Int = 64,
 ) {
     enum class PartialMode { AUTO, DELTA, ACCUMULATED }
 
     private var decided: PartialMode = modeHint
-    private var lastFull: String = ""
 
-    /** Normalize [incoming] into a delta string to append/emit. */
+    private var lastLen: Int = 0
+    private var prefixSample: String = ""
+    private var boundarySample: String = ""
+
+    // Used only in AUTO for the first decision; cap to avoid storing huge content.
+    private var firstChunk: String? = null
+    private var firstChunkLen: Int = 0
+
     fun toDelta(incoming: String): String {
         if (incoming.isEmpty()) return ""
 
-        if (decided == PartialMode.AUTO) {
-            decided = if (lastFull.isNotEmpty() && incoming.startsWith(lastFull)) {
-                PartialMode.ACCUMULATED
-            } else {
-                PartialMode.AUTO
-            }
+        return when (decided) {
+            PartialMode.DELTA -> incoming
+            PartialMode.ACCUMULATED -> accumulatedDelta(incoming)
+            PartialMode.AUTO -> autoDelta(incoming)
+        }
+    }
+
+    private fun autoDelta(incoming: String): String {
+        if (lastLen == 0) {
+            seed(incoming, allowFirstChunk = true)
+            return incoming
         }
 
-        return when (decided) {
-            PartialMode.DELTA -> {
-                lastFull += incoming
-                incoming
-            }
-            PartialMode.ACCUMULATED -> {
-                val delta = if (incoming.startsWith(lastFull)) {
-                    incoming.substring(lastFull.length)
-                } else {
-                    incoming
-                }
-                lastFull = incoming
-                delta
-            }
-            PartialMode.AUTO -> {
-                lastFull += incoming
-                incoming
-            }
+        // Decide on second+ chunk.
+        val looksAccumulated = looksLikeAccumulated(incoming)
+        decided = if (looksAccumulated) PartialMode.ACCUMULATED else PartialMode.DELTA
+
+        // Release AUTO helpers.
+        firstChunk = null
+        firstChunkLen = 0
+
+        return if (decided == PartialMode.ACCUMULATED) {
+            accumulatedDelta(incoming)
+        } else {
+            // DELTA: treat as raw delta.
+            seed(incoming, allowFirstChunk = false)
+            incoming
         }
+    }
+
+    private fun accumulatedDelta(incoming: String): String {
+        if (lastLen == 0) {
+            seed(incoming, allowFirstChunk = false)
+            return incoming
+        }
+
+        // Basic monotonic assumption; verify with light samples.
+        if (!looksLikeAccumulated(incoming)) {
+            // Treat as reset.
+            seed(incoming, allowFirstChunk = false)
+            return incoming
+        }
+
+        val delta = if (incoming.length >= lastLen) incoming.substring(lastLen) else incoming
+        seed(incoming, allowFirstChunk = false)
+        return delta
+    }
+
+    private fun seed(text: String, allowFirstChunk: Boolean) {
+        lastLen = text.length
+        prefixSample = text.take(prefixSampleChars)
+        boundarySample = text.takeLast(boundarySampleChars)
+
+        if (allowFirstChunk) {
+            val cap = 4_096
+            firstChunk = if (text.length <= cap) text else null
+            firstChunkLen = text.length
+        }
+    }
+
+    private fun looksLikeAccumulated(incoming: String): Boolean {
+        val fc = firstChunk
+        if (fc != null && incoming.length >= firstChunkLen && incoming.startsWith(fc)) {
+            return true
+        }
+
+        if (incoming.length < lastLen) return false
+        if (prefixSample.isNotEmpty() && !incoming.startsWith(prefixSample)) return false
+
+        if (boundarySample.isNotEmpty()) {
+            val start = (lastLen - boundarySample.length).coerceAtLeast(0)
+            val ok = incoming.regionMatches(start, boundarySample, 0, boundarySample.length, ignoreCase = false)
+            if (!ok) return false
+        }
+
+        return true
     }
 }
 
 /* ====================================================================== */
-/*  Shared prompt defaults                                                */
+/*  Shared defaults for prompt building                                    */
 /* ====================================================================== */
 
 private object PromptDefaults {
-    const val USER_TURN_PREFIX: String = "<start_of_turn>user"
-    const val MODEL_TURN_PREFIX: String = "<start_of_turn>model"
-    const val TURN_END: String = "<end_of_turn>"
-    const val EMPTY_JSON_INSTRUCTION: String = "Respond with an empty JSON object: {}"
 
-    const val PREAMBLE: String =
-        "You are a well-known farmer survey expert. Read the Question and the Answer."
-
-    const val KEY_CONTRACT: String =
-        "OUTPUT FORMAT:\n" +
-                "- In English.\n" +
-                "- Keys:\n" +
-                "  • \"analysis\": short string\n" +
-                "  • \"expected answer\": short string\n" +
-                "  • \"follow-up question\": a single short confirm/validate question\n" +
-                "  • \"score\": integer 1–100\n" +
-                "FOLLOW-UP INTENT:\n" +
-                "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
-                "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
-                "- Keep it single-scope and answerable immediately."
-
-    const val LENGTH_BUDGET: String =
-        "LENGTH LIMITS:\n" +
-                "- analysis<=80 chars\n" +
-                "- expected answer<=60 chars\n" +
-                "- follow-up question<=90 chars"
-
-    const val SCORING_RULE: String =
-        "SCORING RULE:\n" +
-                "- Judge ONLY content relevance/completeness/accuracy.\n" +
-                "- Do NOT penalize style or formatting."
-
-    const val STRICT_OUTPUT: String =
-        "STRICT OUTPUT (NO MARKDOWN):\n" +
-                "- RAW JSON only.\n" +
-                "- No extra text.\n" +
-                "- Prefer compact JSON.\n" +
-                "- Entire output should be short and machine-parseable."
-}
-
-/* ====================================================================== */
-/*  Shared prompt builder                                                 */
-/* ====================================================================== */
-
-private fun buildPromptCommon(config: SurveyConfig, userPrompt: String): String {
-    val slm = config.slm
-
-    val userTurn = slm.user_turn_prefix ?: PromptDefaults.USER_TURN_PREFIX
-    val modelTurn = slm.model_turn_prefix ?: PromptDefaults.MODEL_TURN_PREFIX
-    val turnEnd = slm.turn_end ?: PromptDefaults.TURN_END
-    val emptyJson = slm.empty_json_instruction ?: PromptDefaults.EMPTY_JSON_INSTRUCTION
-
-    val preamble = slm.preamble ?: PromptDefaults.PREAMBLE
-    val keyContract = slm.key_contract ?: PromptDefaults.KEY_CONTRACT
-    val lengthBudget = slm.length_budget ?: PromptDefaults.LENGTH_BUDGET
-    val scoringRule = slm.scoring_rule ?: PromptDefaults.SCORING_RULE
-    val strictOutput = slm.strict_output ?: PromptDefaults.STRICT_OUTPUT
-
-    val effective = if (userPrompt.isBlank()) emptyJson else userPrompt.trimIndent().normalizePrompt()
-
-    val userBlock = compactJoin(
-        preamble,
-        keyContract,
-        lengthBudget,
-        scoringRule,
-        strictOutput,
-        effective,
-    )
-
-    return compactJoin(
-        userTurn,
-        userBlock,
-        turnEnd,
-        modelTurn,
-    )
-}
-
-/* ====================================================================== */
-/*  Close action + request context                                        */
-/* ====================================================================== */
-
-private enum class CloseAction {
-    NONE,
-    SLM_RESET,
-    SLM_CANCEL_RESET,
-    LITERT_CLEANUP,
-}
-
-/** Close info shared across callback threads safely. */
-private data class CloseInfo(
-    val reason: String,
-    val action: CloseAction,
-    val cause: Throwable?,
-)
-
-/**
- * Request context shared between callbacks and awaitClose.
- *
- * IMPORTANT:
- * - Close must be idempotent (callbacks may race with cancellation).
- * - awaitClose must be called exactly once.
- */
-private class RequestCtx(
-    val tag: String,
-    val requestId: Long,
-    val modelName: String,
-) {
-    val closeRequested = AtomicBoolean(false)
-    val finalized = AtomicBoolean(false)
-    val closeInfoRef = AtomicReference(CloseInfo("unknown", CloseAction.NONE, null))
-
-    fun prefix(): String = "[$tag rid=$requestId model='$modelName']"
-
-    fun requestClose(reason: String, action: CloseAction, cause: Throwable? = null): Boolean {
-        if (!closeRequested.compareAndSet(false, true)) return false
-        closeInfoRef.set(CloseInfo(reason, action, cause))
-        return true
-    }
-
-    fun closeInfo(): CloseInfo = closeInfoRef.get()
-}
-
-/* ====================================================================== */
-/*  SLM (MediaPipe) backend                                               */
-/* ====================================================================== */
-
-class SlmDirectRepository(
-    private val appContext: Context,
-    private val model: Model,
-    private val config: SurveyConfig,
-) : Repository {
-
-    init {
-        AiTrace.install(appContext)
-    }
-
-    companion object {
-        private const val TAG = "SlmDirectRepository"
-        private val REQ_SEQ = AtomicLong(0L)
-
-        private const val HARD_WATCHDOG_MS = 20_000L
-        private const val PROGRESS_STALL_MS = 6_000L
-        private const val PROGRESS_POLL_MS = 250L
-
-        private const val CLEANUP_WAIT_MS = 4_000L
-        private const val CLEANUP_POLL_MS = 50L
-
-        private const val PROMPT_HEADER_MAX = 8
-        private const val PROMPT_TAIL_MAX = 8
-
-        private const val RESET_SESSION_AFTER_EACH_REQUEST = true
-    }
-
-    override fun buildPrompt(userPrompt: String): String {
-        val p = buildPromptCommon(config, userPrompt)
-        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${p.length}")
-        return p
-    }
-
-    override suspend fun request(prompt: String): Flow<String> =
-        callbackFlow {
-            val out = this
-            val requestId = REQ_SEQ.incrementAndGet()
-            val gateReqAt = SystemClock.elapsedRealtime()
-
-            AI_INFERENCE_GATE.withPermit {
-                val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
-
-                val ctx = RequestCtx(tag = "SLM", requestId = requestId, modelName = model.name)
-                val anchorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-                val startAt = AtomicLong(SystemClock.elapsedRealtime())
-                val lastProgressAt = AtomicLong(startAt.get())
-                val firstChunkAt = AtomicLong(-1L)
-
-                val seenFinished = AtomicBoolean(false)
-                val seenOnClean = AtomicBoolean(false)
-
-                val chunks = AtomicLong(0L)
-                val capturedAll = AtomicBoolean(true)
-
-                val outLock = Any()
-                val fullOut = StringBuilder(8 * 1024)
-
-                val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
-
-                fun markProgress() {
-                    lastProgressAt.set(SystemClock.elapsedRealtime())
-                }
-
-                fun isBusyNow(): Boolean {
-                    return runCatching { SLM.isBusy(model) }
-                        .onFailure { Log.w(TAG, "${ctx.prefix()} SLM.isBusy threw: ${it.message}", it) }
-                        .getOrElse { true }
-                }
-
-                fun appendOutput(delta: String) {
-                    if (delta.isEmpty()) return
-                    if (firstChunkAt.get() < 0L) firstChunkAt.compareAndSet(-1L, SystemClock.elapsedRealtime())
-                    chunks.incrementAndGet()
-
-                    synchronized(outLock) {
-                        val ok = AiTrace.capAppend(fullOut, delta)
-                        if (!ok) capturedAll.set(false)
-                    }
-                }
-
-                fun snapshotOutput(): String = synchronized(outLock) { fullOut.toString() }
-
-                fun buildPromptSummary(normalized: String): String {
-                    val lines = normalized.split('\n')
-                    val head = lines.take(PROMPT_HEADER_MAX).joinToString("\n")
-                    val tail = lines.takeLast(PROMPT_TAIL_MAX).joinToString("\n")
-                    val fp = AiTrace.sha256Short(normalized)
-                    return buildString {
-                        appendLine("${ctx.prefix()} gateWaitMs=$gateWaitMs busy=${isBusyNow()}")
-                        appendLine("prompt.len=${normalized.length} lines=${lines.size} sha256_8=$fp")
-                        appendLine("--- prompt.head ---")
-                        appendLine(head)
-                        appendLine("--- prompt.tail ---")
-                        appendLine(tail)
-                    }
-                }
-
-                fun finalizeOnce(reason: String, cause: Throwable? = null) {
-                    if (!ctx.finalized.compareAndSet(false, true)) return
-
-                    val now = SystemClock.elapsedRealtime()
-                    val elapsedMs = now - startAt.get()
-                    val firstMs = firstChunkAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
-                    val outText = snapshotOutput()
-
-                    val stats = buildString {
-                        appendLine("=== SLM TRACE STATS ===")
-                        appendLine("${ctx.prefix()} reason=$reason")
-                        appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstChunkMs=$firstMs")
-                        appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
-                        appendLine("busy_now=${isBusyNow()} finished=${seenFinished.get()} onClean=${seenOnClean.get()}")
-                        if (cause != null) {
-                            appendLine("--- exception ---")
-                            appendLine(Log.getStackTraceString(cause))
-                        }
-                        appendLine("=== OUTPUT (FULL) ===")
-                        append(outText)
-                        if (!capturedAll.get()) {
-                            appendLine()
-                            appendLine("... (output capture truncated by capture cap)")
-                        }
-                    }
-
-                    AiTrace.logLong(
-                        tag = TAG,
-                        level = if (cause != null) Log.WARN else Log.DEBUG,
-                        header = "${ctx.prefix()} FINALIZE: $reason",
-                        body = stats,
-                    )
-
-                    val dump = buildString {
-                        appendLine("=== PROMPT+OUTPUT DUMP ===")
-                        appendLine("${ctx.prefix()} reason=$reason")
-                        appendLine()
-                        appendLine("=== PROMPT ===")
-                        appendLine(prompt.normalizePrompt())
-                        appendLine()
-                        appendLine("=== OUTPUT ===")
-                        appendLine(outText)
-                        if (!capturedAll.get()) appendLine("... (output capture truncated by capture cap)")
-                    }
-
-                    // Offload file IO to avoid blocking callback threads.
-                    TRACE_IO_SCOPE.launch {
-                        val f = AiTrace.dumpToFile("slm", requestId, model.name, dump)
-                        if (f != null) Log.d(TAG, "${ctx.prefix()} Dumped full prompt/output to: ${f.absolutePath}")
-                    }
-                }
-
-                /**
-                 * Close the channel at most once.
-                 *
-                 * NOTE:
-                 * - This MUST NOT call awaitClose.
-                 * - This MUST NOT attempt to register close handlers.
-                 */
-                fun closeChannelOnce(reason: String, action: CloseAction, cause: Throwable? = null) {
-                    val first = ctx.requestClose(reason, action, cause)
-                    if (!first) return
-
-                    finalizeOnce(reason, cause)
-
-                    // Stop watchdogs ASAP.
-                    anchorScope.cancel(CancellationException("closeChannelOnce: $reason"))
-
-                    // Close producer channel exactly once.
-                    if (cause != null) out.close(cause) else out.close()
-                }
-
-                suspend fun cleanupSlm() {
-                    val info = ctx.closeInfo()
-                    withContext(NonCancellable) {
-                        val doReset = RESET_SESSION_AFTER_EACH_REQUEST
-                        when (info.action) {
-                            CloseAction.SLM_CANCEL_RESET -> {
-                                runCatching { SLM.cancel(model) }
-                                if (doReset) runCatching { SLM.resetSession(model) }
-                            }
-                            CloseAction.SLM_RESET -> {
-                                if (doReset) runCatching { SLM.resetSession(model) }
-                            }
-                            else -> {
-                                if (doReset) runCatching { SLM.resetSession(model) }
-                            }
-                        }
-
-                        val ok = withTimeoutOrNull(CLEANUP_WAIT_MS) {
-                            while (true) {
-                                if (!isBusyNow()) break
-                                delay(CLEANUP_POLL_MS)
-                            }
-                            true
-                        } != null
-
-                        if (!ok) {
-                            Log.w(TAG, "${ctx.prefix()} cleanup wait timeout (busy=${isBusyNow()}) reason=${info.reason}")
-                        }
-                    }
-                }
-
-                // Watchdog (hard timeout + progress stall).
-                anchorScope.launch {
-                    while (isActive && !ctx.closeRequested.get()) {
-                        val now = SystemClock.elapsedRealtime()
-                        val elapsed = now - startAt.get()
-                        val stalled = now - lastProgressAt.get()
-
-                        if (elapsed >= HARD_WATCHDOG_MS) {
-                            Log.w(TAG, "${ctx.prefix()} hard watchdog timeout (${elapsed}ms) → cancel/reset + close")
-                            runCatching { SLM.cancel(model) }
-                            runCatching { SLM.resetSession(model) }
-                            closeChannelOnce("hard-watchdog-timeout", CloseAction.SLM_CANCEL_RESET)
-                            break
-                        }
-
-                        if (!seenFinished.get() && stalled >= PROGRESS_STALL_MS) {
-                            Log.w(TAG, "${ctx.prefix()} progress stall (${stalled}ms) → cancel/reset + close")
-                            runCatching { SLM.cancel(model) }
-                            runCatching { SLM.resetSession(model) }
-                            closeChannelOnce("progress-stall-timeout", CloseAction.SLM_CANCEL_RESET)
-                            break
-                        }
-
-                        delay(PROGRESS_POLL_MS)
-                    }
-                }
-
-                try {
-                    val normalizedPrompt = prompt.normalizePrompt()
-
-                    Log.d(
-                        TAG,
-                        "${ctx.prefix()} request start: prompt.len=${normalizedPrompt.length}, gateWaitMs=$gateWaitMs, busy=${isBusyNow()}",
-                    )
-
-                    AiTrace.logLong(TAG, Log.DEBUG, "${ctx.prefix()} PROMPT (FULL)", normalizedPrompt)
-                    Log.d(TAG, buildPromptSummary(normalizedPrompt))
-
-                    val initErr = withTimeoutOrNull(8_000L) {
-                        var err: String? = null
-                        val done = AtomicBoolean(false)
-                        SLM.ensureInitialized(appContext, model) { e ->
-                            err = e
-                            done.set(true)
-                        }
-                        while (!done.get()) delay(25)
-                        err ?: ""
-                    } ?: "SLM.ensureInitialized timed out."
-
-                    if (initErr.isNotBlank()) {
-                        Log.e(TAG, "${ctx.prefix()} ensureInitialized failed: $initErr")
-                        closeChannelOnce("ensureInitialized-error", CloseAction.SLM_CANCEL_RESET, RuntimeException(initErr))
-                    } else {
-                        if (isBusyNow()) {
-                            Log.w(TAG, "${ctx.prefix()} pre-run: engine BUSY → cancel/resetSession")
-                            runCatching { SLM.cancel(model) }
-                            runCatching { SLM.resetSession(model) }
-                        }
-
-                        SLM.runInference(
-                            model = model,
-                            input = normalizedPrompt,
-                            listener = { partial, finished ->
-                                if (ctx.closeRequested.get()) return@runInference
-
-                                markProgress()
-
-                                val delta = normalizer.toDelta(partial)
-                                if (delta.isNotEmpty()) {
-                                    appendOutput(delta)
-                                    out.trySend(delta)
-                                }
-
-                                if (finished && !ctx.closeRequested.get()) {
-                                    seenFinished.set(true)
-                                    Log.d(TAG, "${ctx.prefix()} inference finished")
-                                    closeChannelOnce("finished", CloseAction.SLM_RESET)
-                                }
-                            },
-                            onClean = {
-                                if (ctx.closeRequested.get()) return@runInference
-                                markProgress()
-                                seenOnClean.set(true)
-                                Log.d(TAG, "${ctx.prefix()} onClean")
-                                closeChannelOnce("onClean", CloseAction.SLM_RESET)
-                            },
-                        )
-                    }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "${ctx.prefix()} SLM.runInference threw: ${t.message}", t)
-                    runCatching { SLM.cancel(model) }
-                    runCatching { SLM.resetSession(model) }
-
-                    if (t is CancellationException) {
-                        closeChannelOnce("cancelled", CloseAction.SLM_CANCEL_RESET, null)
-                    } else {
-                        closeChannelOnce("exception", CloseAction.SLM_CANCEL_RESET, t)
-                    }
-                } finally {
-                    awaitClose {
-                        if (!ctx.closeRequested.get()) {
-                            Log.d(TAG, "${ctx.prefix()} awaitClose: collector-cancel → cancel/reset + close")
-                            runCatching { SLM.cancel(model) }
-                            runCatching { SLM.resetSession(model) }
-                            closeChannelOnce("collector-cancel", CloseAction.SLM_CANCEL_RESET)
-                        }
-                    }
-
-                    try {
-                        cleanupSlm()
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "${ctx.prefix()} cleanupSlm failed: ${e.message}", e)
-                    }
-                }
-            }
-        }
-            .buffer(Channel.BUFFERED)
-            .flowOn(Dispatchers.IO)
+    const val USER_TURN_PREFIX = "<start_of_turn>user"
+    const val MODEL_TURN_PREFIX = "<start_of_turn>model"
+    const val TURN_END = "<end_of_turn>"
+//    const val EMPTY_JSON_INSTRUCTION = "Respond with an empty JSON object: {}"
+//    const val PREAMBLE =
+//        "You are a well-known farmer survey expert. Read the Question and the Answer."
+//    const val KEY_CONTRACT =
+//        "OUTPUT FORMAT:\n" +
+//                "- In English.\n" +
+//                "- Keys:\n" +
+//                "  • \"analysis\": short string\n" +
+//                "  • \"expected answer\": short string\n" +
+//                "  • \"follow-up question\": a single short confirm/validate question\n" +
+//                "  • \"score\": integer 1–100\n" +
+//                "FOLLOW-UP INTENT:\n" +
+//                "- The follow-up must confirm or clarify the respondent's original answer to the SAME question.\n" +
+//                "- Target the biggest uncertainty (unit/scale, missing number, time window, baseline, method).\n" +
+//                "- Keep it single-scope and answerable immediately."
+//    const val LENGTH_BUDGET =
+//        "LENGTH LIMITS:\n" +
+//                "- analysis<=80 chars\n" +
+//                "- expected answer<=60 chars\n" +
+//                "- follow-up question<=90 chars"
+//    const val SCORING_RULE =
+//        "SCORING RULE:\n" +
+//                "- Judge ONLY content relevance/completeness/accuracy.\n" +
+//                "- Do NOT penalize style or formatting."
+//    const val STRICT_OUTPUT =
+//        "STRICT OUTPUT (NO MARKDOWN):\n" +
+//                "- RAW JSON only.\n" +
+//                "- No extra text.\n" +
+//                "- Prefer compact JSON.\n" +
+//                "- Entire output should be short and machine-parseable."
 }
 
 /* ====================================================================== */
 /*  LiteRtLM backend                                                      */
 /* ====================================================================== */
 
+/**
+ * Primary repository implementation for LiteRtLM via [SLM] facade.
+ *
+ * This repository assumes:
+ * - [SLM.setApplicationContext] is called early OR [appContext] is provided here.
+ * - [SLM.initializeIfNeeded] is safe to call repeatedly (no-op when ready).
+ */
 class LiteRtRepository(
     private val model: Model,
     private val config: SurveyConfig,
-    appContext: Context? = null,
+    private val appContext: Context? = null,
+    private val supportImage: Boolean = false,
+    private val supportAudio: Boolean = false,
+    private val systemMessage: Message? = null,
+    private val tools: List<Any> = emptyList(),
 ) : Repository {
-
-    init {
-        if (appContext != null) {
-            AiTrace.install(appContext)
-        }
-    }
 
     companion object {
         private const val TAG = "LiteRtRepository"
+
         private val REQ_SEQ = AtomicLong(0L)
 
-        private const val HARD_WATCHDOG_MS = 20_000L
-        private const val PROGRESS_STALL_MS = 6_000L
+        private const val INIT_TIMEOUT_MS = 60_000L
+
+        /** Overall safety cap for a single request (GPU cold start can be slow). */
+        private const val HARD_WATCHDOG_MS = 120_000L
+
+        /** Before first token arrives, tolerate a long warmup period. */
+        private const val FIRST_TOKEN_TIMEOUT_MS = 45_000L
+
+        /** After streaming begins, tolerate silence between callback events. */
+        private const val EVENT_STALL_TIMEOUT_MS = 12_000L
+
+        /** After logical done=true, wait for native termination callback. */
+        private const val POST_DONE_TIMEOUT_MS = 30_000L
+
         private const val PROGRESS_POLL_MS = 250L
 
-        /**
-         * How long we wait for LiteRtLM.cleanUp() completion callback.
-         * This is a best-effort wait to avoid releasing the global inference gate too early.
-         */
-        private const val CLEANUP_WAIT_MS = 8_000L
+        private val DEBUG_STREAM: Boolean = BuildConfig.DEBUG
+        private const val DEBUG_STREAM_EVERY_N = 8
+        private const val DEBUG_PREFIX_CHARS = 180
+
+        /** Prompt size safety caps. */
+        private const val PROMPT_CHAR_CAP: Int = 120_000
+        private const val PROMPT_KEEP_TAIL_CHARS: Int = 24_000
     }
 
-    override fun buildPrompt(userPrompt: String): String {
-        val p = buildPromptCommon(config, userPrompt)
-        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${p.length}")
-        return p
+    init {
+        appContext?.let { AiTrace.install(it) }
     }
 
-    override suspend fun request(prompt: String): Flow<String> =
-        callbackFlow {
+    /**
+     * Sanitize turn tokens: keep them single-line and non-empty.
+     *
+     * - Prevents accidental "\n" inside tokens breaking the prompt format.
+     * - Trims whitespace and collapses internal whitespace.
+     */
+    private fun sanitizeTurnToken(value: String?, fallback: String): String {
+        val raw = (value ?: fallback)
+        val cleaned = raw
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .lines()
+            .joinToString(" ") { it.trim() }
+            .trim()
+            .replace(Regex("\\s+"), " ")
+        return if (cleaned.isBlank()) fallback else cleaned
+    }
+
+    /**
+     * Cap prompt size defensively.
+     *
+     * Strategy:
+     * - Keep the tail (most recent/user content typically lives near the end).
+     * - Prefix a short truncation marker so logs/debugging are honest.
+     */
+    private fun capPromptIfNeeded(prompt: String, maxChars: Int, keepTailChars: Int): String {
+        if (prompt.length <= maxChars) return prompt
+
+        val keep = keepTailChars.coerceIn(4_096, maxChars)
+        val tail = prompt.takeLast(keep)
+        val dropped = prompt.length - keep
+
+        // English-only marker to keep LLM instruction language consistent.
+        val marker = "[TRUNCATED: dropped=$dropped chars; kept_last=$keep]\n"
+
+        val out = marker + tail
+        return if (out.length <= maxChars) out else out.takeLast(maxChars)
+    }
+
+//    override fun buildPrompt(userPrompt: String): String {
+//        fun normalize(s: String): String =
+//            s.replace("\r\n", "\n")
+//                .replace("\r", "\n")
+//                .trimEnd('\n')
+//
+//        fun joinNonBlank(vararg parts: String): String =
+//            parts.asSequence()
+//                .map { normalize(it) }
+//                .filter { it.isNotBlank() }
+//                .joinToString("\n")
+//
+//        val slm = config.slm
+//
+//        val userTurn = sanitizeTurnToken(slm.userTurnPrefix, PromptDefaults.USER_TURN_PREFIX)
+//        val modelTurn = sanitizeTurnToken(slm.modelTurnPrefix, PromptDefaults.MODEL_TURN_PREFIX)
+//        val turnEnd = sanitizeTurnToken(slm.turnEnd, PromptDefaults.TURN_END)
+//
+////        val emptyJson = normalize(slm.emptyJsonInstruction ?: PromptDefaults.EMPTY_JSON_INSTRUCTION)
+////        val preamble = normalize(slm.preamble ?: PromptDefaults.PREAMBLE)
+////        val keyContract = normalize(slm.keyContract ?: PromptDefaults.KEY_CONTRACT)
+////        val lengthBudget = normalize(slm.lengthBudget ?: PromptDefaults.LENGTH_BUDGET)
+////        val scoringRule = normalize(slm.scoringRule ?: PromptDefaults.SCORING_RULE)
+////        val strictOutput = normalize(slm.strictOutput ?: PromptDefaults.STRICT_OUTPUT)
+//
+//        val emptyJson = normalize(slm.emptyJsonInstruction ?: "")
+//        val preamble = normalize(slm.preamble ?: "")
+//        val keyContract = normalize(slm.keyContract ?: "")
+//        val lengthBudget = normalize(slm.lengthBudget ?: "")
+//        val scoringRule = normalize(slm.scoringRule ?: "")
+//        val strictOutput = normalize(slm.strictOutput ?: "")
+//        val effectiveInput = if (userPrompt.isBlank()) emptyJson else normalize(userPrompt.trimIndent())
+//        val labeledInput = joinNonBlank("INPUT:", effectiveInput)
+//        val userBlock = joinNonBlank(
+//            preamble,
+//            keyContract,
+//            lengthBudget,
+//            scoringRule,
+//            strictOutput,
+//            labeledInput
+//        )
+//        val fullPrompt = joinNonBlank(
+//            userTurn,
+//            userBlock,
+//            turnEnd,
+//            modelTurn
+//        )
+//
+//        val capped = capPromptIfNeeded(fullPrompt, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
+//
+////        val sha = AiTrace.sha256Short(capped)
+////        Log.d(TAG, "buildPrompt: in.len=${userPrompt.length}, out.len=${capped.length}, sha=$sha (capped=${capped.length != fullPrompt.length})")
+////
+////        if (BuildConfig.DEBUG && AiTrace.enabled) {
+////            AiTrace.logLong(TAG, Log.DEBUG, "[buildPrompt] PROMPT (FULL) sha=$sha", capped)
+////        } else if (BuildConfig.DEBUG) {
+////            val head = capped.take(420).replace("\n", "\\n")
+////            val tail = capped.takeLast(260).replace("\n", "\\n")
+////            Log.d(TAG, "buildPrompt preview(head): '$head' ...")
+////            Log.d(TAG, "buildPrompt preview(tail): ... '$tail'")
+////        }
+//
+//        return capped
+//    }
+
+    override fun buildPrompt(userPrompt: String): String =
+        buildPrompt(userPrompt, PromptPhase.ONE_STEP)
+
+    override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
+        fun normalize(s: String): String =
+            s.replace("\r\n", "\n")
+                .replace("\r", "\n")
+                .trimEnd('\n')
+
+        fun joinNonBlank(vararg parts: String): String =
+            parts.asSequence()
+                .map { normalize(it) }
+                .filter { it.isNotBlank() }
+                .joinToString("\n")
+
+        val slm = config.slm
+
+        val userTurn = sanitizeTurnToken(slm.userTurnPrefix, PromptDefaults.USER_TURN_PREFIX)
+        val modelTurn = sanitizeTurnToken(slm.modelTurnPrefix, PromptDefaults.MODEL_TURN_PREFIX)
+        val turnEnd = sanitizeTurnToken(slm.turnEnd, PromptDefaults.TURN_END)
+
+        // Phase-specific system prompt.
+        val systemPrompt = when (phase) {
+            PromptPhase.ONE_STEP -> config.composeSystemPromptOneStep()
+            PromptPhase.EVAL -> config.composeSystemPromptEval()
+            PromptPhase.FOLLOWUP -> config.composeSystemPromptFollowup()
+        }.let(::normalize)
+
+        // Keep legacy behavior: if user prompt is blank, inject empty-json instruction.
+        // (Typically not used for FOLLOWUP because you always pass EVAL_JSON there.)
+        val emptyJson = normalize(slm.emptyJsonInstruction ?: "")
+        val effectiveInput = if (userPrompt.isBlank()) emptyJson else normalize(userPrompt.trimIndent())
+
+        val labeledInput = joinNonBlank("INPUT:", effectiveInput)
+
+        val fullPrompt = joinNonBlank(
+            userTurn,
+            systemPrompt,
+            labeledInput,
+            turnEnd,
+            modelTurn
+        )
+
+        return capPromptIfNeeded(fullPrompt, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
+    }
+
+
+    @OptIn(DelicateCoroutinesApi::class)
+    override suspend fun request(prompt: String): Flow<String> {
+        return callbackFlow {
             val out = this
             val requestId = REQ_SEQ.incrementAndGet()
             val gateReqAt = SystemClock.elapsedRealtime()
@@ -775,718 +604,337 @@ class LiteRtRepository(
             AI_INFERENCE_GATE.withPermit {
                 val gateWaitMs = SystemClock.elapsedRealtime() - gateReqAt
 
-                val ctx = RequestCtx(tag = "LITERT", requestId = requestId, modelName = model.name)
                 val anchorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-                // IMPORTANT:
-                // - streamDone: "stream terminated" (done signal)
-                // - cleanupDone: "native objects cleanup finished" (LiteRtLM.cleanUp onDone)
-                val streamDone = CompletableDeferred<Unit>()
-                val cleanupDone = CompletableDeferred<Unit>()
-                val cleanupStarted = AtomicBoolean(false)
+                val closed = AtomicBoolean(false)
+                val finalized = AtomicBoolean(false)
 
                 val startAt = AtomicLong(SystemClock.elapsedRealtime())
-                val lastProgressAt = AtomicLong(startAt.get())
-                val firstChunkAt = AtomicLong(-1L)
 
-                val seenFinished = AtomicBoolean(false)
+                /** First real emitted delta timestamp. -1 means "no token yet". */
+                val firstTokenAt = AtomicLong(-1L)
+
+                /** Updated when any callback event arrives (including empty deltas). */
+                val lastEventAt = AtomicLong(startAt.get())
+
+                /** Updated only when a non-empty delta is produced. */
+                val lastDeltaAt = AtomicLong(startAt.get())
+
+                /** Logical completion flag (done=true). Still wait for native termination if possible. */
+                val logicalDone = AtomicBoolean(false)
+                val logicalDoneAt = AtomicLong(-1L)
+
+                /** Set when cancellation/recovery is initiated by us. */
+                val cancelTag = AtomicReference<String?>(null)
 
                 val chunks = AtomicLong(0L)
                 val capturedAll = AtomicBoolean(true)
 
+                // IMPORTANT: StringBuilder is NOT thread-safe.
+                // Callbacks and watchdog may arrive on different threads.
                 val outLock = Any()
                 val fullOut = StringBuilder(8 * 1024)
 
                 val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
 
-                fun markProgress() {
-                    lastProgressAt.set(SystemClock.elapsedRealtime())
+                fun markEvent() {
+                    lastEventAt.set(SystemClock.elapsedRealtime())
+                }
+
+                val emitCh = Channel<String>(capacity = Channel.BUFFERED)
+                val emitterJob = anchorScope.launch {
+                    for (chunk in emitCh) {
+                        if (chunk.isNotEmpty() && !out.isClosedForSend) {
+                            out.trySend(chunk)
+                        }
+                    }
                 }
 
                 fun appendOutput(delta: String) {
                     if (delta.isEmpty()) return
-                    if (firstChunkAt.get() < 0L) firstChunkAt.compareAndSet(-1L, SystemClock.elapsedRealtime())
+                    val now = SystemClock.elapsedRealtime()
+                    if (firstTokenAt.get() < 0L) firstTokenAt.compareAndSet(-1L, now)
+                    lastDeltaAt.set(now)
+
                     chunks.incrementAndGet()
-                    synchronized(outLock) {
-                        val ok = AiTrace.capAppend(fullOut, delta)
-                        if (!ok) capturedAll.set(false)
+
+                    val ok = synchronized(outLock) {
+                        AiTrace.capAppend(fullOut, delta)
                     }
+                    if (!ok) capturedAll.set(false)
                 }
 
-                fun snapshotOutput(): String = synchronized(outLock) { fullOut.toString() }
+                fun snapshotOutput(): String {
+                    return synchronized(outLock) { fullOut.toString() }
+                }
 
                 fun finalizeOnce(reason: String, cause: Throwable? = null) {
-                    if (!ctx.finalized.compareAndSet(false, true)) return
+                    if (!finalized.compareAndSet(false, true)) return
 
                     val now = SystemClock.elapsedRealtime()
                     val elapsedMs = now - startAt.get()
-                    val firstMs = firstChunkAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
+                    val firstMs = firstTokenAt.get().let { if (it < 0L) -1L else (it - startAt.get()) }
+                    val lastDeltaMsAgo = now - lastDeltaAt.get()
+                    val lastEventMsAgo = now - lastEventAt.get()
 
-                    val normalizedPrompt = prompt.normalizePrompt()
                     val outText = snapshotOutput()
 
                     val stats = buildString {
-                        appendLine("=== LITERT TRACE STATS ===")
-                        appendLine("${ctx.prefix()} reason=$reason")
-                        appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstChunkMs=$firstMs")
+                        appendLine("=== AI TRACE STATS (LiteRtRepository) ===")
+                        appendLine("rid=$requestId model='${model.name}' reason=$reason")
+                        appendLine("gateWaitMs=$gateWaitMs elapsedMs=$elapsedMs firstTokenMs=$firstMs")
+                        appendLine("logicalDone=${logicalDone.get()} logicalDoneAt=${logicalDoneAt.get()}")
+                        appendLine("lastDeltaMsAgo=$lastDeltaMsAgo lastEventMsAgo=$lastEventMsAgo cancelTag='${cancelTag.get()}'")
                         appendLine("chunks=${chunks.get()} capturedAll=${capturedAll.get()} out.len=${outText.length}")
                         if (cause != null) {
                             appendLine("--- exception ---")
                             appendLine(Log.getStackTraceString(cause))
                         }
-                        appendLine("=== PROMPT (FULL) ===")
-                        appendLine(normalizedPrompt)
                         appendLine("=== OUTPUT (FULL) ===")
                         append(outText)
-                        if (!capturedAll.get()) appendLine("\n... (output capture truncated by capture cap)")
+                        if (!capturedAll.get()) appendLine("\n... (output capture truncated by MAX_CAPTURE_CHARS)")
                     }
 
-                    AiTrace.logLong(
-                        tag = TAG,
-                        level = if (cause != null) Log.WARN else Log.DEBUG,
-                        header = "${ctx.prefix()} FINALIZE: $reason",
-                        body = stats,
-                    )
-
-                    TRACE_IO_SCOPE.launch {
-                        AiTrace.dumpToFile("litert", requestId, model.name, stats)
-                    }
+                    AiTrace.logLong(TAG, if (cause != null) Log.WARN else Log.DEBUG, "[$requestId] FINALIZE: $reason", stats)
+                    AiTrace.dumpToFile("litert", requestId, model.name, stats)
                 }
 
-                fun triggerCleanup(tag: String) {
-                    if (cleanupDone.isCompleted) return
-                    if (!cleanupStarted.compareAndSet(false, true)) return
-
-                    runCatching {
-                        LiteRtLM.cleanUp(model) {
-                            Log.d(TAG, "${ctx.prefix()} LiteRtLM cleanUp finished ($tag)")
-                            if (!cleanupDone.isCompleted) cleanupDone.complete(Unit)
-                        }
-                    }.onFailure {
-                        Log.w(TAG, "${ctx.prefix()} LiteRtLM.cleanUp failed ($tag): ${it.message}", it)
-                        if (!cleanupDone.isCompleted) cleanupDone.complete(Unit)
-                    }
-                }
-
-                /**
-                 * Close the channel at most once.
-                 *
-                 * NOTE:
-                 * - Must not call awaitClose.
-                 * - Must be safe under callback races.
-                 */
-                fun closeChannelOnce(reason: String, action: CloseAction, cause: Throwable? = null) {
-                    val first = ctx.requestClose(reason, action, cause)
-                    if (!first) return
+                fun closeOnce(reason: String, cause: Throwable? = null) {
+                    if (!closed.compareAndSet(false, true)) return
 
                     finalizeOnce(reason, cause)
 
-                    // Unblock cleanup waiters.
-                    if (!streamDone.isCompleted) streamDone.complete(Unit)
+                    runCatching { emitCh.close() }
+                    runCatching { emitterJob.cancel() }
+                    runCatching { anchorScope.cancel(CancellationException("closeOnce: $reason")) }
 
-                    // Stop watchdogs ASAP.
-                    anchorScope.cancel(CancellationException("closeChannelOnce: $reason"))
-
-                    if (cause != null) out.close(cause) else out.close()
-                }
-
-                suspend fun cleanupLiteRt() {
-                    val info = ctx.closeInfo()
-                    withContext(NonCancellable) {
-                        // Ensure the stream is terminated before triggering cleanup, best-effort.
-                        withTimeoutOrNull(1_000L) { streamDone.await() }
-
-                        triggerCleanup("finally/${info.reason}")
-
-                        val ok = withTimeoutOrNull(CLEANUP_WAIT_MS) {
-                            cleanupDone.await()
-                            true
-                        } != null
-
-                        if (!ok) {
-                            Log.w(TAG, "${ctx.prefix()} cleanup wait timeout reason=${info.reason}")
-                        }
+                    runCatching {
+                        if (cause != null) out.close(cause) else out.close()
                     }
                 }
 
-                // Watchdog (hard timeout + progress stall).
+                fun bestEffortRecover(tag: String, aggressive: Boolean) {
+                    cancelTag.compareAndSet(null, tag)
+
+                    runCatching { SLM.cancel(model) }
+                        .onFailure { Log.w(TAG, "[$requestId] cancel failed ($tag): ${it.message}", it) }
+
+                    runCatching {
+                        SLM.resetConversation(
+                            model = model,
+                            supportImage = supportImage,
+                            supportAudio = supportAudio,
+                            systemMessage = systemMessage,
+                            tools = tools,
+                        )
+                    }.onFailure { Log.w(TAG, "[$requestId] resetConversation failed ($tag): ${it.message}", it) }
+
+                    if (aggressive) {
+                        runCatching {
+                            SLM.forceCleanUp(model) {
+                                Log.d(TAG, "[$requestId] forceCleanUp done ($tag)")
+                            }
+                        }.onFailure { Log.w(TAG, "[$requestId] forceCleanUp failed ($tag): ${it.message}", it) }
+                    } else {
+                        runCatching {
+                            SLM.cleanUp(model) {
+                                Log.d(TAG, "[$requestId] cleanUp scheduled ($tag)")
+                            }
+                        }.onFailure { Log.w(TAG, "[$requestId] cleanUp failed ($tag): ${it.message}", it) }
+                    }
+                }
+
+                // Normalize + cap prompt used for inference (defensive).
+                val normalized = prompt.normalizePrompt()
+                val cappedPrompt = capPromptIfNeeded(normalized, PROMPT_CHAR_CAP, PROMPT_KEEP_TAIL_CHARS)
+                val promptSha = AiTrace.sha256Short(cappedPrompt)
+
+                Log.d(
+                    TAG,
+                    "[$requestId] request start: model='${model.name}', prompt.len=${cappedPrompt.length}, sha=$promptSha, gateWaitMs=$gateWaitMs"
+                )
+                AiTrace.logLong(TAG, Log.DEBUG, "[$requestId] PROMPT (FULL) sha=$promptSha", cappedPrompt)
+
+                // Watchdog: warmup timeout / event stall / missing termination callback.
                 anchorScope.launch {
-                    while (isActive && !ctx.closeRequested.get()) {
+                    while (isActive && !closed.get()) {
                         val now = SystemClock.elapsedRealtime()
                         val elapsed = now - startAt.get()
-                        val stalled = now - lastProgressAt.get()
+                        val hasAnyToken = firstTokenAt.get() >= 0L
 
                         if (elapsed >= HARD_WATCHDOG_MS) {
-                            Log.w(TAG, "${ctx.prefix()} hard watchdog timeout (${elapsed}ms) → cleanUp/close")
-                            triggerCleanup("hard-watchdog")
-                            closeChannelOnce("hard-watchdog-timeout", CloseAction.LITERT_CLEANUP)
+                            val reason = "hard-watchdog-timeout"
+                            Log.w(TAG, "[$requestId] $reason (${elapsed}ms) → recover/close")
+                            bestEffortRecover(reason, aggressive = true)
+                            closeOnce(reason)
                             break
                         }
 
-                        if (!seenFinished.get() && stalled >= PROGRESS_STALL_MS) {
-                            Log.w(TAG, "${ctx.prefix()} progress stall (${stalled}ms) → cleanUp/close")
-                            triggerCleanup("progress-stall")
-                            closeChannelOnce("progress-stall-timeout", CloseAction.LITERT_CLEANUP)
+                        if (!hasAnyToken && elapsed >= FIRST_TOKEN_TIMEOUT_MS) {
+                            val reason = "first-token-timeout"
+                            Log.w(TAG, "[$requestId] $reason (${elapsed}ms) → recover/close")
+                            bestEffortRecover(reason, aggressive = true)
+                            closeOnce(reason)
                             break
+                        }
+
+                        if (hasAnyToken && !logicalDone.get()) {
+                            val stalled = now - lastEventAt.get()
+                            if (stalled >= EVENT_STALL_TIMEOUT_MS) {
+                                val reason = "event-stall-timeout"
+                                Log.w(TAG, "[$requestId] $reason (${stalled}ms) → recover/close")
+                                bestEffortRecover(reason, aggressive = true)
+                                closeOnce(reason)
+                                break
+                            }
+                        }
+
+                        if (logicalDone.get()) {
+                            val doneAt = logicalDoneAt.get()
+                            if (doneAt > 0L) {
+                                val afterDone = now - doneAt
+                                if (afterDone >= POST_DONE_TIMEOUT_MS) {
+                                    val reason = "post-done-termination-timeout"
+                                    Log.w(TAG, "[$requestId] $reason (${afterDone}ms) → recover/close")
+                                    bestEffortRecover(reason, aggressive = true)
+                                    closeOnce(reason)
+                                    break
+                                }
+                            }
                         }
 
                         delay(PROGRESS_POLL_MS)
                     }
                 }
 
+                val ctx = appContext
+                if (ctx != null) {
+                    val initAttempt = withTimeoutOrNull(INIT_TIMEOUT_MS) {
+                        runCatching {
+                            SLM.initializeIfNeeded(
+                                context = ctx,
+                                model = model,
+                                supportImage = supportImage,
+                                supportAudio = supportAudio,
+                                systemMessage = systemMessage,
+                                tools = tools,
+                            )
+                        }
+                    }
+
+                    when {
+                        initAttempt == null -> {
+                            val msg = "SLM.initializeIfNeeded timed out after ${INIT_TIMEOUT_MS}ms"
+                            Log.e(TAG, "[$requestId] $msg")
+                            bestEffortRecover("init-timeout", aggressive = true)
+                            closeOnce("init-timeout", RuntimeException(msg))
+                            return@withPermit
+                        }
+
+                        initAttempt.isFailure -> {
+                            val e = initAttempt.exceptionOrNull()
+                            Log.e(TAG, "[$requestId] initializeIfNeeded failed: ${e?.message}", e)
+                            bestEffortRecover("init-error", aggressive = true)
+                            closeOnce("init-error", e ?: RuntimeException("init-error"))
+                            return@withPermit
+                        }
+
+                        else -> {
+                            Log.d(TAG, "[$requestId] initializeIfNeeded ok")
+                        }
+                    }
+                } else {
+                    Log.d(TAG, "[$requestId] appContext=null → skip initializeIfNeeded (assume already initialized)")
+                }
+
+                var msgCount = 0
+
                 try {
-                    val normalizedPrompt = prompt.normalizePrompt()
-
-                    Log.d(TAG, "${ctx.prefix()} request start: prompt.len=${normalizedPrompt.length}, gateWaitMs=$gateWaitMs")
-                    AiTrace.logLong(TAG, Log.DEBUG, "${ctx.prefix()} PROMPT (FULL)", normalizedPrompt)
-
-                    LiteRtLM.runInference(
+                    SLM.runInference(
                         model = model,
-                        input = normalizedPrompt,
-                        resultListener = { partial, finished ->
-                            if (ctx.closeRequested.get()) return@runInference
+                        input = cappedPrompt,
+                        resultListener = { partial, done ->
+                            if (closed.get()) return@runInference
 
-                            markProgress()
+                            markEvent()
+                            msgCount++
 
                             val delta = normalizer.toDelta(partial)
                             if (delta.isNotEmpty()) {
                                 appendOutput(delta)
-                                out.trySend(delta)
+                                val r = emitCh.trySend(delta)
+                                if (r.isFailure && DEBUG_STREAM) {
+                                    Log.w(TAG, "[$requestId] emitCh.trySend failed: ${r.exceptionOrNull()?.message}")
+                                }
                             }
 
-                            if (finished && !ctx.closeRequested.get()) {
-                                seenFinished.set(true)
-                                // Stream termination signal (NOT native cleanup completion).
-                                if (!streamDone.isCompleted) streamDone.complete(Unit)
-                                closeChannelOnce("finished", CloseAction.LITERT_CLEANUP)
+                            if (DEBUG_STREAM && (msgCount == 1 || msgCount % DEBUG_STREAM_EVERY_N == 0)) {
+                                val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                                val sPreview = snapshotOutput().take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                                Log.d(
+                                    TAG,
+                                    "stream[rid=$requestId msg#$msgCount] done=$done " +
+                                            "deltaLen=${delta.length} outLen=${snapshotOutput().length} " +
+                                            "outPreview='$sPreview' deltaPreview='$dPreview'"
+                                )
+                            }
+
+                            if (done) {
+                                if (logicalDone.compareAndSet(false, true)) {
+                                    logicalDoneAt.set(SystemClock.elapsedRealtime())
+                                }
+                                Log.d(TAG, "[$requestId] logical done=true (waiting cleanUpListener)")
                             }
                         },
                         cleanUpListener = {
-                            // IMPORTANT: This is a "stream terminated" hook, not "native cleanup done".
-                            markProgress()
-                            if (!streamDone.isCompleted) streamDone.complete(Unit)
-
-                            if (!ctx.closeRequested.get()) {
-                                closeChannelOnce("stream-terminated", CloseAction.LITERT_CLEANUP)
-                            }
+                            if (closed.get()) return@runInference
+                            markEvent()
+                            Log.d(TAG, "[$requestId] cleanUpListener (native termination safe point)")
+                            closeOnce("native-terminated")
                         },
                         onError = { message ->
-                            markProgress()
-                            if (!streamDone.isCompleted) streamDone.complete(Unit)
-                            triggerCleanup("onError")
-                            closeChannelOnce("litert-error", CloseAction.LITERT_CLEANUP, RuntimeException(message))
-                        },
+                            if (closed.get()) return@runInference
+
+                            markEvent()
+                            val msg = message.trim()
+                            val upper = msg.uppercase(Locale.US)
+
+                            val isCancelled =
+                                upper.contains("CANCELLED") ||
+                                        upper.contains("CANCELED") ||
+                                        msg.equals("Cancelled", ignoreCase = true)
+
+                            val tag = cancelTag.get()
+
+                            if (isCancelled && tag != null) {
+                                Log.w(TAG, "[$requestId] onError(cancelled): '$msg' tag='$tag' → close without exception")
+                                closeOnce(tag)
+                                return@runInference
+                            }
+
+                            Log.e(TAG, "[$requestId] onError: '$msg'")
+                            bestEffortRecover("onError", aggressive = true)
+                            closeOnce("error", RuntimeException(msg))
+                        }
                     )
                 } catch (t: Throwable) {
-                    Log.e(TAG, "${ctx.prefix()} LiteRtLM.runInference threw: ${t.message}", t)
-                    if (!streamDone.isCompleted) streamDone.complete(Unit)
+                    Log.e(TAG, "[$requestId] runInference threw: ${t.message}", t)
+                    bestEffortRecover("exception", aggressive = true)
+                    closeOnce("exception", t)
+                }
 
-                    triggerCleanup("exception")
-
-                    if (t is CancellationException) {
-                        closeChannelOnce("cancelled", CloseAction.LITERT_CLEANUP, null)
-                    } else {
-                        closeChannelOnce("exception", CloseAction.LITERT_CLEANUP, t)
-                    }
-                } finally {
-                    awaitClose {
-                        if (!ctx.closeRequested.get()) {
-                            if (!streamDone.isCompleted) streamDone.complete(Unit)
-                            triggerCleanup("collector-cancel")
-                            closeChannelOnce("collector-cancel", CloseAction.LITERT_CLEANUP)
-                        }
-                    }
-
-                    try {
-                        cleanupLiteRt()
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "${ctx.prefix()} cleanupLiteRt failed: ${e.message}", e)
+                // IMPORTANT: awaitClose must always run to clean up resources.
+                awaitClose {
+                    if (!closed.get()) {
+                        val reason = "collector-cancel"
+                        Log.d(TAG, "[$requestId] awaitClose: collector-cancel → recover/close")
+                        cancelTag.compareAndSet(null, reason)
+                        bestEffortRecover(reason, aggressive = true)
+                        closeOnce(reason)
                     }
                 }
             }
         }
             .buffer(Channel.BUFFERED)
-            .flowOn(Dispatchers.IO)
-}
-
-/* ====================================================================== */
-/*  Unified Single/Double step support                                    */
-/* ====================================================================== */
-
-enum class OutputKeyStyle {
-    LEGACY,
-    SNAKE_CASE,
-}
-
-enum class TwoStepStage {
-    EVAL,
-    FOLLOW_UP,
-}
-
-sealed class AiRequestMode {
-
-    data class SingleStep(
-        val passThroughStreaming: Boolean = true,
-    ) : AiRequestMode()
-
-    data class DoubleStep(
-        val options: TwoStepOptions = TwoStepOptions(),
-    ) : AiRequestMode()
-}
-
-data class TwoStepOptions(
-    val evalOkScoreThreshold: Int = 85,
-    val skipFollowupWhenOk: Boolean = true,
-    val followupOnEvalParseError: Boolean = true,
-    val outputKeyStyle: OutputKeyStyle = OutputKeyStyle.LEGACY,
-    val emitEvalChunks: Boolean = false,
-    val emitFollowupChunks: Boolean = false,
-    val emitFinalMergedJson: Boolean = true,
-    val followupOverridesAllFields: Boolean = false,
-    val includeGatingFieldsInFinal: Boolean = false,
-    val includeMetaInFinal: Boolean = false,
-)
-
-/**
- * Debug helper: annotate userPrompt with stage markers for log readability.
- *
- * NOTE:
- * - This does NOT affect the model prompt prefix/suffix contract.
- * - It only helps logcat/file trace show EVAL vs FOLLOW_UP.
- */
-private fun tagUserPromptForStage(stage: TwoStepStage, userPrompt: String): String {
-    val marker = when (stage) {
-        TwoStepStage.EVAL -> "=== TWO_STEP_STAGE: EVAL ==="
-        TwoStepStage.FOLLOW_UP -> "=== TWO_STEP_STAGE: FOLLOW_UP ==="
+            .flowOn(Dispatchers.Default)
     }
-    return compactJoin(marker, userPrompt)
-}
-
-fun Repository.requestWithMode(
-    userPrompt: String,
-    mode: AiRequestMode = AiRequestMode.SingleStep(),
-): Flow<String> = flow {
-    when (mode) {
-        is AiRequestMode.SingleStep -> {
-            val prompt = buildPrompt(userPrompt)
-            request(prompt).collect { delta ->
-                if (mode.passThroughStreaming) emit(delta)
-            }
-        }
-
-        is AiRequestMode.DoubleStep -> {
-            val opts = mode.options
-            val metaRid = SystemClock.elapsedRealtime()
-
-            val evalUserPrompt = buildEvalUserPrompt(
-                baseUserPrompt = userPrompt,
-                threshold = opts.evalOkScoreThreshold,
-                keyStyle = opts.outputKeyStyle,
-            )
-
-            val evalPrompt = buildPrompt(tagUserPromptForStage(TwoStepStage.EVAL, evalUserPrompt))
-
-            val evalRaw = collectFlowToString(
-                upstream = request(evalPrompt),
-                emitChunks = opts.emitEvalChunks,
-                emit = { chunk -> emit(chunk) },
-            )
-
-            val evalJsonStr = extractFirstJsonObject(evalRaw) ?: ""
-            val evalParsed = parseEvalJson(
-                jsonStr = evalJsonStr,
-                keyStyle = opts.outputKeyStyle,
-            )
-
-            if (evalParsed == null) {
-                if (!opts.followupOnEvalParseError) {
-                    if (opts.emitFinalMergedJson) {
-                        emit(wrapAsFallbackJson(evalRaw, opts.outputKeyStyle, error = "eval_json_parse_failed"))
-                    }
-                    return@flow
-                }
-            } else {
-                val needsFollowup = decideNeedsFollowup(evalParsed, opts.evalOkScoreThreshold)
-                val ok = !needsFollowup
-
-                if (ok && opts.skipFollowupWhenOk) {
-                    val finalJson = buildFinalJsonFromEval(
-                        eval = evalParsed,
-                        keyStyle = opts.outputKeyStyle,
-                        includeGating = opts.includeGatingFieldsInFinal,
-                        includeMeta = opts.includeMetaInFinal,
-                        metaRid = metaRid,
-                        metaMode = "single_eval_ok",
-                    )
-                    if (opts.emitFinalMergedJson) emit(finalJson)
-                    return@flow
-                }
-            }
-
-            val followUserPrompt = buildFollowupUserPrompt(
-                baseUserPrompt = userPrompt,
-                evalMissingHint = evalParsed?.missing,
-                keyStyle = opts.outputKeyStyle,
-            )
-
-            val followPrompt = buildPrompt(tagUserPromptForStage(TwoStepStage.FOLLOW_UP, followUserPrompt))
-
-            val followRaw = collectFlowToString(
-                upstream = request(followPrompt),
-                emitChunks = opts.emitFollowupChunks,
-                emit = { chunk -> emit(chunk) },
-            )
-
-            val followJsonStr = extractFirstJsonObject(followRaw) ?: ""
-            val followParsed = parseFollowupJson(
-                jsonStr = followJsonStr,
-                keyStyle = opts.outputKeyStyle,
-            )
-
-            val finalMerged = mergeEvalAndFollowup(
-                eval = evalParsed,
-                follow = followParsed,
-                rawEval = evalRaw,
-                rawFollow = followRaw,
-                opts = opts,
-                metaRid = metaRid,
-            )
-
-            if (opts.emitFinalMergedJson) emit(finalMerged)
-        }
-    }
-}
-
-/* ====================================================================== */
-/*  Two-step helpers                                                      */
-/* ====================================================================== */
-
-private data class EvalResult(
-    val analysis: String?,
-    val expected: String?,
-    val followupQuestion: String?,
-    val score: Int?,
-    val needsFollowup: Boolean?,
-    val missing: String?,
-)
-
-private data class FollowupResult(
-    val analysis: String?,
-    val expected: String?,
-    val followupQuestion: String?,
-    val score: Int?,
-)
-
-private suspend fun collectFlowToString(
-    upstream: Flow<String>,
-    emitChunks: Boolean,
-    emit: suspend (String) -> Unit,
-): String {
-    val sb = StringBuilder(8 * 1024)
-    upstream.collect { delta ->
-        if (delta.isEmpty()) return@collect
-        sb.append(delta)
-        if (emitChunks) emit(delta)
-    }
-    return sb.toString()
-}
-
-private fun buildEvalUserPrompt(
-    baseUserPrompt: String,
-    threshold: Int,
-    keyStyle: OutputKeyStyle,
-): String {
-    val keys = keysForStyle(keyStyle)
-    val override = buildString {
-        appendLine("OVERRIDE: EVAL STEP (validation).")
-        appendLine("Return RAW JSON only (no markdown, no extra text).")
-        appendLine("Required keys:")
-        appendLine(" - \"${keys.analysis}\" (short)")
-        appendLine(" - \"${keys.expected}\" (short)")
-        appendLine(" - \"${keys.followup}\" (single question or empty string)")
-        appendLine(" - \"${keys.score}\" (integer 1-100)")
-        appendLine("Additional gating keys (required):")
-        appendLine(" - \"needs_followup\" (true/false)")
-        appendLine(" - \"missing\" (short string or empty)")
-        appendLine("Rules:")
-        appendLine(" - If score >= $threshold: set needs_followup=false and set \"${keys.followup}\" to \"\".")
-        appendLine(" - If score < $threshold: set needs_followup=true and ask ONE concrete follow-up question.")
-    }
-    return compactJoin(override, baseUserPrompt)
-}
-
-private fun buildFollowupUserPrompt(
-    baseUserPrompt: String,
-    evalMissingHint: String?,
-    keyStyle: OutputKeyStyle,
-): String {
-    val keys = keysForStyle(keyStyle)
-    val hintLine = evalMissingHint?.takeIf { it.isNotBlank() }?.let { "Hint (missing): $it" } ?: ""
-    val override = buildString {
-        appendLine("OVERRIDE: FOLLOW_UP STEP (generate a single clarifying question).")
-        appendLine("Return RAW JSON only (no markdown, no extra text).")
-        appendLine("Keys:")
-        appendLine(" - \"${keys.analysis}\" (short)")
-        appendLine(" - \"${keys.expected}\" (short)")
-        appendLine(" - \"${keys.followup}\" (ONE single-scope question)")
-        appendLine(" - \"${keys.score}\" (integer 1-100)")
-        if (hintLine.isNotBlank()) appendLine(hintLine)
-        appendLine("Rules:")
-        appendLine(" - Focus ONLY on the best next follow-up question to clarify the respondent's original answer.")
-        appendLine(" - Keep it concrete, answerable immediately, and not multi-part.")
-    }
-    return compactJoin(override, baseUserPrompt)
-}
-
-private fun decideNeedsFollowup(eval: EvalResult, threshold: Int): Boolean {
-    eval.needsFollowup?.let { return it }
-    val score = eval.score
-    if (score != null) return score < threshold
-    return true
-}
-
-private fun parseEvalJson(jsonStr: String, keyStyle: OutputKeyStyle): EvalResult? {
-    if (jsonStr.isBlank()) return null
-    return try {
-        val obj = JSONObject(jsonStr)
-        val keys = keysForStyle(keyStyle)
-        EvalResult(
-            analysis = obj.optStringAny(keys.analysis, "analysis"),
-            expected = obj.optStringAny(keys.expected, "expected_answer", "expected answer", "expectedAnswer"),
-            followupQuestion = obj.optStringAny(keys.followup, "follow_up_question", "follow-up question", "followup_question"),
-            score = obj.optIntAny(keys.score, "score"),
-            needsFollowup = obj.optBooleanAny("needs_followup", "needsFollowup", "needs followup"),
-            missing = obj.optStringAny("missing", "missing_field", "missing fields"),
-        )
-    } catch (_: JSONException) {
-        null
-    }
-}
-
-private fun parseFollowupJson(jsonStr: String, keyStyle: OutputKeyStyle): FollowupResult? {
-    if (jsonStr.isBlank()) return null
-    return try {
-        val obj = JSONObject(jsonStr)
-        val keys = keysForStyle(keyStyle)
-        FollowupResult(
-            analysis = obj.optStringAny(keys.analysis, "analysis"),
-            expected = obj.optStringAny(keys.expected, "expected_answer", "expected answer", "expectedAnswer"),
-            followupQuestion = obj.optStringAny(keys.followup, "follow_up_question", "follow-up question", "followup_question"),
-            score = obj.optIntAny(keys.score, "score"),
-        )
-    } catch (_: JSONException) {
-        null
-    }
-}
-
-private fun buildFinalJsonFromEval(
-    eval: EvalResult,
-    keyStyle: OutputKeyStyle,
-    includeGating: Boolean,
-    includeMeta: Boolean,
-    metaRid: Long,
-    metaMode: String,
-): String {
-    val keys = keysForStyle(keyStyle)
-    val out = JSONObject()
-    out.put(keys.analysis, eval.analysis ?: "")
-    out.put(keys.expected, eval.expected ?: "")
-    out.put(keys.followup, eval.followupQuestion ?: "")
-    out.put(keys.score, eval.score ?: 0)
-
-    if (includeGating) {
-        out.put("needs_followup", eval.needsFollowup ?: false)
-        out.put("missing", eval.missing ?: "")
-    }
-    if (includeMeta) {
-        out.put("_meta_rid", metaRid)
-        out.put("_meta_mode", metaMode)
-    }
-    return out.toString()
-}
-
-private fun mergeEvalAndFollowup(
-    eval: EvalResult?,
-    follow: FollowupResult?,
-    rawEval: String,
-    rawFollow: String,
-    opts: TwoStepOptions,
-    metaRid: Long,
-): String {
-    val keys = keysForStyle(opts.outputKeyStyle)
-
-    if (eval == null && follow == null) {
-        return wrapAsFallbackJson(
-            rawOutput = compactJoin("EVAL_RAW:\n$rawEval", "FOLLOW_RAW:\n$rawFollow"),
-            keyStyle = opts.outputKeyStyle,
-            error = "both_steps_parse_failed",
-        )
-    }
-
-    val baseAnalysis = eval?.analysis ?: follow?.analysis ?: ""
-    val baseExpected = eval?.expected ?: follow?.expected ?: ""
-    val baseScore = eval?.score ?: follow?.score ?: 0
-    val baseFollowup = eval?.followupQuestion ?: follow?.followupQuestion ?: ""
-
-    val followFollowup = follow?.followupQuestion?.takeIf { it.isNotBlank() }
-    val followAnalysis = follow?.analysis?.takeIf { it.isNotBlank() }
-    val followExpected = follow?.expected?.takeIf { it.isNotBlank() }
-    val followScore = follow?.score
-
-    val out = JSONObject()
-
-    if (opts.followupOverridesAllFields) {
-        out.put(keys.analysis, followAnalysis ?: baseAnalysis)
-        out.put(keys.expected, followExpected ?: baseExpected)
-        out.put(keys.followup, followFollowup ?: baseFollowup)
-        out.put(keys.score, followScore ?: baseScore)
-    } else {
-        out.put(keys.analysis, baseAnalysis)
-        out.put(keys.expected, baseExpected)
-        out.put(keys.followup, followFollowup ?: baseFollowup)
-        out.put(keys.score, baseScore)
-    }
-
-    if (opts.includeGatingFieldsInFinal) {
-        out.put("needs_followup", true)
-        out.put("missing", eval?.missing ?: "")
-    }
-
-    if (opts.includeMetaInFinal) {
-        out.put("_meta_rid", metaRid)
-        out.put("_meta_mode", "two_step_merged")
-    }
-
-    return out.toString()
-}
-
-private fun wrapAsFallbackJson(rawOutput: String, keyStyle: OutputKeyStyle, error: String): String {
-    val keys = keysForStyle(keyStyle)
-    val out = JSONObject()
-    out.put(keys.analysis, "")
-    out.put(keys.expected, "")
-    out.put(keys.followup, "")
-    out.put(keys.score, 0)
-    out.put("_error", error)
-    out.put("_raw", rawOutput.take(20_000))
-    return out.toString()
-}
-
-private fun extractFirstJsonObject(text: String): String? {
-    val s = text.normalizePrompt()
-    val firstBrace = s.indexOf('{')
-    if (firstBrace < 0) return null
-
-    var start = -1
-    var depth = 0
-    var inString = false
-    var escaped = false
-
-    for (i in firstBrace until s.length) {
-        val c = s[i]
-
-        if (inString) {
-            if (escaped) {
-                escaped = false
-            } else {
-                when (c) {
-                    '\\' -> escaped = true
-                    '"' -> inString = false
-                }
-            }
-            continue
-        }
-
-        when (c) {
-            '"' -> inString = true
-            '{' -> {
-                if (depth == 0) start = i
-                depth++
-            }
-            '}' -> {
-                if (depth > 0) depth--
-                if (depth == 0 && start >= 0) return s.substring(start, i + 1)
-            }
-        }
-    }
-    return null
-}
-
-private data class KeySet(
-    val analysis: String,
-    val expected: String,
-    val followup: String,
-    val score: String,
-)
-
-private fun keysForStyle(style: OutputKeyStyle): KeySet {
-    return when (style) {
-        OutputKeyStyle.LEGACY -> KeySet(
-            analysis = "analysis",
-            expected = "expected answer",
-            followup = "follow-up question",
-            score = "score",
-        )
-        OutputKeyStyle.SNAKE_CASE -> KeySet(
-            analysis = "analysis",
-            expected = "expected_answer",
-            followup = "follow_up_question",
-            score = "score",
-        )
-    }
-}
-
-/* ====================================================================== */
-/*  JSONObject small utilities                                             */
-/* ====================================================================== */
-
-private fun JSONObject.optStringAny(vararg keys: String): String? {
-    for (k in keys) {
-        if (!has(k) || isNull(k)) continue
-        val v = opt(k)
-        when (v) {
-            is String -> return v
-            is Number, is Boolean -> return v.toString()
-            else -> {
-                val s = optString(k, "")
-                if (s.isNotBlank()) return s
-            }
-        }
-    }
-    return null
-}
-
-private fun JSONObject.optIntAny(vararg keys: String): Int? {
-    for (k in keys) {
-        if (!has(k) || isNull(k)) continue
-        val v = opt(k)
-        when (v) {
-            is Int -> return v
-            is Long -> return v.toInt()
-            is Double -> return v.toInt()
-            is Float -> return v.toInt()
-            is String -> {
-                val n = v.trim().toIntOrNull()
-                if (n != null) return n
-            }
-        }
-    }
-    return null
-}
-
-private fun JSONObject.optBooleanAny(vararg keys: String): Boolean? {
-    for (k in keys) {
-        if (!has(k) || isNull(k)) continue
-        val v = opt(k)
-        when (v) {
-            is Boolean -> return v
-            is String -> {
-                val t = v.trim().lowercase(Locale.US)
-                if (t == "true") return true
-                if (t == "false") return false
-            }
-            is Number -> return v.toInt() != 0
-        }
-    }
-    return null
 }
