@@ -28,14 +28,13 @@
  * ================================================================
  */
 
-package com.negi.whispers.media
+package com.negi.survey.whisper
 
 import android.util.Log
 import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.floor
 import kotlin.math.min
 
 private const val LOG_TAG = "WaveCodec"
