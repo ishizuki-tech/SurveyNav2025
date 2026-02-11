@@ -80,9 +80,7 @@ class GitHubUploadWorker(
 
         val mode = inputData.getString(KEY_MODE)?.lowercase(Locale.US) ?: MODE_FILE
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            ensureChannel()
-        }
+        ensureChannel()
 
         val notifTitleBase = when (mode) {
             MODE_LOGCAT -> "Uploading logcat"
@@ -154,14 +152,12 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to "Pending file is empty: $filePath"))
         }
 
-        if (fileSize > MAX_CONTENTS_API_BYTES_HINT) {
-            return Result.failure(
-                workDataOf(
-                    ERROR_MESSAGE to
-                            "File too large for GitHub Contents API " +
-                            "(size=$fileSize, limit~$MAX_CONTENTS_API_BYTES_HINT)."
-                )
-            )
+        val maxBytesHint = inputData.getLong(KEY_FILE_MAX_BYTES_HINT, MAX_CONTENTS_API_BYTES_HINT)
+        if (fileSize > maxBytesHint) {
+            val msg =
+                "File too large for this upload path (size=$fileSize, limit~$maxBytesHint). " +
+                        "For PCM_16BIT MONO WAV: bytes = 44 + seconds * sampleRateHz * 2."
+            return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
         val remotePathForUi = buildDatedRemotePath(cfg.pathPrefix, fileName)
@@ -169,7 +165,8 @@ class GitHubUploadWorker(
         Log.d(
             TAG,
             "doFileUpload: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
-                    "prefix='${cfg.pathPrefix}' filePath=$filePath fileName=$fileName size=$fileSize"
+                    "prefix='${cfg.pathPrefix}' filePath=$filePath fileName=$fileName size=$fileSize " +
+                    "maxBytesHint=$maxBytesHint"
         )
 
         return try {
@@ -376,7 +373,6 @@ class GitHubUploadWorker(
     /**
      * Ensure the notification channel for upload progress exists.
      */
-    @RequiresApi(Build.VERSION_CODES.O)
     private fun ensureChannel() {
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
@@ -397,7 +393,21 @@ class GitHubUploadWorker(
         private const val CHANNEL_ID = "uploads"
         private const val NOTIF_BASE = 3200
         private const val MAX_ATTEMPTS = 5
-        private const val MAX_CONTENTS_API_BYTES_HINT = 900_000L
+
+        /**
+         * Soft guardrail for payload size before upload.
+         *
+         * For PCM_16BIT MONO WAV, rough size is:
+         *   bytes = 44 + seconds * sampleRateHz * 2
+         *
+         * Examples:
+         * - 16kHz, 180s: 44 + 180 * 16000 * 2 = 5,760,044 bytes (~5.49 MiB)
+         * - 48kHz, 180s: 44 + 180 * 48000 * 2 = 17,280,044 bytes (~16.48 MiB)
+         *
+         * Keep this as a "hint" to avoid accidentally trying to upload very large files.
+         * Override per-request via [KEY_FILE_MAX_BYTES_HINT] if needed.
+         */
+        private const val MAX_CONTENTS_API_BYTES_HINT = 20_000_000L
 
         private val TEXT_EXTENSIONS = setOf("json", "jsonl", "txt", "csv")
 
@@ -420,6 +430,12 @@ class GitHubUploadWorker(
         // File input keys
         const val KEY_FILE_PATH = "filePath"
         const val KEY_FILE_NAME = "fileName"
+
+        /**
+         * Optional per-request override for the file size hint.
+         * Use this when audio settings change (sample rate / duration) without touching this worker.
+         */
+        const val KEY_FILE_MAX_BYTES_HINT = "file.maxBytesHint"
 
         // Logcat input keys
         const val KEY_LOG_REMOTE_DIR = "log.remoteDir"

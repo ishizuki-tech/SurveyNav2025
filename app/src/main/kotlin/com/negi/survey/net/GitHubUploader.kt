@@ -41,8 +41,9 @@ import org.json.JSONObject
  * - Retry transient failures with backoff (429, 5xx, network IO).
  *
  * Notes:
- * - GitHub Contents API is not designed for large binaries.
- * - Prefer gzip + tail for logs. Use Releases/Git LFS for big files.
+ * - GitHub Contents API is not designed for extremely large binaries.
+ * - Storing many WAV files inside a git repo can bloat clone/pull over time.
+ * - Consider Releases assets or external object storage for long-term scaling.
  */
 object GitHubUploader {
 
@@ -55,19 +56,30 @@ object GitHubUploader {
     private const val DEFAULT_MESSAGE = "Upload via SurveyNav"
 
     /**
-     * Conservative guard for raw bytes before Base64 expansion.
+     * Default guard for raw bytes before Base64 expansion.
      *
      * Base64 expands by ~4/3; request JSON adds overhead.
+     *
+     * For PCM_16BIT MONO WAV:
+     *   bytes ≈ 44 + seconds * sampleRateHz * 2
+     *
+     * Examples (180s):
+     * - 16kHz: 44 + 180*16000*2 = 5,760,044 bytes
+     * - 48kHz: 44 + 180*48000*2 = 17,280,044 bytes
      */
-    private const val MAX_RAW_BYTES = 850_000
+    private const val DEFAULT_MAX_RAW_BYTES = 20_000_000
 
     /**
-     * Conservative guard for final JSON request size (rough).
+     * Default guard for the final JSON request size (rough).
      *
      * This is not an official GitHub limit; it is a safety guard to prevent
-     * confusing failures on mobile networks and Contents API.
+     * confusing failures on mobile networks and memory pressure on device.
+     *
+     * Roughly:
+     *   requestBytes ≈ JSON_overhead + Base64(contentBytes)
+     *   Base64(contentBytes) ≈ ceil(contentBytes/3)*4
      */
-    private const val MAX_REQUEST_BYTES = 1_250_000
+    private const val DEFAULT_MAX_REQUEST_BYTES = 32_000_000
 
     /**
      * Configuration container for GitHub upload operations.
@@ -80,7 +92,9 @@ object GitHubUploader {
         val repo: String,
         val token: String,
         val branch: String = "main",
-        val pathPrefix: String = ""
+        val pathPrefix: String = "",
+        val maxRawBytesHint: Int = DEFAULT_MAX_RAW_BYTES,
+        val maxRequestBytesHint: Int = DEFAULT_MAX_REQUEST_BYTES
     )
 
     /**
@@ -112,7 +126,9 @@ object GitHubUploader {
         token = cfg.token,
         content = content,
         message = message,
-        onProgress = onProgress
+        onProgress = onProgress,
+        maxRawBytesHint = cfg.maxRawBytesHint,
+        maxRequestBytesHint = cfg.maxRequestBytesHint
     )
 
     /**
@@ -126,7 +142,9 @@ object GitHubUploader {
         token: String,
         content: String,
         message: String = DEFAULT_MESSAGE,
-        onProgress: (Int) -> Unit = {}
+        onProgress: (Int) -> Unit = {},
+        maxRawBytesHint: Int = DEFAULT_MAX_RAW_BYTES,
+        maxRequestBytesHint: Int = DEFAULT_MAX_REQUEST_BYTES
     ): UploadResult = uploadBytes(
         owner = owner,
         repo = repo,
@@ -135,7 +153,9 @@ object GitHubUploader {
         token = token,
         contentBytes = content.toByteArray(Charsets.UTF_8),
         message = message,
-        onProgress = onProgress
+        onProgress = onProgress,
+        maxRawBytesHint = maxRawBytesHint,
+        maxRequestBytesHint = maxRequestBytesHint
     )
 
     // ---------------------------------------------------------------------
@@ -159,7 +179,9 @@ object GitHubUploader {
         token = cfg.token,
         bytes = bytes,
         message = message,
-        onProgress = onProgress
+        onProgress = onProgress,
+        maxRawBytesHint = cfg.maxRawBytesHint,
+        maxRequestBytesHint = cfg.maxRequestBytesHint
     )
 
     /**
@@ -173,7 +195,9 @@ object GitHubUploader {
         token: String,
         bytes: ByteArray,
         message: String = DEFAULT_MESSAGE,
-        onProgress: (Int) -> Unit = {}
+        onProgress: (Int) -> Unit = {},
+        maxRawBytesHint: Int = DEFAULT_MAX_RAW_BYTES,
+        maxRequestBytesHint: Int = DEFAULT_MAX_REQUEST_BYTES
     ): UploadResult = uploadBytes(
         owner = owner,
         repo = repo,
@@ -182,7 +206,9 @@ object GitHubUploader {
         token = token,
         contentBytes = bytes,
         message = message,
-        onProgress = onProgress
+        onProgress = onProgress,
+        maxRawBytesHint = maxRawBytesHint,
+        maxRequestBytesHint = maxRequestBytesHint
     )
 
     // ---------------------------------------------------------------------
@@ -206,7 +232,9 @@ object GitHubUploader {
         token: String,
         contentBytes: ByteArray,
         message: String,
-        onProgress: (Int) -> Unit
+        onProgress: (Int) -> Unit,
+        maxRawBytesHint: Int,
+        maxRequestBytesHint: Int
     ): UploadResult = withContext(Dispatchers.IO) {
 
         require(owner.isNotBlank()) { "GitHub owner cannot be blank." }
@@ -215,18 +243,21 @@ object GitHubUploader {
         require(path.isNotBlank()) { "GitHub path cannot be blank." }
         require(token.isNotBlank()) { "GitHub token cannot be blank." }
 
-        if (contentBytes.size > MAX_RAW_BYTES) {
-            throw IOException(
-                "Content too large for Contents API guard " +
-                        "(size=${contentBytes.size} bytes, limit=$MAX_RAW_BYTES)."
-            )
+        val rawSize = contentBytes.size
+        if (rawSize > maxRawBytesHint) {
+            val msg =
+                "Content too large for upload guard (size=$rawSize, limit=$maxRawBytesHint). " +
+                        "Base64 expands ~4/3; request grows further due to JSON. " +
+                        "For PCM_16BIT MONO WAV: bytes ≈ 44 + seconds * sampleRateHz * 2."
+            throw IOException(msg)
         }
 
         val encodedPath = encodePath(path)
 
         Log.d(
             TAG,
-            "uploadBytes: owner=$owner repo=$repo branch=$branch path=$path size=${contentBytes.size}"
+            "uploadBytes: owner=$owner repo=$repo branch=$branch path=$path size=$rawSize " +
+                    "maxRawBytesHint=$maxRawBytesHint maxRequestBytesHint=$maxRequestBytesHint"
         )
 
         // Phase 1 — Lookup existing SHA
@@ -245,12 +276,13 @@ object GitHubUploader {
         }.toString()
 
         val requestBytes = payload.toByteArray(Charsets.UTF_8)
-        if (requestBytes.size > MAX_REQUEST_BYTES) {
-            throw IOException(
-                "Request too large for Contents API guard " +
-                        "(requestBytes=${requestBytes.size}, limit=$MAX_REQUEST_BYTES). " +
-                        "Consider stronger gzip/tail or alternative upload path."
-            )
+        if (requestBytes.size > maxRequestBytesHint) {
+            val msg =
+                "Request too large for upload guard " +
+                        "(requestBytes=${requestBytes.size}, limit=$maxRequestBytesHint). " +
+                        "ContentBytes=$rawSize; Base64 expands ~4/3. " +
+                        "Consider stronger compression or alternate upload path for long-term scaling."
+            throw IOException(msg)
         }
 
         val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath")

@@ -17,7 +17,8 @@ plugins {
 android {
     namespace = "com.whispercpp"
     compileSdk = 36
-    ndkVersion = "28.1.13356709"
+    ndkVersion = "29.0.14206865"
+
 
     defaultConfig {
         minSdk = 26

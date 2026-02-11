@@ -38,7 +38,6 @@ package com.negi.survey.net
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.util.Log
 import com.negi.survey.BuildConfig
 import java.io.File
@@ -77,8 +76,7 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         // prevents crashes during LOCKED_BOOT_COMPLETED, even though it may not
         // find the files unless you also store them there.
         val storageContext = when {
-            action == ACTION_LOCKED_BOOT_COMPLETED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N ->
-                context.createDeviceProtectedStorageContext()
+            action == ACTION_LOCKED_BOOT_COMPLETED -> context.createDeviceProtectedStorageContext()
             else -> context
         }
 

@@ -39,7 +39,7 @@ import androidx.lifecycle.viewModelScope
 import com.negi.survey.screens.SpeechController
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.whisper.WhisperEngine
-import com.negi.whispers.recorder.Recorder
+import com.negi.survey.whisper.Recorder
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest

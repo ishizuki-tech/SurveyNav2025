@@ -17,7 +17,6 @@ import android.content.Context
 import android.os.Debug
 import android.os.SystemClock
 import android.util.Log
-import com.negi.whispers.media.decodeWaveFile
 import com.whispercpp.whisper.WhisperContext
 import java.io.File
 import java.util.Locale
