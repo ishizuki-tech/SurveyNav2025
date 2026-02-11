@@ -1017,7 +1017,7 @@ fun SurveyNavHost(
                         onStart = {
                             Log.d(MainActivity.TAG, "Home -> Start survey. session=$sessionId")
                             vmSurvey.resetToStart()
-                            vmAI.resetAll(keepError = false)
+                            vmAI.resetStates(keepError = false)
                             vmSurvey.advanceToNext()
                         }
                     )

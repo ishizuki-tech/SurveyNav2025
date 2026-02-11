@@ -29,7 +29,6 @@ import android.content.Context
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -64,12 +63,28 @@ class GitHubUploadWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
+        // Keep Worker-side hint and Uploader-side hint consistent.
+        val maxFileBytesHint =
+            inputData.getLong(KEY_FILE_MAX_BYTES_HINT, MAX_CONTENTS_API_BYTES_HINT)
+                .coerceAtLeast(1L)
+
+        val maxRawBytesHint = maxFileBytesHint
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
+
+        val maxRequestBytesHint = inputData.getInt(
+            KEY_FILE_MAX_REQUEST_BYTES_HINT,
+            estimateRequestBytesHint(maxRawBytesHint)
+        )
+
         val cfg = GitHubUploader.GitHubConfig(
             owner = inputData.getString(KEY_OWNER).orEmpty(),
             repo = inputData.getString(KEY_REPO).orEmpty(),
             token = inputData.getString(KEY_TOKEN).orEmpty(),
             branch = inputData.getString(KEY_BRANCH)?.takeIf { it.isNotBlank() } ?: "main",
-            pathPrefix = inputData.getString(KEY_PATH_PREFIX).orEmpty()
+            pathPrefix = inputData.getString(KEY_PATH_PREFIX).orEmpty(),
+            maxRawBytesHint = maxRawBytesHint,
+            maxRequestBytesHint = maxRequestBytesHint
         )
 
         if (cfg.owner.isBlank() || cfg.repo.isBlank() || cfg.token.isBlank()) {
@@ -166,7 +181,7 @@ class GitHubUploadWorker(
             TAG,
             "doFileUpload: owner=${cfg.owner} repo=${cfg.repo} branch=${cfg.branch} " +
                     "prefix='${cfg.pathPrefix}' filePath=$filePath fileName=$fileName size=$fileSize " +
-                    "maxBytesHint=$maxBytesHint"
+                    "maxBytesHint=$maxBytesHint rawHint=${cfg.maxRawBytesHint} reqHint=${cfg.maxRequestBytesHint}"
         )
 
         return try {
@@ -403,11 +418,17 @@ class GitHubUploadWorker(
          * Examples:
          * - 16kHz, 180s: 44 + 180 * 16000 * 2 = 5,760,044 bytes (~5.49 MiB)
          * - 48kHz, 180s: 44 + 180 * 48000 * 2 = 17,280,044 bytes (~16.48 MiB)
-         *
-         * Keep this as a "hint" to avoid accidentally trying to upload very large files.
-         * Override per-request via [KEY_FILE_MAX_BYTES_HINT] if needed.
          */
         private const val MAX_CONTENTS_API_BYTES_HINT = 20_000_000L
+
+        /**
+         * Default request (JSON) bytes hint.
+         *
+         * Rough estimate:
+         * - Base64 expands by ~4/3.
+         * - JSON overhead adds some extra bytes.
+         */
+        private const val DEFAULT_MAX_REQUEST_BYTES_HINT = 32_000_000
 
         private val TEXT_EXTENSIONS = setOf("json", "jsonl", "txt", "csv")
 
@@ -432,10 +453,16 @@ class GitHubUploadWorker(
         const val KEY_FILE_NAME = "fileName"
 
         /**
-         * Optional per-request override for the file size hint.
-         * Use this when audio settings change (sample rate / duration) without touching this worker.
+         * Optional per-request override for the raw file size hint.
          */
         const val KEY_FILE_MAX_BYTES_HINT = "file.maxBytesHint"
+
+        /**
+         * Optional per-request override for the estimated request bytes hint.
+         *
+         * If omitted, we estimate from [KEY_FILE_MAX_BYTES_HINT].
+         */
+        const val KEY_FILE_MAX_REQUEST_BYTES_HINT = "file.maxRequestBytesHint"
 
         // Logcat input keys
         const val KEY_LOG_REMOTE_DIR = "log.remoteDir"
@@ -456,12 +483,31 @@ class GitHubUploadWorker(
         const val ERROR_MESSAGE = "error"
 
         /**
+         * Estimate a reasonable request-bytes guard from raw-bytes hint.
+         *
+         * Base64 size (ceil(n/3)*4) + overhead.
+         */
+        private fun estimateRequestBytesHint(rawBytesHint: Int): Int {
+            val raw = rawBytesHint.toLong().coerceAtLeast(1L)
+            val b64 = ((raw + 2L) / 3L) * 4L
+            val overhead = 2_000_000L
+            val est = b64 + overhead
+            val floor = DEFAULT_MAX_REQUEST_BYTES_HINT.toLong()
+            val out = maxOf(floor, est)
+            return out.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        }
+
+        /**
          * Enqueue a work request to upload an existing file.
          */
         fun enqueueExistingPayload(
             context: Context,
             cfg: GitHubUploader.GitHubConfig,
-            file: File
+            file: File,
+            maxBytesHint: Long = MAX_CONTENTS_API_BYTES_HINT,
+            maxRequestBytesHint: Int = estimateRequestBytesHint(
+                maxBytesHint.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            )
         ) {
             val name = file.name
 
@@ -476,7 +522,9 @@ class GitHubUploadWorker(
                             KEY_BRANCH to cfg.branch,
                             KEY_PATH_PREFIX to cfg.pathPrefix,
                             KEY_FILE_PATH to file.absolutePath,
-                            KEY_FILE_NAME to name
+                            KEY_FILE_NAME to name,
+                            KEY_FILE_MAX_BYTES_HINT to maxBytesHint,
+                            KEY_FILE_MAX_REQUEST_BYTES_HINT to maxRequestBytesHint
                         )
                     )
                     .setConstraints(
