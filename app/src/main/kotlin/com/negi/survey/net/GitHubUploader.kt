@@ -14,8 +14,10 @@
 package com.negi.survey.net
 
 import android.util.Base64
+import android.util.Base64OutputStream
 import android.util.Log
 import java.io.BufferedReader
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -159,7 +161,7 @@ object GitHubUploader {
     )
 
     // ---------------------------------------------------------------------
-    // Public APIs — Binary Upload
+    // Public APIs — Binary Upload (ByteArray)
     // ---------------------------------------------------------------------
 
     /**
@@ -212,17 +214,73 @@ object GitHubUploader {
     )
 
     // ---------------------------------------------------------------------
+    // Public APIs — Binary Upload (File streaming)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Upload a local file using [GitHubConfig] (includes date folder).
+     *
+     * This avoids loading the entire file into memory.
+     */
+    suspend fun uploadFile(
+        cfg: GitHubConfig,
+        relativePath: String,
+        file: File,
+        message: String = DEFAULT_MESSAGE,
+        onProgress: (Int) -> Unit = {}
+    ): UploadResult = uploadFile(
+        owner = cfg.owner,
+        repo = cfg.repo,
+        branch = cfg.branch,
+        path = buildPath(cfg.pathPrefix, relativePath),
+        token = cfg.token,
+        file = file,
+        message = message,
+        onProgress = onProgress,
+        maxRawBytesHint = cfg.maxRawBytesHint,
+        maxRequestBytesHint = cfg.maxRequestBytesHint
+    )
+
+    /**
+     * Upload a local file to an explicit [path] (no auto date folder).
+     *
+     * This avoids loading the entire file into memory.
+     */
+    suspend fun uploadFile(
+        owner: String,
+        repo: String,
+        branch: String,
+        path: String,
+        token: String,
+        file: File,
+        message: String = DEFAULT_MESSAGE,
+        onProgress: (Int) -> Unit = {},
+        maxRawBytesHint: Int = DEFAULT_MAX_RAW_BYTES,
+        maxRequestBytesHint: Int = DEFAULT_MAX_REQUEST_BYTES
+    ): UploadResult {
+        require(file.exists() && file.isFile) { "File does not exist: ${file.absolutePath}" }
+        val rawSize = file.length().coerceAtLeast(0L)
+        return uploadStream(
+            owner = owner,
+            repo = repo,
+            branch = branch,
+            path = path,
+            token = token,
+            rawSize = rawSize,
+            openStream = { file.inputStream() },
+            message = message,
+            onProgress = onProgress,
+            maxRawBytesHint = maxRawBytesHint,
+            maxRequestBytesHint = maxRequestBytesHint
+        )
+    }
+
+    // ---------------------------------------------------------------------
     // Shared Implementation
     // ---------------------------------------------------------------------
 
     /**
-     * Shared implementation for both JSON/text and binary uploads.
-     *
-     * Flow:
-     * 1) Validate args and payload size (raw + estimated request size).
-     * 2) GET existing SHA (if any).
-     * 3) PUT Base64 payload to Contents API.
-     * 4) Parse JSON response.
+     * Shared implementation for ByteArray uploads (calls [uploadStream]).
      */
     private suspend fun uploadBytes(
         owner: String,
@@ -235,6 +293,41 @@ object GitHubUploader {
         onProgress: (Int) -> Unit,
         maxRawBytesHint: Int,
         maxRequestBytesHint: Int
+    ): UploadResult = uploadStream(
+        owner = owner,
+        repo = repo,
+        branch = branch,
+        path = path,
+        token = token,
+        rawSize = contentBytes.size.toLong(),
+        openStream = { contentBytes.inputStream() },
+        message = message,
+        onProgress = onProgress,
+        maxRawBytesHint = maxRawBytesHint,
+        maxRequestBytesHint = maxRequestBytesHint
+    )
+
+    /**
+     * Shared implementation for both JSON/text and binary uploads.
+     *
+     * Flow:
+     * 1) Validate args and payload size (raw + estimated request size).
+     * 2) GET existing SHA (if any).
+     * 3) PUT Base64 payload to Contents API (streaming).
+     * 4) Parse JSON response.
+     */
+    private suspend fun uploadStream(
+        owner: String,
+        repo: String,
+        branch: String,
+        path: String,
+        token: String,
+        rawSize: Long,
+        openStream: () -> InputStream,
+        message: String,
+        onProgress: (Int) -> Unit,
+        maxRawBytesHint: Int,
+        maxRequestBytesHint: Int
     ): UploadResult = withContext(Dispatchers.IO) {
 
         require(owner.isNotBlank()) { "GitHub owner cannot be blank." }
@@ -243,8 +336,7 @@ object GitHubUploader {
         require(path.isNotBlank()) { "GitHub path cannot be blank." }
         require(token.isNotBlank()) { "GitHub token cannot be blank." }
 
-        val rawSize = contentBytes.size
-        if (rawSize > maxRawBytesHint) {
+        if (rawSize > maxRawBytesHint.toLong()) {
             val msg =
                 "Content too large for upload guard (size=$rawSize, limit=$maxRawBytesHint). " +
                         "Base64 expands ~4/3; request grows further due to JSON. " +
@@ -256,7 +348,7 @@ object GitHubUploader {
 
         Log.d(
             TAG,
-            "uploadBytes: owner=$owner repo=$repo branch=$branch path=$path size=$rawSize " +
+            "uploadStream: owner=$owner repo=$repo branch=$branch path=$path size=$rawSize " +
                     "maxRawBytesHint=$maxRawBytesHint maxRequestBytesHint=$maxRequestBytesHint"
         )
 
@@ -265,42 +357,66 @@ object GitHubUploader {
         val existingSha = getExistingSha(owner, repo, branch, encodedPath, token)
         onProgress(10)
 
-        // Phase 2 — Prepare JSON payload
-        val b64 = Base64.encodeToString(contentBytes, Base64.NO_WRAP)
+        // Phase 2 — Prepare streaming body pieces + size guard (estimate, fail-fast)
+        val msgJson = JSONObject.quote(message.ifBlank { DEFAULT_MESSAGE })
+        val branchJson = JSONObject.quote(branch)
+        val shaJson = existingSha?.takeIf { it.isNotBlank() }?.let { JSONObject.quote(it) }
 
-        val payload = JSONObject().apply {
-            put("message", message.ifBlank { DEFAULT_MESSAGE })
-            put("branch", branch)
-            put("content", b64)
-            if (!existingSha.isNullOrBlank()) put("sha", existingSha)
-        }.toString()
+        val prefix = "{\"message\":$msgJson,\"branch\":$branchJson,\"content\":\""
+        val suffix = if (shaJson != null) "\",\"sha\":$shaJson}" else "\"}"
 
-        val requestBytes = payload.toByteArray(Charsets.UTF_8)
-        if (requestBytes.size > maxRequestBytesHint) {
+        val prefixBytes = prefix.toByteArray(Charsets.UTF_8)
+        val suffixBytes = suffix.toByteArray(Charsets.UTF_8)
+
+        val b64Len = estimateBase64Length(rawSize)
+        val totalLenLong = prefixBytes.size.toLong() + b64Len + suffixBytes.size.toLong()
+
+        if (totalLenLong > maxRequestBytesHint.toLong()) {
             val msg =
                 "Request too large for upload guard " +
-                        "(requestBytes=${requestBytes.size}, limit=$maxRequestBytesHint). " +
+                        "(requestBytes~$totalLenLong, limit=$maxRequestBytesHint). " +
                         "ContentBytes=$rawSize; Base64 expands ~4/3. " +
                         "Consider stronger compression or alternate upload path for long-term scaling."
             throw IOException(msg)
         }
 
         val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath")
-        val total = requestBytes.size
 
         val writeBody: (HttpURLConnection) -> Unit = { conn ->
-            conn.setFixedLengthStreamingMode(total)
-            conn.outputStream.use { os: OutputStream ->
-                val chunk = 8 * 1024
-                var off = 0
-                while (off < total) {
-                    val len = min(chunk, total - off)
-                    os.write(requestBytes, off, len)
-                    off += len
+            val totalLen = totalLenLong
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt()
 
-                    val pct = 10 + ((off.toDouble() / total) * 80.0).toInt()
-                    onProgress(min(90, pct))
+            conn.setFixedLengthStreamingMode(totalLen)
+
+            conn.outputStream.use { os ->
+                // Write JSON prefix
+                os.write(prefixBytes)
+
+                // Stream Base64 content without allocating a giant String/ByteArray
+                val b64Out = Base64OutputStream(NonClosingOutputStream(os), Base64.NO_WRAP)
+
+                var sent = 0L
+                val buf = ByteArray(8 * 1024)
+
+                openStream().use { ins ->
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        b64Out.write(buf, 0, n)
+                        sent += n.toLong()
+
+                        if (rawSize > 0L) {
+                            val pct = 10 + ((sent.toDouble() / rawSize.toDouble()) * 80.0).toInt()
+                            onProgress(min(90, pct))
+                        }
+                    }
                 }
+
+                b64Out.close() // flush base64 padding without closing underlying os
+
+                // Write JSON suffix
+                os.write(suffixBytes)
                 os.flush()
             }
         }
@@ -331,7 +447,7 @@ object GitHubUploader {
                 ?.optString("sha")
                 ?.takeIf { it.isNotBlank() }
 
-        Log.d(TAG, "uploadBytes: done url=$fileUrl sha=$commitSha")
+        Log.d(TAG, "uploadStream: done url=$fileUrl sha=$commitSha")
         UploadResult(fileUrl, commitSha)
     }
 
@@ -360,6 +476,7 @@ object GitHubUploader {
      * Retries:
      * - 429
      * - 5xx
+     * - 403 with Retry-After (secondary rate limit style)
      * - IOException network errors
      *
      * Honors Retry-After if present.
@@ -407,8 +524,11 @@ object GitHubUploader {
 
                 val errBody = conn.errorStream?.use(::readAll).orEmpty()
 
-                if (code == 429 || code in 500..599) {
-                    val retryAfter = parseRetryAfterSeconds(headers)
+                val retryAfter = parseRetryAfterSeconds(headers)
+                val isTransient =
+                    code == 429 || code in 500..599 || (code == 403 && retryAfter != null)
+
+                if (isTransient) {
                     throw TransientHttpException(code, errBody, retryAfter)
                 }
 
@@ -520,6 +640,29 @@ object GitHubUploader {
             null
         } finally {
             conn.disconnect()
+        }
+    }
+
+    /**
+     * Estimate Base64 output length for a given raw byte size.
+     *
+     * Base64 length = ceil(n/3)*4
+     */
+    private fun estimateBase64Length(rawBytes: Long): Long {
+        val n = rawBytes.coerceAtLeast(0L)
+        return ((n + 2L) / 3L) * 4L
+    }
+
+    /**
+     * OutputStream wrapper that ignores close() to allow Base64OutputStream to finalize
+     * without closing the underlying network stream.
+     */
+    private class NonClosingOutputStream(private val delegate: OutputStream) : OutputStream() {
+        override fun write(b: Int) = delegate.write(b)
+        override fun write(b: ByteArray, off: Int, len: Int) = delegate.write(b, off, len)
+        override fun flush() = delegate.flush()
+        override fun close() {
+            // Intentionally no-op
         }
     }
 }

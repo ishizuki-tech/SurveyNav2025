@@ -36,6 +36,9 @@ object GitHubDiagnosticsConfigStore {
     private const val KEY_BRANCH = "branch"
     private const val KEY_PREFIX = "prefix"
 
+    @Volatile
+    private var cachedPrefs: SharedPreferences? = null
+
     /**
      * Persist GitHub config used for deferred crash/log uploads.
      *
@@ -80,24 +83,38 @@ object GitHubDiagnosticsConfigStore {
 
     /**
      * Build preferences, preferring encrypted storage.
+     *
+     * NOTE:
+     * - We cache the SharedPreferences instance to avoid repeated MasterKey creation.
+     * - We use applicationContext to avoid leaking short-lived contexts.
      */
-    @Suppress("DEPRECATION")
     private fun prefs(context: Context): SharedPreferences {
-        return runCatching {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
+        cachedPrefs?.let { return it }
 
-            EncryptedSharedPreferences.create(
-                context,
-                PREF_NAME,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        }.getOrElse {
-            Log.w(TAG, "Encrypted prefs unavailable; falling back to plain prefs: ${it.message}")
-            context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        synchronized(this) {
+            cachedPrefs?.let { return it }
+
+            val appContext = context.applicationContext
+
+            val created = runCatching {
+                val masterKey = MasterKey.Builder(appContext)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+
+                EncryptedSharedPreferences.create(
+                    appContext,
+                    PREF_NAME,
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                )
+            }.getOrElse { e ->
+                Log.w(TAG, "Encrypted prefs unavailable; falling back to plain prefs: ${e.message}")
+                appContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            }
+
+            cachedPrefs = created
+            return created
         }
     }
 }

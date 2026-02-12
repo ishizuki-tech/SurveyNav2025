@@ -2,18 +2,10 @@
  * =====================================================================
  *  IshizukiTech LLC — SLM Integration Framework
  *  ---------------------------------------------------------------------
- *  File: CrashLogStore.kt
+ *  File: SupabaseCrashLogStore.kt
  *  Author: Shu Ishizuki (石附 支)
  *  License: MIT License
  *  © 2025 IshizukiTech LLC. All rights reserved.
- * =====================================================================
- *
- *  Summary:
- *  ---------------------------------------------------------------------
- *  Captures crash reports (stacktrace + logcat tail) into local files.
- *  Intended flow:
- *   - On crash: write a gzipped crash bundle to internal storage.
- *   - On next launch: scan pending bundles and schedule WorkManager uploads.
  * =====================================================================
  */
 
@@ -22,74 +14,40 @@
 package com.negi.survey.net
 
 import android.content.Context
-import android.content.pm.PackageInfo
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import androidx.core.content.pm.PackageInfoCompat
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
+import kotlin.math.min
 
-private const val TAG = "CrashLogStore"
+private const val TAG = "SupabaseCrashLogStore"
 
-/**
- * Crash log capture + deferred upload scheduler.
- *
- * Design goals:
- * - Crash-time code must be fast and never throw.
- * - Upload happens later via WorkManager (GitHubUploadWorker).
- * - Stored artifacts are small (tail + gzip) to fit GitHub Contents API.
- */
-object CrashLogStore {
+object SupabaseCrashLogStore {
 
-    /** Directory under internal storage for pending crash bundles. */
-    private const val DIR_PENDING_CRASH = "pending_uploads/crashlogs"
+    private const val DIR_PENDING = "pending_uploads/supabase/crashlogs"
 
-    /** Keep last N lines from logcat main/system buffers. */
     private const val LOGCAT_TAIL_LINES = 1200
-
-    /** Keep last N lines from the crash buffer. */
     private const val LOGCAT_CRASH_TAIL_LINES = 200
 
-    /** Hard cap for uncompressed crash bundle bytes (before gzip). */
     private const val MAX_UNCOMPRESSED_BYTES = 850_000
-
-    /**
-     * Operational cap for gz crash payload bytes to keep repo bloat under control.
-     *
-     * This is NOT an official GitHub limit. It is a practical cap for diagnostics files.
-     */
     private const val CRASH_GZ_MAX_BYTES_DEFAULT = 900_000
 
-    /**
-     * Install an UncaughtExceptionHandler that writes a crash bundle to disk.
-     *
-     * IMPORTANT:
-     * - This does NOT prevent the crash.
-     * - It chains to the previous default handler after writing.
-     *
-     * Also:
-     * - On every normal app start, it schedules pending crash bundle uploads using saved config.
-     *   This prevents "we forgot to call schedule()" incidents.
-     */
+    /** Remote directory hint passed to SupabaseUploadWorker. */
+    private const val REMOTE_DIR_CRASH = "crash"
+
     fun install(context: Context) {
         val appContext = context.applicationContext
-
-        // On each start, try to schedule any pending crash bundles.
-        runCatching {
-            schedulePendingUploadsFromSavedConfig(appContext)
-        }.onFailure { e ->
-            Log.w(TAG, "Failed to schedule pending crash uploads: ${e.message}", e)
-        }
-
         val prev = Thread.getDefaultUncaughtExceptionHandler()
 
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -98,83 +56,57 @@ object CrashLogStore {
             }.onFailure { e ->
                 Log.w(TAG, "Crash bundle write failed: ${e.message}", e)
             }
-
-            // Always delegate to the original handler (keeps system behavior).
             prev?.uncaughtException(thread, throwable)
         }
 
-        Log.i(TAG, "CrashLogStore installed.")
+        Log.i(TAG, "SupabaseCrashLogStore installed.")
     }
 
-    /**
-     * Schedule uploads for any pending crash bundles using the saved GitHub config.
-     *
-     * If no config is available (token not set), this is a no-op.
-     */
     fun schedulePendingUploadsFromSavedConfig(context: Context) {
-        val cfg = GitHubDiagnosticsConfigStore.load(context) ?: run {
-            Log.w(TAG, "No GitHub config saved; skip crashlog upload scheduling.")
+        val cfg = SupabaseDiagnosticsConfigStore.load(context) ?: run {
+            Log.w(TAG, "No Supabase config saved; skip crashlog upload scheduling.")
             return
         }
-
-        val uploadCfg = cfg.copy(pathPrefix = "diagnostics/crashlogs")
-        schedulePendingUploads(context, uploadCfg)
+        schedulePendingUploads(context, cfg)
     }
 
-    /**
-     * Schedule uploads for pending crash bundles using the provided config.
-     *
-     * This enqueues one WorkManager job per file, and the worker deletes the file on success.
-     */
     fun schedulePendingUploads(
         context: Context,
-        cfg: GitHubUploader.GitHubConfig
+        cfg: SupabaseUploader.SupabaseConfig
     ) {
         val dir = pendingDir(context)
-        val files = dir.listFiles()
-            ?.filter { it.isFile && it.length() > 0L }
-            ?.filter { !it.name.endsWith(".tmp", ignoreCase = true) } // avoid partial crash writes
-            ?: emptyList()
+        val files = dir.listFiles()?.filter { it.isFile && it.length() > 0L } ?: emptyList()
+
+        Log.d(TAG, "schedulePendingUploads: dir=${dir.absolutePath} files=${files.size} remoteDir=$REMOTE_DIR_CRASH")
 
         if (files.isEmpty()) {
             Log.d(TAG, "No pending crash bundles.")
             return
         }
 
-        // Oldest first (stable behavior).
         files.sortedBy { it.lastModified() }.forEach { f ->
-            GitHubUploadWorker.enqueueExistingPayload(
+            Log.i(TAG, "Enqueue crash bundle: name=${f.name} bytes=${f.length()} remoteDir=$REMOTE_DIR_CRASH upsert=false")
+            SupabaseUploadWorker.enqueueExistingPayload(
                 context = context,
                 cfg = cfg,
-                file = f
+                file = f,
+                remoteDir = REMOTE_DIR_CRASH,
+                contentType = "application/gzip",
+                upsert = false
             )
         }
 
-        Log.i(TAG, "Scheduled ${files.size} crash bundle upload(s).")
+        Log.i(TAG, "Scheduled ${files.size} crash bundle upload(s) to Supabase.")
     }
 
-    /**
-     * Write a gzipped crash bundle to internal storage.
-     *
-     * The bundle contains:
-     * - Device/app header
-     * - Stacktrace
-     * - logcat tail (PID-filtered, best-effort)
-     * - crash buffer tail (best-effort)
-     */
     private fun writeCrashBundle(
         context: Context,
         thread: Thread,
         throwable: Throwable
     ) {
         val pid = Process.myPid()
-
-        // Use millis + short UUID suffix to avoid filename collisions on rapid repeated crashes.
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }.format(Date())
-        val nonce = UUID.randomUUID().toString().substring(0, 8)
-        val name = "crash_${stamp}_pid${pid}_$nonce.log.gz"
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val name = "crash_${stamp}_pid${pid}.log.gz"
 
         val dir = pendingDir(context)
         val outFile = File(dir, name)
@@ -183,7 +115,6 @@ object CrashLogStore {
         val header = buildHeader(context, pid, thread)
         val stack = buildStacktrace(throwable)
 
-        // Best-effort logcat (may be restricted on some devices/ROMs).
         val logMain = collectLogcatTail(pid = pid, tailLines = LOGCAT_TAIL_LINES)
         val logCrash = collectLogcatCrashTail(tailLines = LOGCAT_CRASH_TAIL_LINES)
 
@@ -211,7 +142,6 @@ object CrashLogStore {
             if (outFile.exists()) runCatching { outFile.delete() }
             val renamed = tmpFile.renameTo(outFile)
             if (!renamed) {
-                // Fallback to direct write if rename fails.
                 outFile.writeBytes(gz)
                 runCatching { tmpFile.delete() }
             }
@@ -222,17 +152,15 @@ object CrashLogStore {
         Log.i(TAG, "Crash bundle written: ${outFile.absolutePath} (${gz.size} bytes gz)")
     }
 
-    /**
-     * Build a short diagnostic header for correlation.
-     */
     private fun buildHeader(context: Context, pid: Int, thread: Thread): String {
         val pkg = context.packageName
         val pm = context.packageManager
-
         val pkgInfo = runCatching { pm.getPackageInfo(pkg, 0) }.getOrNull()
 
         val versionName = pkgInfo?.versionName ?: "unknown"
-        val versionCode = getVersionCodeCompat(pkgInfo)
+        val versionCode = runCatching {
+            if (pkgInfo != null) PackageInfoCompat.getLongVersionCode(pkgInfo) else -1L
+        }.getOrDefault(-1L)
 
         val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
@@ -251,35 +179,12 @@ object CrashLogStore {
         }
     }
 
-    /**
-     * Get versionCode as Long safely on all API levels (minSdk=26+).
-     */
-    private fun getVersionCodeCompat(pkgInfo: PackageInfo?): Long {
-        if (pkgInfo == null) return -1L
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            pkgInfo.longVersionCode
-        } else {
-            @Suppress("DEPRECATION")
-            pkgInfo.versionCode.toLong()
-        }
-    }
-
-    /**
-     * Convert Throwable to a full stacktrace string.
-     */
     private fun buildStacktrace(t: Throwable): String {
         val sw = StringWriter()
         PrintWriter(sw).use { pw -> t.printStackTrace(pw) }
         return sw.toString()
     }
 
-    /**
-     * Collect logcat tail for the current app process.
-     *
-     * Notes:
-     * - Uses `--pid` so it should mainly capture your app logs.
-     * - Some devices may still restrict access; returns a short error string then.
-     */
     private fun collectLogcatTail(pid: Int, tailLines: Int): String {
         val cmd = listOf(
             "logcat",
@@ -291,7 +196,6 @@ object CrashLogStore {
         val out = runCommand(cmd, timeoutMs = 1200L)
         if (!looksLikePidUnsupported(out)) return out
 
-        // Fallback without --pid
         val fb = listOf(
             "logcat",
             "-d",
@@ -308,13 +212,6 @@ object CrashLogStore {
         }
     }
 
-    /**
-     * Collect logcat crash buffer tail.
-     *
-     * Notes:
-     * - `-b crash` usually includes AndroidRuntime fatal exceptions.
-     * - Access may vary by device.
-     */
     private fun collectLogcatCrashTail(tailLines: Int): String {
         val cmd = listOf(
             "logcat",
@@ -326,13 +223,6 @@ object CrashLogStore {
         return runCommand(cmd, timeoutMs = 1200L)
     }
 
-    /**
-     * Run a shell command and return stdout as text (best-effort).
-     *
-     * Crash handler safety rules:
-     * - If the process does not finish within [timeoutMs], we do NOT read the stream
-     *   to avoid blocking. We return a short timeout message.
-     */
     private fun runCommand(cmd: List<String>, timeoutMs: Long): String {
         return try {
             val proc = ProcessBuilder(cmd)
@@ -348,16 +238,12 @@ object CrashLogStore {
 
             val out = proc.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             runCatching { proc.destroy() }
-
             if (out.isBlank()) "(logcat empty or restricted)\n" else out
         } catch (t: Throwable) {
             "(command failed: ${t.message})\n"
         }
     }
 
-    /**
-     * Heuristic: detect PID option unsupported patterns.
-     */
     private fun looksLikePidUnsupported(output: String): Boolean {
         val s = output.lowercase(Locale.US)
         val mentionsPid = s.contains("pid")
@@ -370,20 +256,12 @@ object CrashLogStore {
         return mentionsPid && looksLikeOptionError
     }
 
-    /**
-     * Keep only the tail portion when exceeding max bytes.
-     */
     private fun trimToTail(bytes: ByteArray, maxBytes: Int): ByteArray {
         if (bytes.size <= maxBytes) return bytes
         val start = bytes.size - maxBytes
         return bytes.copyOfRange(start, bytes.size)
     }
 
-    /**
-     * Gzip compress and best-effort fit under [maxGzBytes].
-     *
-     * This function must never throw (crash-time path).
-     */
     private fun gzipAndFitToMaxBytesBestEffort(input: ByteArray, maxGzBytes: Int): ByteArray {
         return runCatching {
             var current = input
@@ -394,11 +272,7 @@ object CrashLogStore {
                 val nextMax = (current.size * 0.75).toInt().coerceAtLeast(50_000)
                 current = trimToTail(current, nextMax)
 
-                Log.w(
-                    TAG,
-                    "gzip too large (attempt=$attempt gz=${gz.size} > maxGzBytes=$maxGzBytes). " +
-                            "Trimming tail to $nextMax bytes and retrying."
-                )
+                Log.w(TAG, "gzip too large (attempt=$attempt gz=${gz.size} > maxGzBytes=$maxGzBytes). trimming to $nextMax")
             }
             gzip(current)
         }.getOrElse { t ->
@@ -407,18 +281,12 @@ object CrashLogStore {
         }
     }
 
-    /**
-     * Gzip compress for size safety.
-     */
     private fun gzip(input: ByteArray): ByteArray {
         val bos = ByteArrayOutputStream()
         GZIPOutputStream(bos).use { it.write(input) }
         return bos.toByteArray()
     }
 
-    /**
-     * Get the internal pending directory.
-     */
     private fun pendingDir(context: Context): File =
-        File(context.filesDir, DIR_PENDING_CRASH).apply { mkdirs() }
+        File(context.filesDir, DIR_PENDING).apply { mkdirs() }
 }

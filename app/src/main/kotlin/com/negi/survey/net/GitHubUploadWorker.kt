@@ -50,7 +50,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
-import kotlin.math.max
 
 /**
  * Coroutine-based [WorkManager] worker responsible for uploading either:
@@ -113,11 +112,11 @@ class GitHubUploadWorker(
             )
         )
 
-        var lastPct = -1
+        val lastPctRef = intArrayOf(-1)
         val progressCallback: (Int) -> Unit = progressCallback@{ pct ->
             val clamped = pct.coerceIn(0, 100)
-            if (clamped == lastPct) return@progressCallback
-            lastPct = clamped
+            if (clamped == lastPctRef[0]) return@progressCallback
+            lastPctRef[0] = clamped
 
             setProgressAsync(
                 workDataOf(
@@ -135,9 +134,11 @@ class GitHubUploadWorker(
             )
         }
 
+        val currentPct: () -> Int = { lastPctRef[0].coerceAtLeast(0) }
+
         return when (mode) {
-            MODE_LOGCAT -> doLogcatUpload(cfg, notifId, progressCallback)
-            else -> doFileUpload(cfg, notifId, progressCallback)
+            MODE_LOGCAT -> doLogcatUpload(cfg, notifId, progressCallback, currentPct)
+            else -> doFileUpload(cfg, notifId, progressCallback, currentPct)
         }
     }
 
@@ -148,6 +149,7 @@ class GitHubUploadWorker(
         cfg: GitHubUploader.GitHubConfig,
         notifId: Int,
         onProgress: (Int) -> Unit,
+        currentPct: () -> Int,
     ): Result {
 
         val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
@@ -175,6 +177,15 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
+        // Fail-fast guardrail: raw bytes can fit, but request bytes may exceed limits due to base64 expansion.
+        val estRequestBytes = estimateBase64RequestBytes(fileSize)
+        if (estRequestBytes > cfg.maxRequestBytesHint.toLong()) {
+            val msg =
+                "Request too large for this upload path (raw=$fileSize, request~$estRequestBytes, " +
+                        "limit~${cfg.maxRequestBytesHint}). Base64 expands by ~4/3."
+            return Result.failure(workDataOf(ERROR_MESSAGE to msg))
+        }
+
         val remotePathForUi = buildDatedRemotePath(cfg.pathPrefix, fileName)
 
         Log.d(
@@ -190,7 +201,9 @@ class GitHubUploadWorker(
 
             val result = if (isText) {
                 val text = runCatching { pendingFile.readText(Charsets.UTF_8) }.getOrElse {
-                    return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}"))
+                    return Result.failure(
+                        workDataOf(ERROR_MESSAGE to "Failed to read text file: ${it.message}")
+                    )
                 }
 
                 GitHubUploader.uploadJson(
@@ -201,14 +214,11 @@ class GitHubUploadWorker(
                     onProgress = onProgress
                 )
             } else {
-                val bytes = runCatching { pendingFile.readBytes() }.getOrElse {
-                    return Result.failure(workDataOf(ERROR_MESSAGE to "Failed to read binary file: ${it.message}"))
-                }
-
+                // Stream upload to avoid loading the entire binary into memory.
                 GitHubUploader.uploadFile(
                     cfg = cfg,
                     relativePath = fileName,
-                    bytes = bytes,
+                    file = pendingFile,
                     message = "Upload $fileName (deferred)",
                     onProgress = onProgress
                 )
@@ -240,7 +250,7 @@ class GitHubUploadWorker(
             setForegroundAsync(
                 foregroundInfo(
                     notificationId = notifId,
-                    pct = max(0, inputData.getInt(PROGRESS_PCT, 0)),
+                    pct = currentPct(),
                     title = "Upload failed: $fileName",
                     error = true
                 )
@@ -260,6 +270,7 @@ class GitHubUploadWorker(
         cfg: GitHubUploader.GitHubConfig,
         notifId: Int,
         onProgress: (Int) -> Unit,
+        currentPct: () -> Int,
     ): Result {
 
         val remoteDir = inputData.getString(KEY_LOG_REMOTE_DIR) ?: "diagnostics/logs"
@@ -305,7 +316,7 @@ class GitHubUploadWorker(
             setForegroundAsync(
                 foregroundInfo(
                     notificationId = notifId,
-                    pct = max(0, inputData.getInt(PROGRESS_PCT, 0)),
+                    pct = currentPct(),
                     title = "Log upload failed",
                     error = true
                 )
@@ -341,6 +352,7 @@ class GitHubUploadWorker(
         // Avoid retrying obvious auth/permanent failures.
         if (msg.contains("401")) return false
         if (msg.contains("403")) return false
+        if (msg.contains("422")) return false
         if (msg.contains("bad credentials", ignoreCase = true)) return false
         if (msg.contains("requires authentication", ignoreCase = true)) return false
 
@@ -483,15 +495,24 @@ class GitHubUploadWorker(
         const val ERROR_MESSAGE = "error"
 
         /**
-         * Estimate a reasonable request-bytes guard from raw-bytes hint.
+         * Estimate base64-encoded request bytes from raw bytes.
          *
-         * Base64 size (ceil(n/3)*4) + overhead.
+         * Note: This is a coarse guardrail used to fail fast before attempting a large request.
          */
-        private fun estimateRequestBytesHint(rawBytesHint: Int): Int {
-            val raw = rawBytesHint.toLong().coerceAtLeast(1L)
+        private fun estimateBase64RequestBytes(rawBytes: Long): Long {
+            val raw = rawBytes.coerceAtLeast(1L)
             val b64 = ((raw + 2L) / 3L) * 4L
             val overhead = 2_000_000L
-            val est = b64 + overhead
+            return b64 + overhead
+        }
+
+        /**
+         * Estimate a reasonable request-bytes guard from raw-bytes hint.
+         *
+         * Base64 size (ceil(n/3)*4) + overhead, with a minimum floor.
+         */
+        private fun estimateRequestBytesHint(rawBytesHint: Int): Int {
+            val est = estimateBase64RequestBytes(rawBytesHint.toLong())
             val floor = DEFAULT_MAX_REQUEST_BYTES_HINT.toLong()
             val out = maxOf(floor, est)
             return out.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
