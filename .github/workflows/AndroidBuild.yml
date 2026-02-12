@@ -170,22 +170,75 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.gradle"
 
-          # Secrets may be empty. Keep builds working.
+          # ------------------------------
+          # GitHub export target (BuildConfig.*)
+          # ------------------------------
+          GH_OWNER="${{ vars.GH_OWNER }}"
+          GH_REPO="${{ vars.GH_REPO }}"
+          GH_BRANCH="${{ vars.GH_BRANCH }}"
+          GH_PATH_PREFIX="${{ vars.GH_PATH_PREFIX }}"
           GH_TOKEN="${{ secrets.GH_TOKEN }}"
-          HF_TOKEN="${{ secrets.HF_TOKEN }}"
 
-          if [[ -z "${GH_TOKEN}" ]]; then
+          # Fallbacks (keep CI working even if vars are missing)
+          if [[ -z "$GH_OWNER" ]]; then GH_OWNER="${{ env.OWNER }}"; fi
+          if [[ -z "$GH_REPO"  ]]; then GH_REPO="SurveyExports"; fi
+          if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
+          if [[ -z "$GH_PATH_PREFIX" ]]; then GH_PATH_PREFIX=""; fi
+
+          if [[ -z "$GH_TOKEN" ]]; then
             echo "::warning::GH_TOKEN is not configured. BuildConfig GH_TOKEN will be empty."
           fi
 
-          cat <<PROPS > "$HOME/.gradle/gradle.properties"
-          gh.owner=${{ env.OWNER }}
-          gh.token=${GH_TOKEN}
-          HF_TOKEN=${HF_TOKEN}
+          # ------------------------------
+          # Supabase (optional)
+          # ------------------------------
+          SUPABASE_URL="${{ secrets.SUPABASE_URL }}"
+          SUPABASE_ANON_KEY="${{ secrets.SUPABASE_ANON_KEY }}"
+          SUPABASE_LOG_BUCKET="${{ vars.SUPABASE_LOG_BUCKET }}"
+          SUPABASE_LOG_PREFIX="${{ vars.SUPABASE_LOG_PREFIX }}"
+
+          if [[ -z "$SUPABASE_LOG_BUCKET" ]]; then SUPABASE_LOG_BUCKET="logs"; fi
+          if [[ -z "$SUPABASE_LOG_PREFIX" ]]; then SUPABASE_LOG_PREFIX="surveyapp"; fi
+
+          # ------------------------------
+          # Hugging Face (optional)
+          # ------------------------------
+          HF_TOKEN="${{ secrets.HF_TOKEN }}"
+
+          # Write properties (support both github.* and legacy gh.*)
+          cat > "$HOME/.gradle/gradle.properties" <<PROPS
+          # ---- GitHub config ----
+          github.owner=$GH_OWNER
+          github.repo=$GH_REPO
+          github.branch=$GH_BRANCH
+          github.pathPrefix=$GH_PATH_PREFIX
+          github.token=$GH_TOKEN
+
+          gh.owner=$GH_OWNER
+          gh.repo=$GH_REPO
+          gh.branch=$GH_BRANCH
+          gh.pathPrefix=$GH_PATH_PREFIX
+          gh.token=$GH_TOKEN
+
+          # ---- Supabase config ----
+          supabase.url=$SUPABASE_URL
+          supabase.anonKey=$SUPABASE_ANON_KEY
+          supabase.logBucket=$SUPABASE_LOG_BUCKET
+          supabase.logPrefix=$SUPABASE_LOG_PREFIX
+
+          # ---- Hugging Face token ----
+          hf.token=$HF_TOKEN
+          HF_TOKEN=$HF_TOKEN
           PROPS
 
           echo "::group::gradle.properties (redacted view)"
-          sed -E 's/(gh\\.token=).+/\1***REDACTED***/g; s/(HF_TOKEN=).+/\1***REDACTED***/g' "$HOME/.gradle/gradle.properties" || true
+          sed -E \
+            -e 's/(github\.token=).+/\1***REDACTED***/g' \
+            -e 's/(gh\.token=).+/\1***REDACTED***/g' \
+            -e 's/(supabase\.anonKey=).+/\1***REDACTED***/g' \
+            -e 's/(HF_TOKEN=).+/\1***REDACTED***/g' \
+            -e 's/(hf\.token=).+/\1***REDACTED***/g' \
+            "$HOME/.gradle/gradle.properties" || true
           echo "::endgroup::"
 
       - name: Resolve versionName/tag + versionCode (with validation)
