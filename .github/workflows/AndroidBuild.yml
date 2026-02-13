@@ -41,7 +41,7 @@ on:
 
       ndk_version:
         description: "Android NDK version"
-        default: "25.2.9519653"
+        default: "29.0.14206865"
         required: true
 
       compile_sdk:
