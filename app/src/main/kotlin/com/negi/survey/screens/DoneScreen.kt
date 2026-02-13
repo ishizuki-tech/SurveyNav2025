@@ -22,6 +22,10 @@
  *   • JSON must be built from SurveyViewModel.recordedAudioRefs (logical manifest),
  *     not from file system scans, so repeated JSON exports remain stable even if
  *     WAV files were already uploaded and deleted.
+ *
+ *  Robustness rule (voice):
+ *   • Do NOT delete WAV until all REQUIRED destinations succeed.
+ *     (See VoiceUploadCompletionStore)
  * =====================================================================
  */
 
@@ -83,6 +87,7 @@ import com.negi.survey.net.GitHubUploadWorker
 import com.negi.survey.net.GitHubUploader
 import com.negi.survey.net.SupabaseStorageUploader
 import com.negi.survey.net.SupabaseUploadWorker
+import com.negi.survey.net.VoiceUploadCompletionStore
 import com.negi.survey.utils.ExportUtils
 import com.negi.survey.utils.buildSurveyFileName
 import com.negi.survey.vm.Node
@@ -112,6 +117,9 @@ private const val LOG_TAG = "DoneScreen"
 /** Pending roots (kept stable to match receivers). */
 private const val PENDING_DIR_GH = "pending_uploads"
 private const val PENDING_DIR_SB = "pending_uploads_supabase"
+
+/** Shared pending root for voice so GitHub/Supabase won't race by moving/deleting the same WAV. */
+private const val PENDING_DIR_SHARED = "pending_uploads_shared"
 
 private val LOGCAT_TAG_FILTERS = arrayOf(
     "WhisperEngine",
@@ -149,9 +157,7 @@ fun DoneScreen(
     var uploading by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
-    val supabaseCfg = remember {
-        SupabaseStorageUploader.configFromBuildConfig()
-    }
+    val supabaseCfg = remember { SupabaseStorageUploader.configFromBuildConfig() }
 
     val audioRefsForRun = remember(recordedAudioRefs, surveyUuid) {
         vm.getAudioRefsForRun(surveyUuid)
@@ -175,6 +181,7 @@ fun DoneScreen(
 
     LaunchedEffect(expectedVoiceFileNames, surveyUuid) {
         val files = withContext(Dispatchers.IO) {
+            // Show "on device" as physical exports voice dir only (for UI clarity).
             val out = scanVoiceFilesByNames(context, expectedVoiceFileNames)
             val voiceDir = ExportUtils.getVoiceExportDir(context)
             Log.d(
@@ -497,19 +504,47 @@ fun DoneScreen(
                                                 message = "Upload $fileName"
                                             )
 
+                                            // Include shared pending voice (for cross-button / deferred interactions).
                                             val currentVoiceFiles =
-                                                scanVoiceFilesByNames(context, expectedVoiceFileNames)
+                                                scanVoiceFilesForUploadAnyLocation(
+                                                    context = context,
+                                                    expectedNames = expectedVoiceFileNames,
+                                                    surveyUuid = surveyUuid
+                                                )
 
                                             var uploadedVoices = 0
                                             currentVoiceFiles.forEach { file ->
+                                                // Require both when both are configured, to prevent ordering races.
+                                                VoiceUploadCompletionStore.requireDestinations(
+                                                    context = context,
+                                                    file = file,
+                                                    requireGitHub = true,
+                                                    requireSupabase = (supabaseCfg != null)
+                                                )
+
                                                 GitHubUploader.uploadFile(
                                                     cfg = cfg,
                                                     relativePath = "$REMOTE_VOICE_DIR/${file.name}",
                                                     file = file,
                                                     message = "Upload ${file.name}"
                                                 )
-                                                runCatching { deleteVoiceSidecars(file) }
-                                                runCatching { file.delete() }
+
+                                                val st = VoiceUploadCompletionStore.markGitHubUploaded(context, file)
+                                                Log.d(
+                                                    LOG_TAG,
+                                                    "Voice flag (GitHub immediate): name=${file.name} reqGh=${st.requireGitHub} reqSb=${st.requireSupabase} " +
+                                                            "ghDone=${st.githubUploaded} sbDone=${st.supabaseUploaded} complete=${st.isComplete}"
+                                                )
+
+                                                if (VoiceUploadCompletionStore.shouldDeleteNow(context, file)) {
+                                                    Log.d(LOG_TAG, "Voice delete eligible (GitHub immediate): ${file.name}")
+                                                    runCatching { deleteVoiceSidecars(file) }
+                                                    runCatching { file.delete() }
+                                                    VoiceUploadCompletionStore.clear(context, file)
+                                                } else {
+                                                    Log.d(LOG_TAG, "Voice kept (GitHub immediate): waiting other required destination: ${file.name}")
+                                                }
+
                                                 uploadedVoices++
                                             }
 
@@ -590,8 +625,13 @@ fun DoneScreen(
                                                 ?: IllegalStateException("Supabase JSON upload failed"))
                                         }
 
+                                        // Include shared pending voice (for cross-button / deferred interactions).
                                         val currentVoiceFiles =
-                                            scanVoiceFilesByNames(context, expectedVoiceFileNames)
+                                            scanVoiceFilesForUploadAnyLocation(
+                                                context = context,
+                                                expectedNames = expectedVoiceFileNames,
+                                                surveyUuid = surveyUuid
+                                            )
 
                                         Log.d(
                                             LOG_TAG,
@@ -601,6 +641,15 @@ fun DoneScreen(
                                         var uploadedVoices = 0
                                         currentVoiceFiles.forEach { file ->
                                             Log.d(LOG_TAG, "Supabase voice upload: name=${file.name} bytes=${file.length()}")
+
+                                            // Require both when both are configured, to prevent ordering races.
+                                            VoiceUploadCompletionStore.requireDestinations(
+                                                context = context,
+                                                file = file,
+                                                requireGitHub = (gitHubConfig != null),
+                                                requireSupabase = true
+                                            )
+
                                             val r = SupabaseStorageUploader.uploadFile(
                                                 cfg = cfg,
                                                 remotePath = "$REMOTE_VOICE_DIR/${file.name}",
@@ -609,8 +658,22 @@ fun DoneScreen(
                                                 upsert = false
                                             )
                                             if (r.isSuccess) {
-                                                runCatching { deleteVoiceSidecars(file) }
-                                                runCatching { file.delete() }
+                                                val st = VoiceUploadCompletionStore.markSupabaseUploaded(context, file)
+                                                Log.d(
+                                                    LOG_TAG,
+                                                    "Voice flag (Supabase immediate): name=${file.name} reqGh=${st.requireGitHub} reqSb=${st.requireSupabase} " +
+                                                            "ghDone=${st.githubUploaded} sbDone=${st.supabaseUploaded} complete=${st.isComplete}"
+                                                )
+
+                                                if (VoiceUploadCompletionStore.shouldDeleteNow(context, file)) {
+                                                    Log.d(LOG_TAG, "Voice delete eligible (Supabase immediate): ${file.name}")
+                                                    runCatching { deleteVoiceSidecars(file) }
+                                                    runCatching { file.delete() }
+                                                    VoiceUploadCompletionStore.clear(context, file)
+                                                } else {
+                                                    Log.d(LOG_TAG, "Voice kept (Supabase immediate): waiting other required destination: ${file.name}")
+                                                }
+
                                                 uploadedVoices++
                                             } else {
                                                 throw (r.exceptionOrNull()
@@ -710,12 +773,13 @@ fun DoneScreen(
                                         snackbar.showOnce("GitHub: Failed to schedule JSON upload: ${e.message}")
                                     }
 
+                                    // Stage voice to a shared pending directory (prevents cross-backend races).
                                     val staged = runCatching {
                                         withContext(Dispatchers.IO) {
-                                            stageVoiceFilesToPending(
+                                            stageVoiceFilesToSharedPendingForRun(
                                                 context = context,
-                                                voiceFiles = voiceFilesForRun,
-                                                pendingDirName = PENDING_DIR_GH
+                                                expectedNames = expectedVoiceFileNames,
+                                                surveyUuid = surveyUuid
                                             )
                                         }
                                     }.getOrElse { e ->
@@ -725,6 +789,14 @@ fun DoneScreen(
 
                                     if (staged.isNotEmpty()) {
                                         staged.forEach { stagedFile ->
+                                            // Require both when both are configured, to prevent ordering races.
+                                            VoiceUploadCompletionStore.requireDestinations(
+                                                context = context,
+                                                file = stagedFile,
+                                                requireGitHub = true,
+                                                requireSupabase = (supabaseCfg != null)
+                                            )
+
                                             runCatching {
                                                 enqueueGitHubWorkerFileUpload(
                                                     context = context,
@@ -813,12 +885,13 @@ fun DoneScreen(
                                         snackbar.showOnce("Supabase: Failed to schedule JSON upload: ${e.message}")
                                     }
 
+                                    // Stage voice to a shared pending directory (prevents cross-backend races).
                                     val staged = runCatching {
                                         withContext(Dispatchers.IO) {
-                                            stageVoiceFilesToPending(
+                                            stageVoiceFilesToSharedPendingForRun(
                                                 context = context,
-                                                voiceFiles = voiceFilesForRun,
-                                                pendingDirName = sbPendingDirForSurvey(surveyUuid, "voice")
+                                                expectedNames = expectedVoiceFileNames,
+                                                surveyUuid = surveyUuid
                                             )
                                         }
                                     }.getOrElse { e ->
@@ -828,6 +901,14 @@ fun DoneScreen(
 
                                     if (staged.isNotEmpty()) {
                                         staged.forEach { stagedFile ->
+                                            // Require both when both are configured, to prevent ordering races.
+                                            VoiceUploadCompletionStore.requireDestinations(
+                                                context = context,
+                                                file = stagedFile,
+                                                requireGitHub = (gitHubConfig != null),
+                                                requireSupabase = true
+                                            )
+
                                             runCatching {
                                                 enqueueSupabaseWorkerFileUpload(
                                                     context = context,
@@ -1023,73 +1104,135 @@ private fun sbPendingDirForSurvey(surveyUuid: String, kind: String): String {
  * ============================================================ */
 
 /**
- * Stage voice WAV files into the pending dir so deferred uploads won't break if voiceDir gets cleaned.
+ * Stage voice WAV files into a shared pending dir so GitHub/Supabase won't race.
+ *
+ * Target:
+ *   filesDir/pending_uploads_shared/voice/{surveyUuidSanitized}/{fileName}
  *
  * Strategy:
- * - Move (rename) when possible (fast, no extra storage).
- * - Fallback to copy, then delete original if copy is complete.
- * - IMPORTANT: Keep the base file name stable to match JSON manifest.
+ * - Prefer move (rename) when possible.
+ * - Fallback to copy then delete original if copy is complete.
+ * - Keep base file name stable (manifest consistency).
  */
-private fun stageVoiceFilesToPending(
+private fun stageVoiceFilesToSharedPendingForRun(
     context: Context,
-    voiceFiles: List<File>,
-    pendingDirName: String
+    expectedNames: Set<String>,
+    surveyUuid: String
 ): List<File> {
-    if (voiceFiles.isEmpty()) return emptyList()
+    if (expectedNames.isEmpty()) return emptyList()
 
-    val out = ArrayList<File>(voiceFiles.size)
-    voiceFiles.forEach { src ->
-        if (!src.exists() || !src.isFile) return@forEach
+    val safeSurvey = sanitizeWorkName(surveyUuid).ifBlank { "unknown" }
+    val dir = File(context.filesDir, "$PENDING_DIR_SHARED/voice/$safeSurvey").apply { mkdirs() }
 
-        val staged = stageFileToPendingDir(
-            context = context,
-            src = src,
-            pendingDirName = pendingDirName
-        )
+    val expectedBase = expectedNames
+        .map { normalizeLocalName(it) }
+        .filter { it.isNotBlank() }
+        .toSet()
 
+    val voiceDir = ExportUtils.getVoiceExportDir(context)
+    if (!voiceDir.exists() || !voiceDir.isDirectory) return emptyList()
+
+    val out = ArrayList<File>(expectedBase.size)
+
+    expectedBase.forEach { name ->
+        val dst = File(dir, sanitizeFileName(name))
+
+        // If already staged, use it.
+        if (dst.exists() && dst.isFile && dst.length() > 0L) {
+            out.add(dst)
+            return@forEach
+        }
+
+        val src = File(voiceDir, name)
+        if (!src.exists() || !src.isFile || src.length() <= 0L) return@forEach
+
+        // Best-effort remove old staged file (idempotent staging per run).
+        if (dst.exists()) runCatching { dst.delete() }
+
+        // Keep original sidecar cleanup in the original directory.
         runCatching { deleteVoiceSidecars(src) }
-        out.add(staged)
+
+        if (src.renameTo(dst)) {
+            out.add(dst)
+            return@forEach
+        }
+
+        runCatching {
+            val srcLen = src.length().coerceAtLeast(0L)
+            src.copyTo(dst, overwrite = true)
+            if (dst.exists() && dst.length() == srcLen) {
+                runCatching { src.delete() }
+            }
+        }.getOrElse { e ->
+            throw IOException("Failed to stage voice: ${src.absolutePath} -> ${dst.absolutePath}: ${e.message}", e)
+        }
+
+        out.add(dst)
     }
-    return out
+
+    return out.sortedByDescending { it.lastModified() }
 }
 
 /**
- * Move/copy [src] into app-internal pending dir.
+ * Resolve voice files for upload from either:
+ * - exports voice dir (external files), OR
+ * - shared pending voice dir (internal files)
  *
- * IMPORTANT:
- * - We do NOT change the base file name (no _1 suffixes), because JSON refers to it.
- * - If a target already exists, we overwrite it (same survey staging should be idempotent).
- *
- * @throws IOException if both move and copy fail.
+ * This prevents "Supabase moved/deleted first" issues and supports mixed flows.
  */
-private fun stageFileToPendingDir(
+private fun scanVoiceFilesForUploadAnyLocation(
     context: Context,
-    src: File,
-    pendingDirName: String
-): File {
-    val dir = File(context.filesDir, pendingDirName).apply { mkdirs() }
+    expectedNames: Set<String>,
+    surveyUuid: String
+): List<File> {
+    if (expectedNames.isEmpty()) return emptyList()
 
-    // Keep the same base name to preserve manifest consistency.
-    val target = File(dir, sanitizeFileName(src.name))
+    val expectedBase = expectedNames
+        .map { normalizeLocalName(it) }
+        .filter { it.isNotBlank() }
+        .toSet()
 
-    if (target.exists()) {
-        runCatching { target.delete() }
-    }
+    val a = scanVoiceFilesByNames(context, expectedBase)
+    val b = scanSharedPendingVoiceFilesByNames(context, expectedBase, surveyUuid)
 
-    if (src.renameTo(target)) {
-        return target
-    }
+    if (a.isEmpty()) return b
+    if (b.isEmpty()) return a
 
-    return runCatching {
-        val srcLen = src.length().coerceAtLeast(0L)
-        src.copyTo(target, overwrite = true)
-        if (target.exists() && target.length() == srcLen) {
-            runCatching { src.delete() }
+    // Merge by file name, prefer newer timestamp.
+    val map = LinkedHashMap<String, File>()
+    (a + b).forEach { f ->
+        val prev = map[f.name]
+        if (prev == null || f.lastModified() > prev.lastModified()) {
+            map[f.name] = f
         }
-        target
-    }.getOrElse { e ->
-        throw IOException("Failed to stage file: ${src.absolutePath} -> ${target.absolutePath}: ${e.message}", e)
     }
+    return map.values.sortedByDescending { it.lastModified() }
+}
+
+private fun scanSharedPendingVoiceFilesByNames(
+    context: Context,
+    expectedNames: Set<String>,
+    surveyUuid: String
+): List<File> {
+    if (expectedNames.isEmpty()) return emptyList()
+
+    val safeSurvey = sanitizeWorkName(surveyUuid).ifBlank { "unknown" }
+    val dir = File(context.filesDir, "$PENDING_DIR_SHARED/voice/$safeSurvey")
+    if (!dir.exists() || !dir.isDirectory) return emptyList()
+
+    val expectedBase = expectedNames
+        .map { normalizeLocalName(it) }
+        .filter { it.isNotBlank() }
+        .toSet()
+
+    val files = dir.listFiles { f ->
+        f.isFile &&
+                !f.name.startsWith(".") &&
+                f.name.lowercase(Locale.US).endsWith(".wav") &&
+                expectedBase.contains(f.name)
+    } ?: return emptyList()
+
+    return files.sortedByDescending { it.lastModified() }
 }
 
 /* ============================================================
