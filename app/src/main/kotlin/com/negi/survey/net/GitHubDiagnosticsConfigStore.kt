@@ -29,7 +29,9 @@ private const val TAG = "GitHubDiagCfgStore"
 
 object GitHubDiagnosticsConfigStore {
 
-    private const val PREF_NAME = "github_diag_cfg"
+    private const val PREF_NAME_ENCRYPTED = "github_diag_cfg"
+    private const val PREF_NAME_PLAIN = "github_diag_cfg_plain"
+
     private const val KEY_OWNER = "owner"
     private const val KEY_REPO = "repo"
     private const val KEY_TOKEN = "token"
@@ -37,7 +39,10 @@ object GitHubDiagnosticsConfigStore {
     private const val KEY_PREFIX = "prefix"
 
     @Volatile
-    private var cachedPrefs: SharedPreferences? = null
+    private var cachedEncryptedPrefs: SharedPreferences? = null
+
+    @Volatile
+    private var cachedPlainPrefs: SharedPreferences? = null
 
     /**
      * Persist GitHub config used for deferred crash/log uploads.
@@ -47,23 +52,68 @@ object GitHubDiagnosticsConfigStore {
      * - Use a fine-grained token restricted to one repo/path whenever possible.
      */
     fun save(context: Context, cfg: GitHubUploader.GitHubConfig) {
-        val prefs = prefs(context)
-        prefs.edit()
-            .putString(KEY_OWNER, cfg.owner)
-            .putString(KEY_REPO, cfg.repo)
-            .putString(KEY_TOKEN, cfg.token)
-            .putString(KEY_BRANCH, cfg.branch)
-            .putString(KEY_PREFIX, cfg.pathPrefix)
-            .apply()
+        val appContext = context.applicationContext
 
-        Log.i(TAG, "Saved GitHub diagnostics config (owner=${cfg.owner}, repo=${cfg.repo}).")
+        // Try encrypted first, then fallback to plain prefs if needed.
+        val saved = runCatching {
+            val prefs = encryptedPrefsOrNull(appContext) ?: throw IllegalStateException("Encrypted prefs unavailable")
+            writeToPrefs(prefs, cfg)
+            true
+        }.getOrElse { e ->
+            Log.w(TAG, "Encrypted save failed; falling back to plain prefs: ${e.message}")
+            false
+        }
+
+        if (saved) {
+            Log.i(TAG, "Saved GitHub diagnostics config (encrypted) (owner=${cfg.owner}, repo=${cfg.repo}).")
+            return
+        }
+
+        runCatching {
+            val prefs = plainPrefs(appContext)
+            writeToPrefs(prefs, cfg)
+            Log.i(TAG, "Saved GitHub diagnostics config (plain) (owner=${cfg.owner}, repo=${cfg.repo}).")
+        }.onFailure { e ->
+            Log.w(TAG, "Plain save failed: ${e.message}", e)
+        }
     }
 
     /**
      * Load config or null if missing/invalid.
+     *
+     * Safety:
+     * - Never throws. If encrypted prefs are corrupted/unreadable, it falls back to plain prefs.
      */
     fun load(context: Context): GitHubUploader.GitHubConfig? {
-        val prefs = prefs(context)
+        val appContext = context.applicationContext
+
+        // 1) Encrypted prefs first (preferred).
+        val enc = runCatching {
+            val prefs = encryptedPrefsOrNull(appContext) ?: return@runCatching null
+            readFromPrefs(prefs)
+        }.getOrElse { e ->
+            Log.w(TAG, "Encrypted load failed; will try plain prefs: ${e.message}")
+            null
+        }
+
+        if (enc != null) return enc
+
+        // 2) Plain fallback (recovery path).
+        val plain = runCatching {
+            val prefs = plainPrefs(appContext)
+            readFromPrefs(prefs)
+        }.getOrElse { e ->
+            Log.w(TAG, "Plain load failed: ${e.message}", e)
+            null
+        }
+
+        return plain
+    }
+
+    /**
+     * Read config from prefs. Returns null if missing/invalid.
+     */
+    private fun readFromPrefs(prefs: SharedPreferences): GitHubUploader.GitHubConfig? {
         val owner = prefs.getString(KEY_OWNER, null).orEmpty()
         val repo = prefs.getString(KEY_REPO, null).orEmpty()
         val token = prefs.getString(KEY_TOKEN, null).orEmpty()
@@ -82,38 +132,63 @@ object GitHubDiagnosticsConfigStore {
     }
 
     /**
-     * Build preferences, preferring encrypted storage.
+     * Write config to prefs.
+     */
+    private fun writeToPrefs(prefs: SharedPreferences, cfg: GitHubUploader.GitHubConfig) {
+        prefs.edit()
+            .putString(KEY_OWNER, cfg.owner)
+            .putString(KEY_REPO, cfg.repo)
+            .putString(KEY_TOKEN, cfg.token)
+            .putString(KEY_BRANCH, cfg.branch)
+            .putString(KEY_PREFIX, cfg.pathPrefix)
+            .apply()
+    }
+
+    /**
+     * Build encrypted preferences if available. Returns null on any failure.
      *
      * NOTE:
      * - We cache the SharedPreferences instance to avoid repeated MasterKey creation.
      * - We use applicationContext to avoid leaking short-lived contexts.
      */
-    private fun prefs(context: Context): SharedPreferences {
-        cachedPrefs?.let { return it }
+    private fun encryptedPrefsOrNull(context: Context): SharedPreferences? {
+        cachedEncryptedPrefs?.let { return it }
 
         synchronized(this) {
-            cachedPrefs?.let { return it }
-
-            val appContext = context.applicationContext
+            cachedEncryptedPrefs?.let { return it }
 
             val created = runCatching {
-                val masterKey = MasterKey.Builder(appContext)
+                val masterKey = MasterKey.Builder(context)
                     .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                     .build()
 
                 EncryptedSharedPreferences.create(
-                    appContext,
-                    PREF_NAME,
+                    context,
+                    PREF_NAME_ENCRYPTED,
                     masterKey,
                     EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                     EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
                 )
             }.getOrElse { e ->
-                Log.w(TAG, "Encrypted prefs unavailable; falling back to plain prefs: ${e.message}")
-                appContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                Log.w(TAG, "Encrypted prefs unavailable: ${e.message}")
+                null
             }
 
-            cachedPrefs = created
+            cachedEncryptedPrefs = created
+            return created
+        }
+    }
+
+    /**
+     * Build plain preferences (separate file name to avoid format conflicts).
+     */
+    private fun plainPrefs(context: Context): SharedPreferences {
+        cachedPlainPrefs?.let { return it }
+
+        synchronized(this) {
+            cachedPlainPrefs?.let { return it }
+            val created = context.getSharedPreferences(PREF_NAME_PLAIN, Context.MODE_PRIVATE)
+            cachedPlainPrefs = created
             return created
         }
     }

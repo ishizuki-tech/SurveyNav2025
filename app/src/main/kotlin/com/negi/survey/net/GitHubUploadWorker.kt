@@ -48,6 +48,7 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
@@ -186,7 +187,8 @@ class GitHubUploadWorker(
             return Result.failure(workDataOf(ERROR_MESSAGE to msg))
         }
 
-        val remotePathForUi = buildDatedRemotePath(cfg.pathPrefix, fileName)
+        // UI path should match GitHubUploader.buildPath() behavior (UTC yyyy-MM-dd).
+        val remotePathForUi = buildDatedRemotePathUtc(cfg.pathPrefix, fileName)
 
         Log.d(
             TAG,
@@ -332,9 +334,14 @@ class GitHubUploadWorker(
     /**
      * Build a date-based remote path consistent with GitHubUploader:
      *   prefix + yyyy-MM-dd + fileName
+     *
+     * Uses UTC date to keep paths stable across timezones.
      */
-    private fun buildDatedRemotePath(prefix: String, fileName: String): String {
-        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+    private fun buildDatedRemotePathUtc(prefix: String, fileName: String): String {
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+
         return listOf(prefix.trim('/'), date, fileName.trim('/'))
             .filter { it.isNotEmpty() }
             .joinToString("/")
@@ -346,15 +353,20 @@ class GitHubUploadWorker(
     private fun shouldRetry(t: Throwable): Boolean {
         val msg = t.message.orEmpty()
 
+        // If uploader labeled it transient, allow retry even for 403 (secondary rate limit).
+        if (msg.startsWith("Transient HTTP ", ignoreCase = true)) return true
+
         if (msg.contains("too large", ignoreCase = true)) return false
         if (msg.contains("invalid github configuration", ignoreCase = true)) return false
 
         // Avoid retrying obvious auth/permanent failures.
         if (msg.contains("401")) return false
-        if (msg.contains("403")) return false
         if (msg.contains("422")) return false
         if (msg.contains("bad credentials", ignoreCase = true)) return false
         if (msg.contains("requires authentication", ignoreCase = true)) return false
+
+        // 403 is ambiguous; retry only if it was labeled transient above.
+        if (msg.contains("403")) return false
 
         return t is IOException || msg.contains("timeout", ignoreCase = true)
     }

@@ -35,6 +35,7 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.negi.survey.BuildConfig
 import com.negi.survey.R
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -54,10 +55,11 @@ class SupabaseCrashUploadWorker(
         val filePath = inputData.getString(KEY_FILE_PATH).orEmpty()
         val objectPrefix = inputData.getString(KEY_OBJECT_PREFIX).orEmpty()
         val addDate = inputData.getBoolean(KEY_ADD_DATE, true)
+        val upsert = inputData.getBoolean(KEY_UPSERT, false)
 
         Log.d(
             TAG,
-            "doWork start attempt=$runAttemptCount filePath=$filePath prefix=$objectPrefix addDate=$addDate"
+            "doWork start attempt=$runAttemptCount filePath=$filePath prefix=$objectPrefix addDate=$addDate upsert=$upsert"
         )
 
         if (filePath.isBlank()) {
@@ -87,7 +89,7 @@ class SupabaseCrashUploadWorker(
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val notifId = NOTIF_BASE + (abs(("supabase_crash_$stamp").hashCode()) % 8000)
 
-        // Foreground start (async, safe from non-suspend contexts too)
+        // NOTE: setForegroundAsync is safe from non-suspend callbacks too.
         runCatching {
             setForegroundAsync(
                 foregroundInfo(
@@ -113,6 +115,7 @@ class SupabaseCrashUploadWorker(
             uploadCrashFile(
                 file = file,
                 remotePath = remotePath,
+                upsert = upsert,
                 onProgress = { pct ->
                     // IMPORTANT: onProgress is not suspend; use Async APIs.
                     runCatching {
@@ -179,8 +182,11 @@ class SupabaseCrashUploadWorker(
     private fun uploadCrashFile(
         file: File,
         remotePath: String,
+        upsert: Boolean,
         onProgress: (Int) -> Unit
     ) {
+        require(remotePath.isNotBlank()) { "remotePath is blank." }
+
         val baseUrl = BuildConfig.SUPABASE_URL.trimEnd('/')
         val bucket = BuildConfig.SUPABASE_LOG_BUCKET.trim()
         val anonKey = BuildConfig.SUPABASE_ANON_KEY.trim()
@@ -197,15 +203,15 @@ class SupabaseCrashUploadWorker(
         Log.d(
             TAG,
             "Supabase upload: url=${redactUrl(url.toString())} bucket=$bucket " +
-                    "path=$remotePath encodedPath=$encodedRemotePath bytes=${file.length()}"
+                    "path=$remotePath encodedPath=$encodedRemotePath bytes=${file.length()} upsert=$upsert"
         )
 
         try {
-            uploadWithMethod(url, "POST", anonKey, file, total, onProgress)
+            uploadWithMethod(url, "POST", anonKey, file, total, upsert, onProgress)
         } catch (e: HttpStatusException) {
             if (e.code == 405 || e.code == 404) {
                 Log.w(TAG, "POST not accepted (HTTP ${e.code}). Retrying with PUT… body=${truncate(e.body)}")
-                uploadWithMethod(url, "PUT", anonKey, file, total, onProgress)
+                uploadWithMethod(url, "PUT", anonKey, file, total, upsert, onProgress)
             } else {
                 throw e
             }
@@ -218,27 +224,44 @@ class SupabaseCrashUploadWorker(
         anonKey: String,
         file: File,
         totalBytes: Long,
+        upsert: Boolean,
         onProgress: (Int) -> Unit
     ) {
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = method
             doOutput = true
+            doInput = true
+            useCaches = false
+
             connectTimeout = 15_000
-            readTimeout = 25_000
+            readTimeout = 35_000
 
             // Supabase Storage REST auth headers
             setRequestProperty("Authorization", "Bearer $anonKey")
             setRequestProperty("apikey", anonKey)
+            setRequestProperty("Accept", "application/json")
 
             setRequestProperty("Content-Type", "application/gzip")
-            setRequestProperty("x-upsert", "true")
+
+            // IMPORTANT:
+            // Upsert may require UPDATE policy in RLS; keep it OFF by default for crash logs.
+            if (upsert) {
+                setRequestProperty("x-upsert", "true")
+            }
+
+            // Make streaming deterministic (and avoid internal buffering surprises).
+            if (totalBytes <= Int.MAX_VALUE.toLong()) {
+                setFixedLengthStreamingMode(totalBytes.toInt())
+            } else {
+                setChunkedStreamingMode(256 * 1024)
+            }
         }
 
         var sent = 0L
         try {
-            file.inputStream().use { input ->
+            BufferedInputStream(file.inputStream(), 256 * 1024).use { input ->
                 conn.outputStream.use { output ->
-                    val buf = ByteArray(32 * 1024)
+                    val buf = ByteArray(256 * 1024)
                     while (true) {
                         val n = input.read(buf)
                         if (n <= 0) break
@@ -274,11 +297,21 @@ class SupabaseCrashUploadWorker(
     }
 
     private fun shouldRetry(t: Throwable): Boolean {
+        // NOTE: Prefer code-based retry logic when we have it.
+        val code = (t as? HttpStatusException)?.code
+        if (code != null) {
+            if (code == 401 || code == 403 || code == 422) return false
+            if (code == 429) return true
+            if (code in 500..599) return true
+            return false
+        }
+
         val msg = t.message.orEmpty()
         if (msg.contains("401")) return false
         if (msg.contains("403")) return false
         if (msg.contains("422")) return false
         if (msg.contains("bad credentials", ignoreCase = true)) return false
+
         return t is IOException || msg.contains("timeout", ignoreCase = true)
     }
 
@@ -355,6 +388,8 @@ class SupabaseCrashUploadWorker(
         private const val NOTIF_BASE = 5200
         private const val MAX_ATTEMPTS = 5
 
+        // IMPORTANT:
+        // This prefix already includes "surveyapp/" so it matches typical RLS patterns.
         private const val DEFAULT_PREFIX = "surveyapp/crash"
 
         const val PROGRESS_PCT = "pct"
@@ -362,6 +397,7 @@ class SupabaseCrashUploadWorker(
         const val KEY_FILE_PATH = "filePath"
         const val KEY_OBJECT_PREFIX = "objectPrefix"
         const val KEY_ADD_DATE = "addDate"
+        const val KEY_UPSERT = "upsert"
 
         const val OUT_REMOTE_PATH = "out.remotePath"
         const val OUT_BYTES = "out.bytes"
@@ -377,7 +413,8 @@ class SupabaseCrashUploadWorker(
             context: Context,
             file: File,
             objectPrefix: String = DEFAULT_PREFIX,
-            addDateSubdir: Boolean = true
+            addDateSubdir: Boolean = true,
+            upsert: Boolean = false
         ) {
             val name = file.name
             val uniqueName = "upload_supabase_crash_$name"
@@ -388,7 +425,8 @@ class SupabaseCrashUploadWorker(
                         workDataOf(
                             KEY_FILE_PATH to file.absolutePath,
                             KEY_OBJECT_PREFIX to objectPrefix,
-                            KEY_ADD_DATE to addDateSubdir
+                            KEY_ADD_DATE to addDateSubdir,
+                            KEY_UPSERT to upsert
                         )
                     )
                     .setConstraints(
@@ -405,7 +443,7 @@ class SupabaseCrashUploadWorker(
             WorkManager.getInstance(context.applicationContext)
                 .enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, req)
 
-            Log.d(TAG, "Enqueued crash upload: unique=$uniqueName file=${file.absolutePath} bytes=${file.length()}")
+            Log.d(TAG, "Enqueued crash upload: unique=$uniqueName file=${file.absolutePath} bytes=${file.length()} upsert=$upsert")
         }
     }
 }

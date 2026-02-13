@@ -29,13 +29,22 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
-import kotlin.math.min
 
 private const val TAG = "SupabaseCrashLogStore"
 
 object SupabaseCrashLogStore {
 
-    private const val DIR_PENDING = "pending_uploads/supabase/crashlogs"
+    /**
+     * Pending directory (primary).
+     * Keep consistent with other Supabase pending payload staging.
+     */
+    private const val DIR_PENDING_PRIMARY = "pending_uploads_supabase/crashlogs"
+
+    /**
+     * Legacy pending directory (older builds).
+     * We continue to scan this to avoid orphaning crash bundles after updates.
+     */
+    private const val DIR_PENDING_LEGACY = "pending_uploads/supabase/crashlogs"
 
     private const val LOGCAT_TAIL_LINES = 1200
     private const val LOGCAT_CRASH_TAIL_LINES = 200
@@ -74,10 +83,21 @@ object SupabaseCrashLogStore {
         context: Context,
         cfg: SupabaseUploader.SupabaseConfig
     ) {
-        val dir = pendingDir(context)
-        val files = dir.listFiles()?.filter { it.isFile && it.length() > 0L } ?: emptyList()
+        val dirs = listOf(
+            pendingDirPrimary(context),
+            pendingDirLegacy(context)
+        )
 
-        Log.d(TAG, "schedulePendingUploads: dir=${dir.absolutePath} files=${files.size} remoteDir=$REMOTE_DIR_CRASH")
+        val files = dirs
+            .flatMap { dir ->
+                val list = dir.listFiles()?.toList().orEmpty()
+                Log.d(TAG, "schedulePendingUploads: dir=${dir.absolutePath} files=${list.size}")
+                list
+            }
+            .filter { it.isFile && it.length() > 0L }
+            .distinctBy { it.absolutePath }
+
+        Log.d(TAG, "schedulePendingUploads: totalFiles=${files.size} remoteDir=$REMOTE_DIR_CRASH")
 
         if (files.isEmpty()) {
             Log.d(TAG, "No pending crash bundles.")
@@ -85,7 +105,10 @@ object SupabaseCrashLogStore {
         }
 
         files.sortedBy { it.lastModified() }.forEach { f ->
-            Log.i(TAG, "Enqueue crash bundle: name=${f.name} bytes=${f.length()} remoteDir=$REMOTE_DIR_CRASH upsert=false")
+            Log.i(
+                TAG,
+                "Enqueue crash bundle: name=${f.name} bytes=${f.length()} remoteDir=$REMOTE_DIR_CRASH upsert=false"
+            )
             SupabaseUploadWorker.enqueueExistingPayload(
                 context = context,
                 cfg = cfg,
@@ -105,12 +128,14 @@ object SupabaseCrashLogStore {
         throwable: Throwable
     ) {
         val pid = Process.myPid()
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val name = "crash_${stamp}_pid${pid}.log.gz"
 
-        val dir = pendingDir(context)
-        val outFile = File(dir, name)
-        val tmpFile = File(dir, "$name.tmp")
+        // Include milliseconds to avoid name collision during crash loops.
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val baseName = "crash_${stamp}_pid${pid}.log.gz"
+
+        val dir = pendingDirPrimary(context)
+        val outFile = uniqueIfExists(File(dir, baseName))
+        val tmpFile = File(dir, "${outFile.name}.tmp")
 
         val header = buildHeader(context, pid, thread)
         val stack = buildStacktrace(throwable)
@@ -139,6 +164,8 @@ object SupabaseCrashLogStore {
 
         runCatching {
             tmpFile.writeBytes(gz)
+
+            // Best-effort atomic swap.
             if (outFile.exists()) runCatching { outFile.delete() }
             val renamed = tmpFile.renameTo(outFile)
             if (!renamed) {
@@ -193,7 +220,7 @@ object SupabaseCrashLogStore {
             "-v", "threadtime",
             "-t", tailLines.toString()
         )
-        val out = runCommand(cmd, timeoutMs = 1200L)
+        val out = runCommand(cmd, timeoutMs = 1500L)
         if (!looksLikePidUnsupported(out)) return out
 
         val fb = listOf(
@@ -208,7 +235,7 @@ object SupabaseCrashLogStore {
             appendLine("Fallback logcat dump may include other processes.")
             appendLine("================")
             appendLine()
-            append(runCommand(fb, timeoutMs = 1200L))
+            append(runCommand(fb, timeoutMs = 1500L))
         }
     }
 
@@ -220,7 +247,7 @@ object SupabaseCrashLogStore {
             "-v", "threadtime",
             "-t", tailLines.toString()
         )
-        return runCommand(cmd, timeoutMs = 1200L)
+        return runCommand(cmd, timeoutMs = 1500L)
     }
 
     private fun runCommand(cmd: List<String>, timeoutMs: Long): String {
@@ -272,7 +299,10 @@ object SupabaseCrashLogStore {
                 val nextMax = (current.size * 0.75).toInt().coerceAtLeast(50_000)
                 current = trimToTail(current, nextMax)
 
-                Log.w(TAG, "gzip too large (attempt=$attempt gz=${gz.size} > maxGzBytes=$maxGzBytes). trimming to $nextMax")
+                Log.w(
+                    TAG,
+                    "gzip too large (attempt=$attempt gz=${gz.size} > maxGzBytes=$maxGzBytes). trimming to $nextMax"
+                )
             }
             gzip(current)
         }.getOrElse { t ->
@@ -287,6 +317,25 @@ object SupabaseCrashLogStore {
         return bos.toByteArray()
     }
 
-    private fun pendingDir(context: Context): File =
-        File(context.filesDir, DIR_PENDING).apply { mkdirs() }
+    private fun pendingDirPrimary(context: Context): File =
+        File(context.filesDir, DIR_PENDING_PRIMARY).apply { mkdirs() }
+
+    private fun pendingDirLegacy(context: Context): File =
+        File(context.filesDir, DIR_PENDING_LEGACY).apply { mkdirs() }
+
+    /**
+     * Ensure a unique file name if the target already exists.
+     */
+    private fun uniqueIfExists(file: File): File {
+        if (!file.exists()) return file
+
+        val base = file.nameWithoutExtension
+        val ext = file.extension.takeIf { it.isNotEmpty() }?.let { ".$it" } ?: ""
+        var idx = 1
+        while (true) {
+            val c = File(file.parentFile, "${base}_$idx$ext")
+            if (!c.exists()) return c
+            idx++
+        }
+    }
 }

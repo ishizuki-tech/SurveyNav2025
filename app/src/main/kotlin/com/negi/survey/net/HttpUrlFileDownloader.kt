@@ -29,10 +29,6 @@ package com.negi.survey.net
 
 import android.os.StatFs
 import android.util.Log
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -42,9 +38,15 @@ import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.security.MessageDigest
+import java.time.Instant
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.pow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 
 /**
  * Coroutine-safe downloader for large, resumable HTTP transfers.
@@ -133,8 +135,6 @@ class HttpUrlFileDownloader(
                 // If we are starting a new partial, write meta ONCE (do not overwrite for existing partial).
                 if (resumeFrom == 0L && !part.exists()) {
                     meta.write(Meta(probe.etag, probe.lastModified, total))
-                } else if (resumeFrom == 0L && part.exists().not()) {
-                    meta.write(Meta(probe.etag, probe.lastModified, total))
                 }
 
                 checkFreeSpaceOrThrow(
@@ -153,7 +153,9 @@ class HttpUrlFileDownloader(
                         finalUrl = refreshed.finalUrl
                     }
 
-                    val ifRange = meta.read()?.let { m -> m.etag ?: m.lastModified }
+                    val ifRange = meta.read()?.let { m ->
+                        etagForIfRange(m.etag) ?: m.lastModified
+                    }
 
                     val conn = openGetWithRedirects(
                         srcUrl = finalUrl,
@@ -352,7 +354,7 @@ class HttpUrlFileDownloader(
                 val acceptRanges =
                     (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes", true)
 
-                val etag = normalizeEtag(conn.getHeaderField("ETag"))
+                val etag = etagForIfRange(conn.getHeaderField("ETag"))
                 val lastMod = conn.getHeaderField("Last-Modified")
                 val finalUrl = conn.url.toString()
 
@@ -406,7 +408,7 @@ class HttpUrlFileDownloader(
                 val acceptRanges = (code == HttpURLConnection.HTTP_PARTIAL) ||
                         (conn.getHeaderField("Accept-Ranges") ?: "").contains("bytes", true)
 
-                val etag = normalizeEtag(conn.getHeaderField("ETag"))
+                val etag = etagForIfRange(conn.getHeaderField("ETag"))
                 val lastMod = conn.getHeaderField("Last-Modified")
                 val finalUrl = conn.url.toString()
 
@@ -430,8 +432,31 @@ class HttpUrlFileDownloader(
         return cr.substring(slash + 1).trim().toLongOrNull()?.takeIf { it >= 0L }
     }
 
-    private fun normalizeEtag(etag: String?): String? =
+    /**
+     * Returns a safe value for If-Range usage.
+     *
+     * Note: Do not strip quotes here. For If-Range, the entity-tag should be used as received.
+     */
+    private fun etagForIfRange(etag: String?): String? =
         etag?.trim()?.takeIf { it.isNotBlank() }
+
+    /**
+     * Returns a canonical value for comparing entity-tags across CDNs/proxies.
+     *
+     * We normalize:
+     * - Optional weak prefix "W/"
+     * - Optional surrounding quotes
+     */
+    private fun etagForCompare(etag: String?): String? {
+        var s = etagForIfRange(etag) ?: return null
+        if (s.startsWith("W/", ignoreCase = true)) {
+            s = s.substring(2).trim()
+        }
+        if (s.length >= 2 && s.first() == '"' && s.last() == '"') {
+            s = s.substring(1, s.length - 1).trim()
+        }
+        return s.takeIf { it.isNotBlank() }
+    }
 
     // ----------------------------------------------------------
     // Meta file / partial reconciliation
@@ -519,9 +544,9 @@ class HttpUrlFileDownloader(
             return PartialReconcile(0L)
         }
 
-        val probeEtag = normalizeEtag(probe.etag)
-        val metaEtag = normalizeEtag(m.etag)
-        if (probeEtag != null && metaEtag != null && probeEtag != metaEtag) {
+        val probeEtagCmp = etagForCompare(probe.etag)
+        val metaEtagCmp = etagForCompare(m.etag)
+        if (probeEtagCmp != null && metaEtagCmp != null && probeEtagCmp != metaEtagCmp) {
             logw("ETag changed. Restarting.")
             safeDelete(part)
             meta.delete()
@@ -530,7 +555,7 @@ class HttpUrlFileDownloader(
 
         val probeLm = probe.lastModified?.trim()
         val metaLm = m.lastModified?.trim()
-        if (probeEtag == null && metaEtag == null && probeLm != null && metaLm != null && probeLm != metaLm) {
+        if (probeEtagCmp == null && metaEtagCmp == null && probeLm != null && metaLm != null && probeLm != metaLm) {
             logw("Last-Modified changed. Restarting.")
             safeDelete(part)
             meta.delete()
@@ -693,8 +718,25 @@ class HttpUrlFileDownloader(
         }
     }
 
-    private fun readRetryAfterMs(conn: HttpURLConnection): Long? =
-        conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.times(1000)
+    /**
+     * Parse Retry-After for both delta-seconds and HTTP-date formats.
+     */
+    private fun readRetryAfterMs(conn: HttpURLConnection): Long? {
+        val v = conn.getHeaderField("Retry-After")?.trim()?.takeIf { it.isNotBlank() } ?: return null
+
+        // delta-seconds
+        v.toLongOrNull()?.let { secs ->
+            return (secs.coerceAtLeast(0L) * 1000L)
+        }
+
+        // HTTP-date (RFC 1123)
+        return runCatching {
+            val zdt = ZonedDateTime.parse(v, DateTimeFormatter.RFC_1123_DATE_TIME)
+            val targetMs = zdt.toInstant().toEpochMilli()
+            val nowMs = Instant.now().toEpochMilli()
+            (targetMs - nowMs).coerceAtLeast(0L)
+        }.getOrNull()
+    }
 
     private fun checkFreeSpaceOrThrow(dir: File, required: Long) {
         val fs = StatFs(dir.absolutePath)

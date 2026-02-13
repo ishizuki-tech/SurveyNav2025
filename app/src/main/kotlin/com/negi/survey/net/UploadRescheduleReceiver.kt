@@ -14,7 +14,10 @@
  *  after system reboot or app update.
  *
  *  - GitHub pending dir: /files/pending_uploads/
- *  - Supabase pending dir: /files/pending_uploads_sb/
+ *  - Supabase pending dirs (historical):
+ *      /files/pending_uploads_supabase/
+ *      /files/pending_uploads_sb/
+ *      /files/pending_uploads/supabase/...
  * =====================================================================
  */
 
@@ -36,16 +39,22 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         val action = intent.action ?: return
         if (!isRelevantAction(action)) return
 
-        val storageContext = when {
-            action == ACTION_LOCKED_BOOT_COMPLETED -> context.createDeviceProtectedStorageContext()
-            else -> context
+        // For LOCKED_BOOT_COMPLETED, device-protected storage is available.
+        // But pending files may live in credential-protected storage (normal context).
+        // We scan both contexts and de-duplicate by absolute path.
+        val ctxNormal = context
+        val ctxDeviceProtected = runCatching { context.createDeviceProtectedStorageContext() }.getOrNull()
+
+        val contexts = buildList {
+            add(ctxNormal)
+            if (ctxDeviceProtected != null) add(ctxDeviceProtected)
         }
 
-        rescheduleGitHub(storageContext, action)
-        rescheduleSupabase(storageContext, action)
+        rescheduleGitHub(contexts, action)
+        rescheduleSupabase(contexts, action)
     }
 
-    private fun rescheduleGitHub(context: Context, action: String) {
+    private fun rescheduleGitHub(contexts: List<Context>, action: String) {
         val cfg = GitHubUploader.GitHubConfig(
             owner = BuildConfig.GH_OWNER,
             repo = BuildConfig.GH_REPO,
@@ -59,34 +68,32 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             return
         }
 
-        val dir = File(context.filesDir, PENDING_DIR_GH)
-        if (!dir.exists() || !dir.isDirectory) {
-            Log.d(TAG, "No GitHub pending dir for action=$action path=${dir.absolutePath}")
-            return
-        }
+        val allFiles = contexts
+            .flatMap { ctx -> listPendingFiles(ctx, PENDING_DIR_GH, walk = false) }
+            .distinctBy { it.absolutePath }
+            .filter { it.isFile && it.length() > 0L }
 
-        val files = dir.listFiles()?.filter { it.isFile } ?: emptyList()
-        if (files.isEmpty()) {
+        if (allFiles.isEmpty()) {
             Log.d(TAG, "No GitHub pending files for action=$action")
             return
         }
 
-        Log.d(TAG, "Rescheduling ${files.size} GitHub pending uploads for action=$action")
+        Log.d(TAG, "Rescheduling ${allFiles.size} GitHub pending uploads for action=$action")
 
-        files.forEach { file ->
+        allFiles.forEach { file ->
             runCatching {
-                GitHubUploadWorker.enqueueExistingPayload(context, cfg, file)
+                GitHubUploadWorker.enqueueExistingPayload(contexts.first().applicationContext, cfg, file)
             }.onFailure { t ->
                 Log.w(TAG, "GitHub enqueue failed file=${file.name}: ${t.message}")
             }
         }
     }
 
-    private fun rescheduleSupabase(context: Context, action: String) {
-        val sbUrl = BuildConfig.SUPABASE_URL
-        val sbAnon = BuildConfig.SUPABASE_ANON_KEY
-        val sbBucket = BuildConfig.SUPABASE_LOG_BUCKET
-        val sbPrefix = BuildConfig.SUPABASE_LOG_PATH_PREFIX
+    private fun rescheduleSupabase(contexts: List<Context>, action: String) {
+        val sbUrl = BuildConfig.SUPABASE_URL.trim()
+        val sbAnon = BuildConfig.SUPABASE_ANON_KEY.trim()
+        val sbBucket = BuildConfig.SUPABASE_LOG_BUCKET.trim()
+        val sbPrefix = BuildConfig.SUPABASE_LOG_PATH_PREFIX.trim()
 
         val cfg = SupabaseUploader.SupabaseConfig(
             supabaseUrl = sbUrl,
@@ -101,27 +108,35 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
             return
         }
 
-        val dir = File(context.filesDir, PENDING_DIR_SB)
-        if (!dir.exists() || !dir.isDirectory) {
-            Log.d(TAG, "No Supabase pending dir for action=$action path=${dir.absolutePath}")
-            return
-        }
+        // Scan multiple historical pending roots.
+        val sbRoots = listOf(
+            PENDING_DIR_SB_V2,          // "pending_uploads_supabase"
+            PENDING_DIR_SB_V1,          // "pending_uploads_sb"
+            PENDING_DIR_SB_NESTED_ROOT  // "pending_uploads/supabase"
+        )
 
-        val files = dir.listFiles()?.filter { it.isFile } ?: emptyList()
-        if (files.isEmpty()) {
+        val allFiles = sbRoots
+            .flatMap { dirName ->
+                contexts.flatMap { ctx -> listPendingFiles(ctx, dirName, walk = true) }
+            }
+            .distinctBy { it.absolutePath }
+            .filter { it.isFile && it.length() > 0L }
+            .filterNot { it.name.endsWith(".tmp", ignoreCase = true) }
+
+        if (allFiles.isEmpty()) {
             Log.d(TAG, "No Supabase pending files for action=$action")
             return
         }
 
-        Log.d(TAG, "Rescheduling ${files.size} Supabase pending uploads for action=$action")
+        Log.d(TAG, "Rescheduling ${allFiles.size} Supabase pending uploads for action=$action")
 
-        files.forEach { file ->
+        allFiles.forEach { file ->
             val remoteDir = guessSupabaseRemoteDir(file)
             val contentType = guessContentType(file)
 
             runCatching {
                 SupabaseUploadWorker.enqueueExistingPayload(
-                    context = context,
+                    context = contexts.first().applicationContext,
                     cfg = cfg,
                     file = file,
                     remoteDir = remoteDir,
@@ -136,19 +151,62 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * List pending files under /files/{dirName}.
+     *
+     * @param walk If true, walkTopDown to include nested crash log dirs etc.
+     */
+    private fun listPendingFiles(context: Context, dirName: String, walk: Boolean): List<File> {
+        val dir = File(context.filesDir, dirName)
+        if (!dir.exists() || !dir.isDirectory) {
+            return emptyList()
+        }
+
+        val files = if (walk) {
+            dir.walkTopDown().filter { it.isFile }.toList()
+        } else {
+            dir.listFiles()?.filter { it.isFile } ?: emptyList()
+        }
+
+        if (files.isNotEmpty()) {
+            Log.d(TAG, "Found pending: dir=${dir.absolutePath} files=${files.size}")
+        }
+        return files
+    }
+
+    /**
+     * Guess Supabase remoteDir from file name and parent directories.
+     *
+     * Important: SupabaseUploadWorker builds:
+     *   objectPath = dated(prefix + "/" + remoteDir, fileName)
+     */
     private fun guessSupabaseRemoteDir(file: File): String {
         val name = file.name.lowercase(Locale.US)
+        val path = file.absolutePath.lowercase(Locale.US)
+
         return when {
-            name.startsWith("logcat_") || name.endsWith(".log.gz") || name.endsWith(".gz") -> "diagnostics/logcat"
+            // Crash bundles (various formats/locations)
+            path.contains("/crash") || name.startsWith("crash_") -> "crash"
+
+            // Logcat snapshots
+            name.startsWith("logcat_") || name.endsWith(".log.gz") || name.endsWith(".gz") ->
+                "diagnostics/logcat"
+
+            // Voice WAVs
             name.endsWith(".wav") -> "voice"
+
+            // Default
             else -> "regular"
         }
     }
 
+    /**
+     * Guess contentType by extension.
+     */
     private fun guessContentType(file: File): String {
         val name = file.name.lowercase(Locale.US)
         return when {
-            name.endsWith(".json") -> "application/json"
+            name.endsWith(".json") -> "application/json; charset=utf-8"
             name.endsWith(".wav") -> "audio/wav"
             name.endsWith(".gz") -> "application/gzip"
             else -> "application/octet-stream"
@@ -169,8 +227,23 @@ class UploadRescheduleReceiver : BroadcastReceiver() {
         /** Directory under `/files/` containing pending GitHub upload payloads. */
         private const val PENDING_DIR_GH = "pending_uploads"
 
-        /** Directory under `/files/` containing pending Supabase upload payloads. */
-        private const val PENDING_DIR_SB = "pending_uploads_sb"
+        /**
+         * Directory under `/files/` containing pending Supabase upload payloads.
+         * (Newer DoneScreen uses this.)
+         */
+        private const val PENDING_DIR_SB_V2 = "pending_uploads_supabase"
+
+        /**
+         * Directory under `/files/` containing pending Supabase upload payloads.
+         * (Older variant.)
+         */
+        private const val PENDING_DIR_SB_V1 = "pending_uploads_sb"
+
+        /**
+         * Nested pending root used by crash/log stores:
+         * e.g. /files/pending_uploads/supabase/crashlogs/...
+         */
+        private const val PENDING_DIR_SB_NESTED_ROOT = "pending_uploads/supabase"
 
         /** String constant for locked boot action to avoid API gated references. */
         private const val ACTION_LOCKED_BOOT_COMPLETED =

@@ -90,7 +90,7 @@ object SupabaseUploader {
      * Upload an existing local file by streaming.
      *
      * @param cfg Supabase config.
-     * @param objectPath Object path inside bucket (no leading slash).
+     * @param objectPath Object path inside bucket (no leading slash). (Prefix is applied automatically.)
      * @param file Local file to upload.
      * @param contentType MIME type.
      * @param upsert If true, sets x-upsert=true (may require UPDATE RLS policy).
@@ -204,10 +204,14 @@ object SupabaseUploader {
     ): UploadResult {
 
         val baseUrl = cfg.supabaseUrl.trimEnd('/')
-        val encodedObjectPath = encodePath(objectPath)
+        val resolvedObjectPath = applyPrefixIfNeeded(cfg.pathPrefix, objectPath)
+        val encodedObjectPath = encodePath(resolvedObjectPath)
 
         val url = URL("$baseUrl$API_PATH/${cfg.bucket}/$encodedObjectPath")
-        Log.d(TAG, "upload: url=$url len=${body.contentLength} upsert=$upsert")
+        Log.d(
+            TAG,
+            "upload: url=$url len=${body.contentLength} upsert=$upsert prefix=${cfg.pathPrefix} objectPath=$resolvedObjectPath"
+        )
 
         // Try POST first, and if 405, retry with PUT.
         val methods = listOf("POST", "PUT")
@@ -224,11 +228,12 @@ object SupabaseUploader {
                     upsert = upsert,
                     tokenOverride = tokenOverride,
                     body = body,
-                    onProgress = onProgress
+                    onProgress = onProgress,
+                    resolvedObjectPath = resolvedObjectPath
                 )
             } catch (e: MethodNotAllowedException) {
                 lastError = e
-                // Try next method with a fresh body stream.
+                Log.w(TAG, "Method not allowed for $m, will try next. msg=${e.message}")
             } catch (e: IOException) {
                 lastError = e
                 throw e
@@ -244,7 +249,7 @@ object SupabaseUploader {
         val code: Int,
         val body: String,
         val retryAfterMs: Long?
-    ) : IOException()
+    ) : IOException("Transient HTTP $code")
 
     private class HttpFailureException(val code: Int, val body: String) :
         IOException("Supabase request failed ($code): ${body.take(256)}")
@@ -259,6 +264,7 @@ object SupabaseUploader {
         tokenOverride: String?,
         body: BodySource,
         onProgress: (Int) -> Unit,
+        resolvedObjectPath: String,
         maxAttempts: Int = 3
     ): UploadResult {
 
@@ -315,6 +321,11 @@ object SupabaseUploader {
                     ?.use { it.readBytes().decodeToString() }
                     .orEmpty()
 
+                Log.d(
+                    TAG,
+                    "response: method=$method code=$code objectPath=$resolvedObjectPath reqId=${pickRequestId(headers)} bodyLen=${bodyText.length}"
+                )
+
                 if (code == 405) {
                     throw MethodNotAllowedException("HTTP 405 Method Not Allowed for $method")
                 }
@@ -333,19 +344,16 @@ object SupabaseUploader {
                 val etag = headers.keys.firstOrNull { it.equals("etag", ignoreCase = true) }
                     ?.let { headers[it]?.firstOrNull() }
 
-                val requestId = headers.keys.firstOrNull {
-                    it.equals("x-request-id", ignoreCase = true) || it.equals("cf-ray", ignoreCase = true)
-                }?.let { headers[it]?.firstOrNull() }
+                val requestId = pickRequestId(headers)
 
-                val objectPathDecoded = decodeBestEffort(objectPathFromUrl(url, cfg.bucket))
-                val publicUrl = buildPublicUrl(cfg, objectPathDecoded)
+                val publicUrl = buildPublicUrl(cfg, resolvedObjectPath)
 
                 runCatching {
                     if (bodyText.isNotBlank()) JSONObject(bodyText)
                 }.getOrNull()
 
                 return UploadResult(
-                    objectPath = objectPathDecoded,
+                    objectPath = resolvedObjectPath,
                     publicUrl = publicUrl,
                     etag = etag,
                     requestId = requestId
@@ -356,12 +364,14 @@ object SupabaseUploader {
                 if (attempt >= maxAttempts) throw lastError
 
                 val backoff = e.retryAfterMs ?: (500L shl (attempt - 1))
+                Log.w(TAG, "Retrying transient error in ${backoff}ms (attempt=$attempt/$maxAttempts)")
                 delay(backoff)
 
             } catch (e: IOException) {
                 lastError = e
                 if (attempt >= maxAttempts) throw e
                 val backoff = 500L shl (attempt - 1)
+                Log.w(TAG, "Retrying IO error in ${backoff}ms (attempt=$attempt/$maxAttempts): ${e.message}")
                 delay(backoff)
 
             } finally {
@@ -398,21 +408,32 @@ object SupabaseUploader {
         return key?.let { headers[it]?.firstOrNull()?.trim()?.toLongOrNull()?.times(1000L) }
     }
 
-    private fun objectPathFromUrl(url: URL, bucket: String): String {
-        val s = url.toString()
-        val marker = "$API_PATH/$bucket/"
-        val idx = s.indexOf(marker)
-        return if (idx >= 0) s.substring(idx + marker.length) else ""
-    }
-
-    private fun decodeBestEffort(encoded: String): String {
-        // We only encoded segments; best-effort decode is fine for UI/logging.
-        return encoded.replace("%20", " ")
+    private fun pickRequestId(headers: Map<String, List<String>>): String? {
+        return headers.keys.firstOrNull {
+            it.equals("x-request-id", ignoreCase = true) || it.equals("cf-ray", ignoreCase = true)
+        }?.let { headers[it]?.firstOrNull() }
     }
 
     private fun buildPublicUrl(cfg: SupabaseConfig, objectPath: String): String {
         val baseUrl = cfg.supabaseUrl.trimEnd('/')
         val encoded = encodePath(objectPath)
         return "$baseUrl/storage/v1/object/public/${cfg.bucket}/$encoded"
+    }
+
+    /**
+     * Apply config pathPrefix to a relative objectPath if needed.
+     *
+     * This is idempotent:
+     * - prefix="" -> returns sanitized objectPath
+     * - objectPath already starts with "prefix/" -> unchanged
+     */
+    private fun applyPrefixIfNeeded(pathPrefix: String, objectPath: String): String {
+        val p = pathPrefix.trim().trim('/')
+        val o = objectPath.trim().trim('/')
+
+        if (o.isBlank()) return ""
+        if (p.isBlank()) return o
+        if (o == p || o.startsWith("$p/")) return o
+        return "$p/$o"
     }
 }

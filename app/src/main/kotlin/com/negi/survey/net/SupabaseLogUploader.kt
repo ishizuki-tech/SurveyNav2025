@@ -24,6 +24,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
 import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +33,18 @@ import kotlinx.coroutines.withContext
 private const val TAG = "SupabaseLogUploader"
 
 object SupabaseLogUploader {
+
+    /**
+     * If cfg.pathPrefix is blank, we fall back to this to match typical RLS patterns:
+     *   surveyapp/diagnostics/logcat/...
+     */
+    private const val DEFAULT_PREFIX_FALLBACK = "surveyapp"
+
+    /**
+     * Safety timeout for logcat dumps.
+     * Even with -d, some runtimes can hang; we keep this bounded.
+     */
+    private const val LOGCAT_TIMEOUT_MS = 1600L
 
     data class LogUploadResult(
         val objectPath: String,
@@ -45,7 +58,7 @@ object SupabaseLogUploader {
     suspend fun collectAndUploadLogcat(
         context: Context,
         cfg: SupabaseUploader.SupabaseConfig,
-        remoteDir: String = "logcat",
+        remoteDir: String = "diagnostics/logcat",
         addDateSubdir: Boolean = true,
         includeDeviceHeader: Boolean = true,
         maxUncompressedBytes: Int = 850_000,
@@ -61,6 +74,7 @@ object SupabaseLogUploader {
         val dateDir = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
         val remoteName = "logcat_${stamp}_pid${pid}.log.gz"
+
         val objectPath = buildRemotePath(
             prefix = cfg.pathPrefix,
             remoteDir = remoteDir,
@@ -69,13 +83,16 @@ object SupabaseLogUploader {
             fileName = remoteName
         )
 
+        Log.d(
+            TAG,
+            "collectAndUploadLogcat: pid=$pid objectPath=$objectPath includeCrash=$includeCrashBuffer maxRaw=$maxUncompressedBytes"
+        )
+
         val header = if (includeDeviceHeader) buildHeader(context, pid) else ""
 
         onProgress(5)
 
-        val headerBytes = header.toByteArray(Charsets.UTF_8)
         val budgetTotal = maxUncompressedBytes.coerceAtLeast(50_000)
-
         val budgetMain = if (includeCrashBuffer) (budgetTotal * 3) / 4 else budgetTotal
         val budgetCrash = (budgetTotal - budgetMain).coerceAtLeast(10_000)
 
@@ -103,8 +120,14 @@ object SupabaseLogUploader {
 
         onProgress(20)
 
+        // Keep gz under a safe-ish bound (GitHub-like). This is not a Supabase limit; it is an app policy.
         val maxGzBytes = min(cfg.maxRawBytesHint, 900_000L).toInt().coerceAtLeast(50_000)
         val gz = gzipAndFitToMaxBytes(trimmed, maxGzBytes)
+
+        Log.d(
+            TAG,
+            "logcat bundle: raw=${trimmed.size}B gz=${gz.size}B maxGz=$maxGzBytes objectPath=$objectPath"
+        )
 
         onProgress(35)
 
@@ -122,6 +145,8 @@ object SupabaseLogUploader {
         )
 
         onProgress(100)
+
+        Log.i(TAG, "upload ok: objectPath=${res.objectPath} etag=${res.etag} reqId=${res.requestId}")
 
         LogUploadResult(
             objectPath = res.objectPath,
@@ -141,7 +166,9 @@ object SupabaseLogUploader {
         }
         base.add("--pid=$pid")
 
-        val firstTry = runCatching { runProcessTail(base.toTypedArray(), maxBytes) }.getOrElse { "" }
+        val firstTry = runCatching { runProcessTail(base.toTypedArray(), maxBytes, LOGCAT_TIMEOUT_MS) }
+            .getOrElse { "" }
+
         if (firstTry.isNotBlank() && !looksLikePidUnsupported(firstTry)) return firstTry
 
         val fallback = mutableListOf("logcat", "-d", "-v", "threadtime")
@@ -150,10 +177,11 @@ object SupabaseLogUploader {
             fallback.add(buffer)
         }
 
-        val out = runCatching { runProcessTail(fallback.toTypedArray(), maxBytes) }.getOrElse { t ->
-            Log.w(TAG, "collectLogcatForPidTail failed: ${t.message}", t)
-            "collectLogcatForPidTail failed: ${t.message}\n"
-        }
+        val out = runCatching { runProcessTail(fallback.toTypedArray(), maxBytes, LOGCAT_TIMEOUT_MS) }
+            .getOrElse { t ->
+                Log.w(TAG, "collectLogcatForPidTail failed: ${t.message}", t)
+                "collectLogcatForPidTail failed: ${t.message}\n"
+            }
 
         return buildString {
             appendLine("=== WARNING ===")
@@ -165,18 +193,44 @@ object SupabaseLogUploader {
         }
     }
 
-    private fun runProcessTail(cmd: Array<String>, maxBytes: Int): String {
+    /**
+     * Run a process and capture only the last [maxBytes] bytes of its stdout/stderr.
+     * This method is timeout-bounded to avoid rare hangs.
+     */
+    private fun runProcessTail(cmd: Array<String>, maxBytes: Int, timeoutMs: Long): String {
         val proc = ProcessBuilder(*cmd)
             .redirectErrorStream(true)
             .start()
 
         val tail = TailBuffer(maxBytes.coerceAtLeast(10_000))
-        proc.inputStream.use { stream ->
-            pumpToTail(stream, tail)
+
+        val readerThread = Thread {
+            runCatching {
+                proc.inputStream.use { stream ->
+                    pumpToTail(stream, tail)
+                }
+            }
+        }.apply {
+            isDaemon = true
+            start()
         }
 
+        val finished = runCatching { proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS) }
+            .getOrDefault(false)
+
+        if (!finished) {
+            Log.w(TAG, "process timeout: ${cmd.joinToString(" ")}")
+            runCatching { proc.destroy() }
+            runCatching { proc.destroyForcibly() }
+        }
+
+        // Give the reader a short chance to flush after destroy.
+        runCatching { readerThread.join(250L) }
+
         runCatching { proc.destroy() }
-        return String(tail.toByteArray(), Charsets.UTF_8)
+
+        val bytes = tail.toByteArray()
+        return if (bytes.isEmpty()) "(logcat empty or restricted)\n" else String(bytes, Charsets.UTF_8)
     }
 
     private fun pumpToTail(stream: InputStream, tail: TailBuffer) {
@@ -190,7 +244,14 @@ object SupabaseLogUploader {
 
     private fun looksLikePidUnsupported(output: String): Boolean {
         val s = output.lowercase(Locale.US)
-        return s.contains("unknown option") && s.contains("pid")
+        val mentionsPid = s.contains("pid") || s.contains("--pid")
+        val looksLikeOptionError =
+            s.contains("unknown option") ||
+                    s.contains("unrecognized option") ||
+                    s.contains("invalid option") ||
+                    (s.contains("unknown") && s.contains("--pid"))
+
+        return mentionsPid && looksLikeOptionError
     }
 
     private fun buildHeader(context: Context, pid: Int): String {
@@ -251,6 +312,11 @@ object SupabaseLogUploader {
         return bos.toByteArray()
     }
 
+    /**
+     * Build remote path:
+     * - If [prefix] is blank, use DEFAULT_PREFIX_FALLBACK.
+     * - Avoid accidental double-prefix when remoteDir already starts with prefix.
+     */
     private fun buildRemotePath(
         prefix: String,
         remoteDir: String,
@@ -258,12 +324,23 @@ object SupabaseLogUploader {
         dateDir: String,
         fileName: String
     ): String {
+        val pfx = prefix.trim('/').ifBlank { DEFAULT_PREFIX_FALLBACK }
+        val dirRaw = remoteDir.trim('/')
+
+        val dir = when {
+            dirRaw.isBlank() -> ""
+            dirRaw == pfx -> ""
+            dirRaw.startsWith("$pfx/") -> dirRaw.removePrefix("$pfx/").trim('/')
+            else -> dirRaw
+        }
+
         val parts = mutableListOf<String>()
-        prefix.trim('/').takeIf { it.isNotBlank() }?.let(parts::add)
-        remoteDir.trim('/').takeIf { it.isNotBlank() }?.let(parts::add)
+        pfx.takeIf { it.isNotBlank() }?.let(parts::add)
+        dir.takeIf { it.isNotBlank() }?.let(parts::add)
         if (addDateSubdir) parts.add(dateDir)
         parts.add(fileName.trim('/'))
-        return parts.joinToString("/")
+
+        return parts.filter { it.isNotBlank() }.joinToString("/")
     }
 
     private class TailBuffer(private val capacity: Int) {

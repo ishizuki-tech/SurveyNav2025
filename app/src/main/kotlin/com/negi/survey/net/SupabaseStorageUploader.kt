@@ -38,6 +38,15 @@ object SupabaseStorageUploader {
 
     private const val DEFAULT_MAX_BYTES_GUARD = 20_000_000L
 
+    /**
+     * If BuildConfig path prefix is blank, we fall back to this to match typical RLS patterns:
+     *   surveyapp/regular/...
+     *   surveyapp/exports/...
+     *   surveyapp/voice/...
+     *   surveyapp/diagnostics/...
+     */
+    private const val DEFAULT_PREFIX_FALLBACK = "surveyapp"
+
     data class SupabaseConfig(
         val supabaseUrl: String,
         val anonKey: String,
@@ -47,20 +56,35 @@ object SupabaseStorageUploader {
 
     /**
      * Returns a config from BuildConfig if Supabase is configured, else null.
+     *
+     * Debug note:
+     * - We log URL, bucket, and prefix so you can confirm the final object path.
+     * - The anon key is redacted.
      */
     fun configFromBuildConfig(): SupabaseConfig? {
         val url = BuildConfig.SUPABASE_URL.trim()
         val key = BuildConfig.SUPABASE_ANON_KEY.trim()
         val bucket = BuildConfig.SUPABASE_LOG_BUCKET.trim().ifEmpty { "logs" }
-        val prefix = BuildConfig.SUPABASE_LOG_PATH_PREFIX.trim().trim('/')
+
+        // IMPORTANT: prefix must typically be "surveyapp" for your RLS policies.
+        val rawPrefix = BuildConfig.SUPABASE_LOG_PATH_PREFIX.trim().trim('/')
+        val prefix = rawPrefix.ifBlank { DEFAULT_PREFIX_FALLBACK }
 
         if (url.isBlank() || key.isBlank()) return null
-        return SupabaseConfig(
+
+        val cfg = SupabaseConfig(
             supabaseUrl = url.trimEnd('/'),
             anonKey = key,
             bucket = bucket,
             pathPrefix = prefix
         )
+
+        Log.i(
+            TAG,
+            "configFromBuildConfig: url=${cfg.supabaseUrl} bucket=${cfg.bucket} prefix=${cfg.pathPrefix} anonKey=${redact(cfg.anonKey)}"
+        )
+
+        return cfg
     }
 
     /**
@@ -86,6 +110,11 @@ object SupabaseStorageUploader {
         val normalizedRemote = normalizeRemote(cfg, remotePath)
         val coreCfg = toCoreConfig(cfg, bytes.size.toLong(), connectTimeoutMs, readTimeoutMs)
 
+        Log.d(
+            TAG,
+            "uploadBytes: remotePath=$remotePath normalized=$normalizedRemote bytes=${bytes.size} contentType=$contentType upsert=$upsert"
+        )
+
         var attempt = 0
         var last: Throwable? = null
 
@@ -102,7 +131,7 @@ object SupabaseStorageUploader {
                 return@withContext Result.success(Unit)
             } catch (t: Throwable) {
                 last = t
-                Log.w(TAG, "Upload failed (attempt=${attempt + 1}/$maxRetries): ${t.message}")
+                Log.w(TAG, "uploadBytes failed (attempt=${attempt + 1}/$maxRetries): ${t.message}", t)
                 if (attempt < maxRetries - 1) {
                     val backoffMs = (500.0 * 2.0.pow(attempt.toDouble())).toLong()
                     delay(backoffMs)
@@ -112,7 +141,7 @@ object SupabaseStorageUploader {
             }
         }
 
-        Result.failure(last ?: IOException("Supabase upload failed"))
+        Result.failure(last ?: IOException("Supabase uploadBytes failed"))
     }
 
     /**
@@ -136,6 +165,11 @@ object SupabaseStorageUploader {
         val normalizedRemote = normalizeRemote(cfg, remotePath)
         val coreCfg = toCoreConfig(cfg, file.length(), connectTimeoutMs, readTimeoutMs)
 
+        Log.d(
+            TAG,
+            "uploadFile: remotePath=$remotePath normalized=$normalizedRemote file=${file.name} bytes=${file.length()} contentType=$contentType upsert=$upsert"
+        )
+
         var attempt = 0
         var last: Throwable? = null
 
@@ -152,7 +186,7 @@ object SupabaseStorageUploader {
                 return@withContext Result.success(Unit)
             } catch (t: Throwable) {
                 last = t
-                Log.w(TAG, "Upload failed (attempt=${attempt + 1}/$maxRetries): ${t.message}")
+                Log.w(TAG, "uploadFile failed (attempt=${attempt + 1}/$maxRetries): ${t.message}", t)
                 if (attempt < maxRetries - 1) {
                     val backoffMs = (500.0 * 2.0.pow(attempt.toDouble())).toLong()
                     delay(backoffMs)
@@ -162,19 +196,34 @@ object SupabaseStorageUploader {
             }
         }
 
-        Result.failure(last ?: IOException("Supabase upload failed"))
+        Result.failure(last ?: IOException("Supabase uploadFile failed"))
     }
 
+    /**
+     * Normalize remote path:
+     * - Trim leading slashes
+     * - Apply cfg.pathPrefix unless remote already starts with it
+     * - Collapse accidental double slashes
+     *
+     * This is critical for avoiding:
+     * - Missing "surveyapp/" prefix (RLS mismatch)
+     * - Double "surveyapp/surveyapp/..." prefix (invisible uploads)
+     */
     private fun normalizeRemote(cfg: SupabaseConfig, remotePath: String): String {
-        val p = remotePath.trim().trimStart('/')
+        val p = remotePath.trim().trimStart('/').replace(Regex("""/+"""), "/")
         val prefix = cfg.pathPrefix.trim().trim('/')
-        return if (prefix.isBlank()) p else "$prefix/$p"
+
+        if (prefix.isBlank()) return p
+        if (p == prefix) return p
+        if (p.startsWith("$prefix/")) return p
+
+        return "$prefix/$p"
     }
 
     /**
      * Convert the lightweight config to the core uploader config.
      *
-     * Note: maxRawBytesHint is used as a guard. For streaming we allow at least the content length.
+     * Note: maxRawBytesHint is used as a guard; we always allow at least the content length.
      */
     private fun toCoreConfig(
         cfg: SupabaseConfig,
@@ -191,5 +240,11 @@ object SupabaseStorageUploader {
             connectTimeoutMs = connectTimeoutMs,
             readTimeoutMs = readTimeoutMs
         )
+    }
+
+    private fun redact(s: String, keepTail: Int = 6): String {
+        if (s.isBlank()) return "(blank)"
+        val t = s.trim()
+        return if (t.length <= keepTail) "***" else "***${t.takeLast(keepTail)}"
     }
 }

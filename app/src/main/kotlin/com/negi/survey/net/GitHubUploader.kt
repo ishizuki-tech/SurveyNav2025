@@ -27,6 +27,7 @@ import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -352,7 +353,7 @@ object GitHubUploader {
                     "maxRawBytesHint=$maxRawBytesHint maxRequestBytesHint=$maxRequestBytesHint"
         )
 
-        // Phase 1 — Lookup existing SHA
+        // Phase 1 — Lookup existing SHA (retry-capable, 404 allowed)
         onProgress(0)
         val existingSha = getExistingSha(owner, repo, branch, encodedPath, token)
         onProgress(10)
@@ -480,15 +481,19 @@ object GitHubUploader {
      * - IOException network errors
      *
      * Honors Retry-After if present.
+     *
+     * @param allowNon2xxCodes Treat these codes as non-fatal and return them as a normal response.
+     *                         Use this to allow 404 for "file not found" lookups.
      */
     private suspend fun executeWithRetry(
         method: String,
         url: URL,
         token: String,
-        writeBody: (HttpURLConnection) -> Unit,
+        writeBody: ((HttpURLConnection) -> Unit)?,
         connectTimeoutMs: Int = 20_000,
         readTimeoutMs: Int = 30_000,
-        maxAttempts: Int = 3
+        maxAttempts: Int = 3,
+        allowNon2xxCodes: Set<Int> = emptySet()
     ): HttpResponse {
         var attempt = 0
         var lastError: IOException? = null
@@ -498,27 +503,33 @@ object GitHubUploader {
 
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = method
-                doOutput = true
                 doInput = true
+                doOutput = (writeBody != null)
 
                 setRequestProperty("Authorization", "Bearer ${token.trim()}")
                 setRequestProperty("Accept", "application/vnd.github+json")
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 setRequestProperty("X-GitHub-Api-Version", API_VERSION)
                 setRequestProperty("User-Agent", USER_AGENT)
+
+                if (writeBody != null) {
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
 
                 connectTimeout = connectTimeoutMs
                 readTimeout = readTimeoutMs
             }
 
             try {
-                writeBody(conn)
+                // For PUT/POST-like calls, caller writes the body.
+                writeBody?.invoke(conn)
 
                 val code = conn.responseCode
                 val headers = conn.headerFields.filterKeys { it != null }
 
-                if (code in 200..299) {
-                    val body = conn.inputStream.use(::readAll)
+                if (code in 200..299 || allowNon2xxCodes.contains(code)) {
+                    val bodyStream =
+                        if (code in 200..299) conn.inputStream else conn.errorStream
+                    val body = bodyStream?.use(::readAll).orEmpty()
                     return HttpResponse(code, body, headers)
                 }
 
@@ -576,9 +587,14 @@ object GitHubUploader {
     /**
      * Build a dated GitHub path:
      *   prefix / yyyy-MM-dd / relative
+     *
+     * Uses UTC date to keep paths stable across timezones.
      */
     private fun buildPath(prefix: String, relative: String): String {
-        val dateSegment = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val dateSegment = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+
         val segments = listOf(prefix.trim('/'), dateSegment, relative.trim('/'))
             .filter { it.isNotBlank() }
         return segments.joinToString("/")
@@ -602,11 +618,13 @@ object GitHubUploader {
      * Look up an existing file SHA if the path already exists on the target branch.
      *
      * Returns null when:
-     * - File does not exist
-     * - API returns non-200
-     * - Parsing fails
+     * - File does not exist (404)
+     *
+     * Throws when:
+     * - Non-404 non-2xx errors occur (rate limit, auth issues, 5xx, etc.)
+     * - Network errors persist beyond retries
      */
-    private fun getExistingSha(
+    private suspend fun getExistingSha(
         owner: String,
         repo: String,
         branch: String,
@@ -616,31 +634,23 @@ object GitHubUploader {
         val refEncoded = URLEncoder.encode(branch.trim(), "UTF-8").replace("+", "%20")
         val url = URL("$API_BASE/repos/$owner/$repo/contents/$encodedPath?ref=$refEncoded")
 
-        val conn = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            doInput = true
+        val resp = executeWithRetry(
+            method = "GET",
+            url = url,
+            token = token,
+            writeBody = null,
+            connectTimeoutMs = 15_000,
+            readTimeoutMs = 20_000,
+            maxAttempts = 3,
+            allowNon2xxCodes = setOf(404)
+        )
 
-            setRequestProperty("Authorization", "Bearer ${token.trim()}")
-            setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("X-GitHub-Api-Version", API_VERSION)
-            setRequestProperty("User-Agent", USER_AGENT)
+        if (resp.code == 404) return null
+        if (resp.code !in 200..299) return null
 
-            connectTimeout = 15_000
-            readTimeout = 20_000
-        }
-
-        return try {
-            if (conn.responseCode == 200) {
-                val body = conn.inputStream.use(::readAll)
-                JSONObject(body).optString("sha").takeIf { it.isNotBlank() }
-            } else {
-                null
-            }
-        } catch (_: Exception) {
-            null
-        } finally {
-            conn.disconnect()
-        }
+        return runCatching {
+            JSONObject(resp.body).optString("sha").takeIf { it.isNotBlank() }
+        }.getOrNull()
     }
 
     /**
