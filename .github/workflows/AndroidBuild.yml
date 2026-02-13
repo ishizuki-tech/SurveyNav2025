@@ -101,7 +101,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Debug git context (branch/sha)
         id: gitdebug
@@ -116,6 +116,14 @@ jobs:
           echo "branch=$(git branch --show-current || true)"
           echo "sha=$(git rev-parse HEAD)"
           git log -1 --oneline --decorate --no-color
+          echo "::endgroup::"
+
+          echo "::group::HEAD files (debug)"
+          git show --name-only --pretty=format: HEAD || true
+          echo "::endgroup::"
+
+          echo "::group::Working tree status (debug)"
+          git status --porcelain || true
           echo "::endgroup::"
 
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -399,11 +407,25 @@ jobs:
       - name: Create and push git tag (ensures GitHub “Source code” matches this build)
         id: tagpush
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.ver.outputs.tag }}
           REPO: ${{ env.REPO }}
+          BUILD_SHA: ${{ steps.gitdebug.outputs.sha }}
+          PUSH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |-
           set -euo pipefail
+
+          if [[ -z "${PUSH_TOKEN:-}" ]]; then
+            echo "::error::secrets.RELEASE_PAT is not configured."
+            echo "::error::Create a fine-grained PAT limited to this repo with:"
+            echo "::error::  - Contents: Read and write"
+            echo "::error::  - Workflows: Read and write"
+            exit 1
+          fi
+
+          echo "::group::Tag push debug"
+          echo "TAG=${TAG}"
+          echo "BUILD_SHA=${BUILD_SHA}"
+          echo "::endgroup::"
 
           # Fail-fast if tag already exists (prevents “old Source code” accidents).
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
@@ -419,10 +441,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -a "${TAG}" -m "Release ${TAG}"
+          # Tag the exact commit we built (extra safety)
+          git tag -a "${TAG}" "${BUILD_SHA}" -m "Release ${TAG}"
 
-          # Ensure authenticated push (uses GITHUB_TOKEN).
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          # Authenticated push using PAT (required when workflow files are involved)
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git"
           git push origin "refs/tags/${TAG}"
 
           echo "::group::Tag pushed"
@@ -507,13 +530,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ steps.gitdebug.outputs.sha }}
           body: ${{ steps.notes.outputs.body }}
           files: |
             ${{ steps.collect.outputs.apk_list }}
             ${{ steps.collect.outputs.aab_list }}
           draft: false
           prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Skip release
         if: ${{ !inputs.create_release || (steps.collect.outputs.apk_count == '0' && steps.collect.outputs.aab_count == '0') }}
@@ -534,6 +559,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.build.outputs.tag }}
+          persist-credentials: false
 
       - name: Resolve TAG/DATE/BASE
         id: info
@@ -551,7 +577,7 @@ jobs:
       - name: Resolve APK URL for this tag (GitHub Release API)
         id: apk
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |-
           set -euo pipefail
           REPO="${{ steps.info.outputs.repo }}"
@@ -592,7 +618,7 @@ jobs:
 
       - name: Update Wiki (Home + TAG.md)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           APK_URL: ${{ steps.apk.outputs.apk_url }}
         run: |-
           set -euo pipefail
@@ -745,7 +771,7 @@ jobs:
       - name: Publish GH Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ github.token }}
           publish_dir: gh-pages
           publish_branch: gh-pages
           force_orphan: true
